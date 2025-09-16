@@ -1,9 +1,20 @@
-# 🚨 Rustyleaf 🗺️ v0.0.1 (EXPERIMENTAL - WORK IN PROGRESS)
+<p align="center">
+  <img src="assets/logo.png" alt="Rustyleaf Logo" width="150">
+</p>
 
-**⚠️ WARNING: This is an early-stage experimental project. Currently incomplete and NOT FOR PRODUCTION.**
+<h1 align="center">🚨 Rustyleaf 🗺️ v0.0.1</h1>
+<p align="center">
+  <strong>EXPERIMENTAL - WORK IN PROGRESS</strong>
+</p>
 
-**Tiny, modern Rust-based map visualization engine (WASM + WebGL2).**
-Leaflet-simple API. Currently in active development with many unfinished features.
+<p align="center">
+  ⚠️ WARNING: This is an early-stage experimental project. Currently incomplete and NOT FOR PRODUCTION.
+</p>
+
+<p align="center">
+  <strong>Tiny, modern Rust-based map visualization engine (WASM + WebGL2).</strong><br>
+  Leaflet-simple API. Currently in active development with many unfinished features.
+</p>
 
 ---
 
