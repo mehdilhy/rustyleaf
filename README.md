@@ -260,21 +260,7 @@ xdg-open examples/basic/index.html
 
 This is an early experimental release. No network requests or telemetry beyond fetching public tiles via the URL you provide. Review the source if you embed in production.
 
-## 🗺️ Roadmap
 
-### v0.1 (Current)
-- ✅ WebGL2 rendering engine
-- ✅ Basic Map, TileLayer, PointLayer
-- ✅ Event system foundation
-- ✅ npm package structure
-
-### v0.2 (Next)
-- Line and polygon rendering
-- Advanced hit-testing
-- Label collision detection
-- Vector tile support
-
----
 
 ## 🤝 Contributing
 
