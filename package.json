@@ -1,0 +1,89 @@
+{
+  "name": "rustyleaf",
+  "version": "0.0.1",
+  "description": "A high-performance Rust-based map visualization engine powered by WebAssembly and WebGL2",
+  "main": "dist/rustyleaf.bundle.js",
+  "module": "dist/rustyleaf.js",
+  "exports": {
+    ".": "./dist/rustyleaf.bundle.js",
+    "./dist/*": "./dist/*"
+  },
+  "types": "dist/rustyleaf.d.ts",
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "npm run build:wasm && webpack --mode production",
+    "dev": "npm run build:wasm && webpack --mode development --watch",
+    "build:wasm": "cd core && wasm-pack build --target bundler --release --out-dir ../dist",
+    "prepublishOnly": "npm run build",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "lint": "eslint . --ext .ts,.js",
+    "lint:fix": "eslint . --ext .ts,.js --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "typecheck": "tsc --noEmit",
+    "bench": "node benchmarks/run.js"
+  },
+  "keywords": [
+    "map",
+    "webgl",
+    "wasm",
+    "leaflet",
+    "gis",
+    "visualization",
+    "rust",
+    "geospatial",
+    "mapping",
+    "web-mapping",
+    "javascript",
+    "typescript",
+    "webassembly",
+    "graphics",
+    "canvas"
+  ],
+  "author": "Mehdi",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mehdilhy/rustyleaf.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mehdilhy/rustyleaf/issues"
+  },
+  "homepage": "https://github.com/mehdilhy/rustyleaf#readme",
+  "devDependencies": {
+    "@types/jest": "^29.0.0",
+    "@types/node": "^20.0.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "eslint": "^8.0.0",
+    "jest": "^29.0.0",
+    "jest-environment-jsdom": "^29.0.0",
+    "prettier": "^3.0.0",
+    "ts-jest": "^29.0.0",
+    "ts-loader": "^9.0.0",
+    "typescript": "^5.0.0",
+    "webpack": "^5.0.0",
+    "webpack-cli": "^5.0.0"
+  },
+  "peerDependencies": {
+    "typescript": "^4.0.0 || ^5.0.0"
+  },
+  "peerDependenciesMeta": {
+    "typescript": {
+      "optional": true
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/mehdilhy"
+  }
+}

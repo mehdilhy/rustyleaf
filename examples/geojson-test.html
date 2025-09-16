@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>GeoJSONLayer Test</title>
+    <style>
+        body { margin: 0; padding: 0; font-family: Arial, sans-serif; }
+        #map { width: 100vw; height: 100vh; }
+        .info { position: absolute; top: 10px; left: 10px; background: white; padding: 15px; border-radius: 5px; box-shadow: 0 2px 10px rgba(0,0,0,0.2); z-index: 1000; max-width: 300px; }
+        .status { position: absolute; bottom: 10px; right: 10px; background: rgba(0,0,0,0.8); color: white; padding: 10px; border-radius: 5px; z-index: 1000; font-family: monospace; }
+    </style>
+</head>
+<body>
+    <div class="info">
+        <h3>GeoJSONLayer Test - Paris Arrondissements</h3>
+        <p><strong>Real Data:</strong></p>
+        <ul>
+            <li>File: arrondissements.geojson (5.5MB)</li>
+            <li>Processing: Rust-based loading</li>
+            <li>Features: Paris administrative districts</li>
+        </ul>
+        <p><strong>Status:</strong> <span id="status">Loading...</span></p>
+    </div>
+    <div class="status" id="debugInfo">
+        Ready
+    </div>
+    <div id="map"></div>
+
+    <script type="module">
+        import { Map, TileLayer, PointLayer, GeoJSONLayer, PolygonLayer, LineLayer } from "../src/rustyleaf-api.js";
+
+        // Create map
+        const map = new Map('map', {
+            center: [46.0, 5.5], // Eastern France where arrondissements are located
+            zoom: 8
+        });
+
+        // Add tile layer
+        const tiles = new TileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png');
+        tiles.addTo(map);
+
+        // Create GeoJSONLayer - use more visible colors
+        const geojsonLayer = new GeoJSONLayer(null, {
+            pointColor: '#ff0000',      // Bright red points
+            pointSize: 8,
+            lineColor: '#ffffff',       // White lines
+            lineWidth: 3,
+            polygonColor: '#ff6600ff'   // Fully opaque orange (ff at end = no transparency)
+        });
+
+        // Sample GeoJSON data with all geometry types
+        const sampleGeoJSON = {
+            "type": "FeatureCollection",
+            "features": [
+                // Point - Eiffel Tower
+                {
+                    "type": "Feature",
+                    "properties": {
+                        "name": "Eiffel Tower",
+                        "type": "landmark",
+                        "height": 330
+                    },
+                    "geometry": {
+                        "type": "Point",
+                        "coordinates": [2.2945, 48.8584]
+                    }
+                },
+                // Point - Louvre Museum
+                {
+                    "type": "Feature",
+                    "properties": {
+                        "name": "Louvre Museum",
+                        "type": "museum"
+                    },
+                    "geometry": {
+                        "type": "Point",
+                        "coordinates": [2.3376, 48.8606]
+                    }
+                },
+                // LineString - Champs-Élysées route
+                {
+                    "type": "Feature",
+                    "properties": {
+                        "name": "Champs-Élysées",
+                        "type": "route",
+                        "length": "1.9km"
+                    },
+                    "geometry": {
+                        "type": "LineString",
+                        "coordinates": [
+                            [2.2945, 48.8700],  // Arc de Triomphe
+                            [2.3000, 48.8690],
+                            [2.3050, 48.8680],
+                            [2.3100, 48.8670],
+                            [2.3150, 48.8660],
+                            [2.3200, 48.8650],
+                            [2.3250, 48.8640],
+                            [2.3300, 48.8630],
+                            [2.3350, 48.8620],
+                            [2.3400, 48.8610],  // Place de la Concorde
+                            [2.3450, 48.8600],
+                            [2.3500, 48.8590],
+                            [2.3550, 48.8580],
+                            [2.3600, 48.8570],
+                            [2.3650, 48.8560],
+                            [2.3700, 48.8550],
+                            [2.3750, 48.8540],
+                            [2.3800, 48.8530]   // Place de la Bastille area
+                        ]
+                    }
+                },
+                // MultiLineString - Metro lines
+                {
+                    "type": "Feature",
+                    "properties": {
+                        "name": "Metro Lines",
+                        "type": "transport"
+                    },
+                    "geometry": {
+                        "type": "MultiLineString",
+                        "coordinates": [
+                            // Line 1 (partial)
+                            [
+                                [2.2945, 48.8700],  // Charles de Gaulle - Étoile
+                                [2.3000, 48.8680],
+                                [2.3100, 48.8660],
+                                [2.3200, 48.8640],
+                                [2.3300, 48.8620],
+                                [2.3400, 48.8600],
+                                [2.3500, 48.8580],
+                                [2.3600, 48.8560]
+                            ],
+                            // Line 6 (partial)
+                            [
+                                [2.2945, 48.8550],  // Bir-Hakeim
+                                [2.3000, 48.8560],
+                                [2.3100, 48.8580],
+                                [2.3200, 48.8600],
+                                [2.3300, 48.8620],
+                                [2.3400, 48.8640],
+                                [2.3500, 48.8660]
+                            ]
+                        ]
+                    }
+                },
+                // Polygon - Luxembourg Gardens
+                {
+                    "type": "Feature",
+                    "properties": {
+                        "name": "Luxembourg Gardens",
+                        "type": "park",
+                        "area": "23 hectares"
+                    },
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[
+                            [2.3350, 48.8460],
+                            [2.3400, 48.8460],
+                            [2.3450, 48.8465],
+                            [2.3500, 48.8470],
+                            [2.3500, 48.8490],
+                            [2.3500, 48.8510],
+                            [2.3480, 48.8520],
+                            [2.3450, 48.8525],
+                            [2.3400, 48.8520],
+                            [2.3350, 48.8515],
+                            [2.3320, 48.8500],
+                            [2.3300, 48.8480],
+                            [2.3320, 48.8465],
+                            [2.3350, 48.8460]
+                        ]]
+                    }
+                },
+                // Polygon - Tuileries Garden
+                {
+                    "type": "Feature",
+                    "properties": {
+                        "name": "Tuileries Garden",
+                        "type": "park"
+                    },
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[
+                            [2.3250, 48.8630],
+                            [2.3300, 48.8630],
+                            [2.3350, 48.8635],
+                            [2.3400, 48.8640],
+                            [2.3400, 48.8660],
+                            [2.3350, 48.8665],
+                            [2.3300, 48.8660],
+                            [2.3250, 48.8655],
+                            [2.3250, 48.8630]
+                        ]]
+                    }
+                }
+            ]
+        };
+
+        // Add layer to map first
+        geojsonLayer.addTo(map);
+
+        // Add event handlers
+        geojsonLayer.on('click', (hitInfo) => {
+            console.log('GeoJSON feature clicked:', hitInfo);
+            const debugDiv = document.getElementById('debugInfo');
+            debugDiv.innerHTML = `
+                <strong>Feature Clicked!</strong><br>
+                Type: ${hitInfo.original_meta?.type || 'Unknown'}<br>
+                Name: ${hitInfo.original_meta?.name || 'Unknown'}<br>
+                Meta: ${JSON.stringify(hitInfo.original_meta)}
+            `;
+        });
+
+        // Load the GeoJSON data from the actual file using Rust-based processing
+        console.log('Loading GeoJSON from file...');
+
+        // Load the arrondissements GeoJSON file using JS fetch path (simpler)
+        geojsonLayer.loadUrl('../geojson/arrondissements.geojson')
+            .then(() => {
+                console.log('GeoJSON loaded and processed successfully');
+                document.getElementById('status').textContent = 'GeoJSON loaded successfully!';
+            })
+            .catch(error => {
+                console.error('Failed to load GeoJSON:', error);
+                document.getElementById('status').textContent = 'Error loading GeoJSON file';
+            });
+
+        // Also load the sample data for comparison
+        // geojsonLayer.loadData(sampleGeoJSON);
+
+        // Calculate and display bounds after loading
+        setTimeout(() => {
+            const bounds = geojsonLayer.getBounds();
+            const featureCount = geojsonLayer.getFeatureCount();
+
+            if (bounds && featureCount > 0) {
+                const [[swLat, swLng], [neLat, neLng]] = bounds;
+                console.log('GeoJSON bounds:', bounds);
+                document.getElementById('status').textContent =
+                    `Loaded ${featureCount} features from Paris arrondissements`;
+                console.log('GeoJSONLayer test initialized successfully');
+                console.log(`Loaded ${featureCount} features from Paris arrondissements`);
+            } else {
+                document.getElementById('status').textContent = 'No features loaded yet...';
+                console.log('Waiting for GeoJSON data to load...');
+            }
+        }, 2000); // Wait 2 seconds for the async loading to complete
+
+        // Test style changes
+        setTimeout(() => {
+            console.log('Changing styles...');
+            geojsonLayer.setStyle({
+                pointColor: '#ff00ff',  // Magenta points
+                lineColor: '#00ffff',   // Cyan lines
+                polygonColor: '#ffff0080'  // Semi-transparent yellow
+            });
+        }, 3000);
+
+    </script>
+</body>
+</html>

@@ -1,0 +1,42 @@
+# Node / TypeScript
+node_modules/
+dist/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Rust / Cargo
+/target/
+Cargo.lock
+
+# wasm-pack outputs
+bindings/
+core/bindings/
+core/pkg/
+core/dist/
+examples/**/pkg/
+examples/**/dist/
+
+# IDE & OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Example build outputs
+examples/**/rustyleaf_core*.wasm
+examples/**/rustyleaf_core*.js
+examples/**/rustyleaf_core*.d.ts
+examples/**/main.js
+
+# Generated demo files
+/demo.html
+/demo_map.html
+
+# Binaries
+*.exe
+*.pdb
+
+#claude
+.claude/

@@ -1,0 +1,55 @@
+{
+  "name": "@rustyleaf/types",
+  "version": "0.0.1-experimental",
+  "description": "TypeScript definitions for Rustyleaf - High-performance WebAssembly map visualization engine",
+  "types": "types/rustyleaf.d.ts",
+  "typesPublisherContentHash": "auto",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-username/rustyleaf.git",
+    "directory": "packages/types"
+  },
+  "keywords": [
+    "typescript",
+    "definitions",
+    "rustyleaf",
+    "webassembly",
+    "webgl",
+    "maps",
+    "visualization",
+    "geojson"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/your-username/rustyleaf/issues"
+  },
+  "homepage": "https://github.com/your-username/rustyleaf#readme",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "files": [
+    "types/",
+    "README.md",
+    "package.json"
+  ],
+  "scripts": {
+    "prepublishOnly": "npm run test",
+    "test": "tsc --noEmit",
+    "lint": "eslint types/**/*.d.ts --fix",
+    "format": "prettier --write types/**/*.d.ts",
+    "build:docs": "typedoc types/rustyleaf.d.ts --out docs",
+    "validate": "npm run test && npm run lint"
+  },
+  "devDependencies": {
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "eslint": "^8.0.0",
+    "prettier": "^3.0.0",
+    "typedoc": "^0.25.0",
+    "typescript": "^5.0.0"
+  },
+  "peerDependencies": {
+    "typescript": ">=4.0.0"
+  }
+}
