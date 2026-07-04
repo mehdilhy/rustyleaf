@@ -7,6 +7,90 @@ use web_sys::{
     WebGlUniformLocation, WebGlVertexArrayObject
 };
 
+// RAII WebGL resource wrappers — Drop calls the corresponding delete_*() on the GL context
+// Uses Rc-backed inner so cloning (cheap ref-count increment) doesn't double-delete.
+
+struct OwnedTextureInner {
+    gl: WebGl2RenderingContext,
+    texture: WebGlTexture,
+}
+impl Drop for OwnedTextureInner {
+    fn drop(&mut self) { self.gl.delete_texture(Some(&self.texture)); }
+}
+
+#[derive(Clone)]
+pub(crate) struct OwnedTexture {
+    inner: Rc<OwnedTextureInner>,
+}
+impl OwnedTexture {
+    pub fn new(gl: &WebGl2RenderingContext, texture: WebGlTexture) -> Self {
+        Self { inner: Rc::new(OwnedTextureInner { gl: gl.clone(), texture }) }
+    }
+    pub fn inner(&self) -> &WebGlTexture { &self.inner.texture }
+}
+
+struct OwnedBufferInner {
+    gl: WebGl2RenderingContext,
+    buffer: WebGlBuffer,
+}
+impl Drop for OwnedBufferInner {
+    fn drop(&mut self) { self.gl.delete_buffer(Some(&self.buffer)); }
+}
+
+#[derive(Clone)]
+pub(crate) struct OwnedBuffer {
+    inner: Rc<OwnedBufferInner>,
+}
+impl OwnedBuffer {
+    pub fn new(gl: &WebGl2RenderingContext, buffer: WebGlBuffer) -> Self {
+        Self { inner: Rc::new(OwnedBufferInner { gl: gl.clone(), buffer }) }
+    }
+    pub fn inner(&self) -> &WebGlBuffer { &self.inner.buffer }
+}
+
+struct OwnedVAOInner {
+    gl: WebGl2RenderingContext,
+    vao: WebGlVertexArrayObject,
+}
+impl Drop for OwnedVAOInner {
+    fn drop(&mut self) { self.gl.delete_vertex_array(Some(&self.vao)); }
+}
+
+#[derive(Clone)]
+pub(crate) struct OwnedVAO {
+    inner: Rc<OwnedVAOInner>,
+}
+impl OwnedVAO {
+    pub fn new(gl: &WebGl2RenderingContext, vao: WebGlVertexArrayObject) -> Self {
+        Self { inner: Rc::new(OwnedVAOInner { gl: gl.clone(), vao }) }
+    }
+    pub fn inner(&self) -> &WebGlVertexArrayObject { &self.inner.vao }
+}
+
+struct OwnedProgramInner {
+    gl: WebGl2RenderingContext,
+    program: WebGlProgram,
+    shaders: Vec<WebGlShader>,
+}
+impl Drop for OwnedProgramInner {
+    fn drop(&mut self) {
+        for shader in &self.shaders { self.gl.delete_shader(Some(shader)); }
+        self.gl.delete_program(Some(&self.program));
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct OwnedProgram {
+    inner: Rc<OwnedProgramInner>,
+}
+impl OwnedProgram {
+    pub fn new(gl: &WebGl2RenderingContext, program: WebGlProgram, vertex: WebGlShader, fragment: WebGlShader) -> Self {
+        Self { inner: Rc::new(OwnedProgramInner { gl: gl.clone(), program, shaders: vec![vertex, fragment] }) }
+    }
+    pub fn inner(&self) -> &WebGlProgram { &self.inner.program }
+}
+
+
 // Animation frame helpers
 fn request_animation_frame(closure: &js_sys::Function) -> Result<i32, JsValue> {
     let window = window().ok_or_else(|| JsValue::from_str("Window not available"))?;
@@ -20,12 +104,17 @@ fn cancel_animation_frame(handle: i32) -> Result<(), JsValue> {
     Ok(())
 }
 use std::cell::{RefCell, Cell};
+use std::rc::Rc;
 use std::collections::{HashMap, HashSet};
 use js_sys::{Array, Float32Array};
 use rstar::{RTree, RTreeObject, AABB};
 use lyon_tessellation::{BuffersBuilder, FillOptions, FillTessellator, FillVertex, VertexBuffers};
 use lyon_path::Path;
 
+mod projection;
+mod color;
+use crate::projection::Viewport;
+use crate::color::parse_color;
 
 // Coordinate and spatial data structures
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -58,34 +147,30 @@ impl RTreeObject for SpatialFeature {
     }
 }
 
-// Shader programs for different rendering types
+// Shader programs for different rendering types — OwnedProgram owns its shaders
 struct ShaderPrograms {
-    tile_program: WebGlProgram,
-    point_program: WebGlProgram,
-    line_program: WebGlProgram,
-    polygon_program: WebGlProgram,
+    tile_program: OwnedProgram,
+    point_program: OwnedProgram,
+    line_program: OwnedProgram,
+    polygon_program: OwnedProgram,
 }
 
 // WebGL buffers and state
 struct WebGlState {
     context: WebGl2RenderingContext,
     programs: ShaderPrograms,
-    tile_vao: WebGlVertexArrayObject,
-    point_vao: WebGlVertexArrayObject,
-    line_vao: WebGlVertexArrayObject,
-    polygon_vao: WebGlVertexArrayObject,
-    tile_buffer: WebGlBuffer,
-    point_buffer: WebGlBuffer,
-    line_buffer: WebGlBuffer,
-    polygon_buffer: WebGlBuffer,
+    tile_vao: OwnedVAO,
+    point_vao: OwnedVAO,
+    line_vao: OwnedVAO,
+    polygon_vao: OwnedVAO,
+    tile_buffer: OwnedBuffer,
+    point_buffer: OwnedBuffer,
+    line_buffer: OwnedBuffer,
+    polygon_buffer: OwnedBuffer,
     polygon_u_origin: Option<WebGlUniformLocation>,
     polygon_u_world_scale: Option<WebGlUniformLocation>,
     line_u_origin: Option<WebGlUniformLocation>,
     line_u_world_scale: Option<WebGlUniformLocation>,
-}
-
-thread_local! {
-    static TILE_TEXTURES: RefCell<HashMap<String, WebGlTexture>> = RefCell::new(HashMap::new());
 }
 
 // Event callback types
@@ -162,10 +247,10 @@ pub struct GeoJSONLayer {
     // Flattened triangles in lat/lng coordinate pairs: [lat, lng, lat, lng, lat, lng, ...]
     cached_polygon_triangles: Vec<[f64; 2]>,
     // GPU buffer for normalized-world polygon vertices (uploaded once per data load)
-    polygon_vertex_buffer: RefCell<Option<WebGlBuffer>>,
+    polygon_vertex_buffer: RefCell<Option<OwnedBuffer>>,
     polygon_vertex_count: Cell<usize>,
     // GPU buffer for normalized-world line vertices (uploaded once per data load)
-    line_vertex_buffer: RefCell<Option<WebGlBuffer>>,
+    line_vertex_buffer: RefCell<Option<OwnedBuffer>>,
     line_vertex_count: Cell<usize>,
 }
 
@@ -321,6 +406,7 @@ pub struct RustyleafMap {
     canvas: Option<HtmlCanvasElement>,
     gl_state: Option<WebGlState>,
     tiles: HashMap<String, Tile>,
+    tile_textures: Rc<RefCell<HashMap<String, WebGlTexture>>>,
     tile_size: u32,
     requested: HashSet<String>,
     tile_layer: Option<TileLayer>,
@@ -368,6 +454,7 @@ impl RustyleafMap {
             canvas: None,
             gl_state: None,
             tiles: HashMap::new(),
+            tile_textures: Rc::new(RefCell::new(HashMap::new())),
             tile_size: 256,
             requested: HashSet::new(),
             tile_layer: None,
@@ -404,6 +491,42 @@ impl RustyleafMap {
             keyup_callbacks: Vec::new(),
             dragend_callbacks: Vec::new(),
         }
+    }
+
+    fn viewport(&self) -> Viewport {
+        Viewport {
+            width: self.width,
+            height: self.height,
+            center_lat: self.center_lat,
+            center_lng: self.center_lng,
+            zoom: self.zoom,
+            tile_size: self.tile_size,
+        }
+    }
+
+    // Tile keys needed to fill the current viewport (plus a one-tile buffer), matching
+    // the visibility computation in render_tiles()/load_visible_tiles(). Used so tile-cache
+    // eviction never throws out a tile that's actually on screen right now.
+    fn visible_tile_keys(&self, zoom: u32) -> HashSet<String> {
+        let center_pixel = self.viewport().lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
+        let start_x = center_pixel.0 - (self.width as f64 / 2.0);
+        let start_y = center_pixel.1 - (self.height as f64 / 2.0);
+        let start_tile_x = (start_x / self.tile_size as f64).floor() as i32;
+        let start_tile_y = (start_y / self.tile_size as f64).floor() as i32;
+        let tiles_x = (self.width as f64 / self.tile_size as f64).ceil() as i32 + 2;
+        let tiles_y = (self.height as f64 / self.tile_size as f64).ceil() as i32 + 2;
+
+        let mut keys = HashSet::new();
+        for i in 0..tiles_x {
+            for j in 0..tiles_y {
+                let tile_x = start_tile_x + i;
+                let tile_y = start_tile_y + j;
+                if tile_x >= 0 && tile_y >= 0 && tile_x < (1 << zoom) && tile_y < (1 << zoom) {
+                    keys.insert(format!("{}/{}/{}", zoom, tile_x, tile_y));
+                }
+            }
+        }
+        keys
     }
 
     pub fn set_view(&mut self, lat: f64, lng: f64, zoom: f64) {
@@ -511,47 +634,52 @@ impl RustyleafMap {
     }
 
     fn cleanup_old_tiles(&mut self) {
-        let current_zoom = self.zoom.round() as i32;
-        let max_cache_size = 20;
+        let current_zoom = self.zoom.round() as u32;
+        let visible_keys = self.visible_tile_keys(current_zoom);
+        // Budget scales with what the viewport can actually show, so a full screen of
+        // tiles is never itself over the cap (that alone used to cause thrashing at rest).
+        let max_cache_size = (visible_keys.len() * 3).max(20);
 
         if let Some(ref gl_state) = self.gl_state {
             let context = &gl_state.context;
 
-            TILE_TEXTURES.with(|store| {
-                let mut textures = store.borrow_mut();
+            let mut textures = self.tile_textures.borrow_mut();
 
-                let keys_to_remove: Vec<String> = textures.iter()
-                    .filter(|(key, _)| {
-                        let parts: Vec<&str> = key.split('/').collect();
-                        if parts.len() == 3 {
-                            if let Ok(zoom) = parts[0].parse::<i32>() {
-                                zoom != current_zoom
-                            } else { true }
+            // Evict tiles from any other zoom level — never the current visible set.
+            let keys_to_remove: Vec<String> = textures.iter()
+                .filter(|(key, _)| {
+                    let parts: Vec<&str> = key.split('/').collect();
+                    if parts.len() == 3 {
+                        if let Ok(zoom) = parts[0].parse::<u32>() {
+                            zoom != current_zoom
                         } else { true }
-                    })
-                    .map(|(key, _)| key.clone())
-                    .collect();
+                    } else { true }
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
 
-                for key in keys_to_remove {
+            for key in keys_to_remove {
+                if let Some(texture) = textures.remove(&key) {
+                    context.delete_texture(Some(&texture));
+                }
+            }
+
+            // If still over budget, evict same-zoom tiles that are NOT currently on screen.
+            // Tiles in `visible_keys` are never evicted, so a drag can't starve the tiles
+            // it's actively displaying.
+            if textures.len() > max_cache_size {
+                let overflow = textures.len() - max_cache_size;
+                let to_remove: Vec<String> = textures.keys()
+                    .filter(|k| !visible_keys.contains(*k))
+                    .take(overflow)
+                    .cloned()
+                    .collect();
+                for key in to_remove {
                     if let Some(texture) = textures.remove(&key) {
                         context.delete_texture(Some(&texture));
                     }
                 }
-
-                if textures.len() > max_cache_size {
-                    let mut keys: Vec<String> = textures.keys().cloned().collect();
-                    keys.truncate(max_cache_size);
-                    let to_remove: Vec<String> = textures.keys()
-                        .filter(|k| !keys.contains(k))
-                        .cloned()
-                        .collect();
-                    for key in to_remove {
-                        if let Some(texture) = textures.remove(&key) {
-                            context.delete_texture(Some(&texture));
-                        }
-                    }
-                }
-        });
+            }
         }
         
         // Clean up requested set to prevent memory bloat
@@ -571,6 +699,29 @@ impl RustyleafMap {
                 }
             });
         }
+    }
+
+    fn cleanup_gl_resources(&mut self) {
+        // Delete tile textures (still raw, not RAII-wrapped)
+        let mut textures = self.tile_textures.borrow_mut();
+        if let Some(ref gl_state) = self.gl_state {
+            for (_key, texture) in textures.drain() {
+                gl_state.context.delete_texture(Some(&texture));
+            }
+        }
+        // Clear GeoJSON layer GPU buffers (triggers OwnedBuffer::Drop → delete_buffer)
+        for layer in &self.geojson_layers {
+            layer.polygon_vertex_buffer.borrow_mut().take();
+            layer.line_vertex_buffer.borrow_mut().take();
+        }
+        // Dropping gl_state triggers OwnedVAO, OwnedBuffer, OwnedProgram Drop impls
+        self.gl_state = None;
+        self.canvas = None;
+    }
+
+    #[wasm_bindgen]
+    pub fn destroy(&mut self) {
+        self.cleanup_gl_resources();
     }
 
   
@@ -601,11 +752,15 @@ impl RustyleafMap {
         canvas.set_width(self.width);
         canvas.set_height(self.height);
 
-        let context = canvas
-            .get_context("webgl2")?
-            .ok_or_else(|| JsValue::from_str("WebGL2 context not available"))?
-            .dyn_into::<WebGl2RenderingContext>()
-            .map_err(|_| JsValue::from_str("Failed to get WebGL2 context"))?;
+        let context = {
+            let attrs = web_sys::WebGlContextAttributes::new();
+            attrs.set_preserve_drawing_buffer(true);
+            canvas
+                .get_context_with_context_options("webgl2", &attrs.into())?
+                .ok_or_else(|| JsValue::from_str("WebGL2 context not available"))?
+                .dyn_into::<WebGl2RenderingContext>()
+                .map_err(|_| JsValue::from_str("Failed to get WebGL2 context"))?
+        };
 
         self.canvas = Some(canvas);
         self.initialize_webgl(context)?;
@@ -622,11 +777,11 @@ impl RustyleafMap {
         let programs = self.create_shader_programs(&context)?;
 
         // Get u_origin uniform location for polygon shader
-        let polygon_u_origin = context.get_uniform_location(&programs.polygon_program, "u_origin");
-        let polygon_u_world_scale = context.get_uniform_location(&programs.polygon_program, "u_world_scale");
+        let polygon_u_origin = context.get_uniform_location(programs.polygon_program.inner(), "u_origin");
+        let polygon_u_world_scale = context.get_uniform_location(programs.polygon_program.inner(), "u_world_scale");
 
-        let line_u_origin = context.get_uniform_location(&programs.line_program, "u_origin");
-        let line_u_world_scale = context.get_uniform_location(&programs.line_program, "u_world_scale");
+        let line_u_origin = context.get_uniform_location(programs.line_program.inner(), "u_origin");
+        let line_u_world_scale = context.get_uniform_location(programs.line_program.inner(), "u_world_scale");
 
         // Create VAOs and buffers with error handling
         let tile_vao = context.create_vertex_array().ok_or_else(|| JsValue::from_str("Failed to create tile VAO"))?;
@@ -661,16 +816,16 @@ impl RustyleafMap {
         context.vertex_attrib_pointer_with_i32(2, 4, WebGl2RenderingContext::FLOAT, false, 28, 12);  // color
 
         self.gl_state = Some(WebGlState {
-            context,
+            context: context.clone(),
             programs,
-            tile_vao,
-            point_vao,
-            line_vao,
-            polygon_vao,
-            tile_buffer,
-            point_buffer,
-            line_buffer,
-            polygon_buffer,
+            tile_vao: OwnedVAO::new(&context, tile_vao),
+            point_vao: OwnedVAO::new(&context, point_vao),
+            line_vao: OwnedVAO::new(&context, line_vao),
+            polygon_vao: OwnedVAO::new(&context, polygon_vao),
+            tile_buffer: OwnedBuffer::new(&context, tile_buffer),
+            point_buffer: OwnedBuffer::new(&context, point_buffer),
+            line_buffer: OwnedBuffer::new(&context, line_buffer),
+            polygon_buffer: OwnedBuffer::new(&context, polygon_buffer),
             polygon_u_origin,
             polygon_u_world_scale,
             line_u_origin,
@@ -844,10 +999,10 @@ impl RustyleafMap {
         )?;
 
         Ok(ShaderPrograms {
-            tile_program,
-            point_program,
-            line_program,
-            polygon_program,
+            tile_program: OwnedProgram::new(context, tile_program, tile_vertex_shader, tile_fragment_shader),
+            point_program: OwnedProgram::new(context, point_program, point_vertex_shader, point_fragment_shader),
+            line_program: OwnedProgram::new(context, line_program, line_vertex_shader, line_fragment_shader),
+            polygon_program: OwnedProgram::new(context, polygon_program, polygon_vertex_shader, polygon_fragment_shader),
         })
     }
 
@@ -950,7 +1105,7 @@ impl RustyleafMap {
         if let Some(ref gl_state) = self.gl_state {
             let tile_zoom = self.zoom.round() as u32;
             
-            let center_pixel = self.lat_lng_to_pixel(self.center_lat, self.center_lng, tile_zoom);
+            let center_pixel = self.viewport().lat_lng_to_pixel(self.center_lat, self.center_lng, tile_zoom);
             
             let start_x = center_pixel.0 - (self.width as f64 / 2.0);
             let start_y = center_pixel.1 - (self.height as f64 / 2.0);
@@ -961,8 +1116,8 @@ impl RustyleafMap {
             let tiles_y = (self.height as f64 / self.tile_size as f64).ceil() as i32 + 2;
 
             // Use tile shader program
-            context.use_program(Some(&gl_state.programs.tile_program));
-            context.bind_vertex_array(Some(&gl_state.tile_vao));
+            context.use_program(Some(gl_state.programs.tile_program.inner()));
+            context.bind_vertex_array(Some(gl_state.tile_vao.inner()));
 
             // Set up projection matrix - orthographic projection for 2D tiles
             let projection_matrix = [
@@ -971,13 +1126,13 @@ impl RustyleafMap {
                 0.0, 0.0, -1.0, 0.0,
                 -1.0, 1.0, 0.0, 1.0,
             ];
-            let u_matrix: Option<WebGlUniformLocation> = context.get_uniform_location(&gl_state.programs.tile_program, "u_matrix");
+            let u_matrix: Option<WebGlUniformLocation> = context.get_uniform_location(gl_state.programs.tile_program.inner(), "u_matrix");
             if let Some(loc) = u_matrix.as_ref() {
                 context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
             }
 
             // Set up texture uniform
-            let u_texture: Option<WebGlUniformLocation> = context.get_uniform_location(&gl_state.programs.tile_program, "u_texture");
+            let u_texture: Option<WebGlUniformLocation> = context.get_uniform_location(gl_state.programs.tile_program.inner(), "u_texture");
             if let Some(loc) = u_texture.as_ref() {
                 context.uniform1i(Some(loc), 0); // Use texture unit 0
             }
@@ -989,18 +1144,17 @@ impl RustyleafMap {
             let mut tiles_rendered = 0;
             let mut tiles_found = 0;
             let mut tiles_to_load = Vec::new();
-            TILE_TEXTURES.with(|store| {
-                for i in 0..tiles_x {
-                    for j in 0..tiles_y {
-                        let tile_x = start_tile_x + i;
-                        let tile_y = start_tile_y + j;
+            for i in 0..tiles_x {
+                for j in 0..tiles_y {
+                    let tile_x = start_tile_x + i;
+                    let tile_y = start_tile_y + j;
 
-                        if tile_x >= 0 && tile_y >= 0 && tile_x < (1 << tile_zoom) && tile_y < (1 << tile_zoom) {
-                            let key = format!("{}/{}/{}", tile_zoom, tile_x, tile_y);
-                            let pixel_x = (tile_x * self.tile_size as i32) as f64 - start_x;
-                            let pixel_y = (tile_y * self.tile_size as i32) as f64 - start_y;
+                    if tile_x >= 0 && tile_y >= 0 && tile_x < (1 << tile_zoom) && tile_y < (1 << tile_zoom) {
+                        let key = format!("{}/{}/{}", tile_zoom, tile_x, tile_y);
+                        let pixel_x = (tile_x * self.tile_size as i32) as f64 - start_x;
+                        let pixel_y = (tile_y * self.tile_size as i32) as f64 - start_y;
 
-                            if let Some(texture) = store.borrow().get(&key) {
+                        if let Some(texture) = self.tile_textures.borrow().get(&key) {
                                 tiles_found += 1;
                                 
                                 // Bind texture
@@ -1040,7 +1194,7 @@ impl RustyleafMap {
                                 vertices.set_index(14, 1.0);
                                 vertices.set_index(15, 1.0);
 
-                                context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(&gl_state.tile_buffer));
+                                context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(gl_state.tile_buffer.inner()));
                                 context.buffer_data_with_array_buffer_view(
                                     WebGl2RenderingContext::ARRAY_BUFFER,
                                     &vertices,
@@ -1061,7 +1215,6 @@ impl RustyleafMap {
                         }
                     }
                 }
-            });
             
             if tiles_rendered == 0 {
                 // No tiles rendered - could indicate various issues
@@ -1086,8 +1239,8 @@ impl RustyleafMap {
         }
 
         if let Some(ref gl_state) = self.gl_state {
-            context.use_program(Some(&gl_state.programs.point_program));
-            context.bind_vertex_array(Some(&gl_state.point_vao));
+            context.use_program(Some(gl_state.programs.point_program.inner()));
+            context.bind_vertex_array(Some(gl_state.point_vao.inner()));
 
             for layer in &self.point_layers {
                 if !layer.visible {
@@ -1098,7 +1251,7 @@ impl RustyleafMap {
                 let mut vertex_data = Vec::new();
 
                 for point in layer.points.iter() {
-                    let screen_pos = self.lat_lng_to_screen(point.lat, point.lng);
+                    let screen_pos = self.viewport().lat_lng_to_screen(point.lat, point.lng);
                     vertex_data.extend_from_slice(&[
                         screen_pos.0 as f32, screen_pos.1 as f32,
                         point.size,
@@ -1112,7 +1265,7 @@ impl RustyleafMap {
                         vertices.set_index(i as u32, val);
                     }
 
-                    context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(&gl_state.point_buffer));
+                    context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(gl_state.point_buffer.inner()));
                     context.buffer_data_with_array_buffer_view(
                         WebGl2RenderingContext::ARRAY_BUFFER,
                         &vertices,
@@ -1134,8 +1287,8 @@ impl RustyleafMap {
         }
 
         if let Some(ref gl_state) = self.gl_state {
-            context.use_program(Some(&gl_state.programs.line_program));
-            context.bind_vertex_array(Some(&gl_state.line_vao));
+            context.use_program(Some(gl_state.programs.line_program.inner()));
+            context.bind_vertex_array(Some(gl_state.line_vao.inner()));
 
             for layer in &self.line_layers {
                 if !layer.visible {
@@ -1151,8 +1304,8 @@ impl RustyleafMap {
                         let start = line.points[i];
                         let end = line.points[i + 1];
                         
-                        let start_screen = self.lat_lng_to_screen(start[0], start[1]);
-                        let end_screen = self.lat_lng_to_screen(end[0], end[1]);
+                        let start_screen = self.viewport().lat_lng_to_screen(start[0], start[1]);
+                        let end_screen = self.viewport().lat_lng_to_screen(end[0], end[1]);
                         
                         // Create line segment with points and attributes
                         // Each segment gets both endpoints with the same color
@@ -1171,7 +1324,7 @@ impl RustyleafMap {
                         vertices.set_index(i as u32, val);
                     }
 
-                    context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(&gl_state.line_buffer));
+                    context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(gl_state.line_buffer.inner()));
                     context.buffer_data_with_array_buffer_view(
                         WebGl2RenderingContext::ARRAY_BUFFER,
                         &vertices,
@@ -1213,8 +1366,8 @@ impl RustyleafMap {
         }
 
         if let Some(ref gl_state) = self.gl_state {
-            context.use_program(Some(&gl_state.programs.polygon_program));
-            context.bind_vertex_array(Some(&gl_state.polygon_vao));
+            context.use_program(Some(gl_state.programs.polygon_program.inner()));
+            context.bind_vertex_array(Some(gl_state.polygon_vao.inner()));
 
             for layer in &self.polygon_layers {
                 if !layer.visible {
@@ -1242,7 +1395,7 @@ impl RustyleafMap {
                         for triangle in triangles.chunks(3) {
                             if triangle.len() == 3 {
                                 for &[lat, lng] in triangle {
-                                    let screen_pos = self.lat_lng_to_screen(lat, lng);
+                                    let screen_pos = self.viewport().lat_lng_to_screen(lat, lng);
                                     vertex_data.extend_from_slice(&[
                                         screen_pos.0 as f32, screen_pos.1 as f32,
                                         polygon.color[0], polygon.color[1], polygon.color[2], polygon.color[3],
@@ -1259,7 +1412,7 @@ impl RustyleafMap {
                         vertices.set_index(i as u32, val);
                     }
 
-                    context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(&gl_state.polygon_buffer));
+                    context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(gl_state.polygon_buffer.inner()));
                     context.buffer_data_with_array_buffer_view(
                         WebGl2RenderingContext::ARRAY_BUFFER,
                         &vertices,
@@ -1307,7 +1460,7 @@ impl RustyleafMap {
         let w = self.width as f32;
         let h = self.height as f32;
         let zoom = self.zoom.round() as u32;
-        let center_pixel = self.lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
+        let center_pixel = self.viewport().lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
         let origin_x = center_pixel.0 - (self.width as f64 / 2.0);
         let origin_y = center_pixel.1 - (self.height as f64 / 2.0);
         [
@@ -1318,17 +1471,6 @@ impl RustyleafMap {
             2.0 * origin_y as f32 / h + 1.0,
             0.0, 1.0,
         ]
-    }
-
-    fn lat_lng_to_screen(&self, lat: f64, lng: f64) -> (f64, f64) {
-        let zoom = self.zoom.round() as u32;
-        let center_pixel = self.lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
-        let start_x = center_pixel.0 - (self.width as f64 / 2.0);
-        let start_y = center_pixel.1 - (self.height as f64 / 2.0);
-        let pixel = self.lat_lng_to_pixel(lat, lng, zoom);
-        let screen_x = pixel.0 - start_x;
-        let screen_y = pixel.1 - start_y;
-        (screen_x, screen_y)
     }
 
     #[wasm_bindgen]
@@ -1347,17 +1489,7 @@ impl RustyleafMap {
 
     #[wasm_bindgen]
     pub fn screen_xy(&self, lat: f64, lng: f64) -> Array {
-        let zoom = self.zoom.round() as u32;
-        let center_pixel = self.lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
-        let start_x = center_pixel.0 - (self.width as f64 / 2.0);
-        let start_y = center_pixel.1 - (self.height as f64 / 2.0);
-        let (px, py) = self.lat_lng_to_pixel(lat, lng, zoom);
-        let screen_x = px - start_x;
-        let screen_y = py - start_y;
-        let arr = Array::new();
-        arr.push(&JsValue::from_f64(screen_x));
-        arr.push(&JsValue::from_f64(screen_y));
-        arr
+        self.viewport().screen_xy(lat, lng)
     }
 
     // removed stale canvas 2D debug renderer
@@ -1365,7 +1497,7 @@ impl RustyleafMap {
     fn load_visible_tiles(&mut self) {
         self.cleanup_old_tiles();
         let zoom = self.zoom.round() as u32;
-        let center_pixel = self.lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
+        let center_pixel = self.viewport().lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
 
         let start_x = center_pixel.0 - (self.width as f64 / 2.0);
         let start_y = center_pixel.1 - (self.height as f64 / 2.0);
@@ -1386,7 +1518,7 @@ impl RustyleafMap {
                     let tile_coord = TileCoord { x, y, z: zoom };
                     let tile_key = format!("{}/{}/{}", zoom, x, y);
                     let already_requested = self.requested.contains(&tile_key);
-                    let already_cached = TILE_TEXTURES.with(|store| store.borrow().contains_key(&tile_key));
+                    let already_cached = self.tile_textures.borrow().contains_key(&tile_key);
 
                     if !already_requested && !already_cached && load_count < max_load_per_frame {
                         let tile = Tile {
@@ -1440,6 +1572,7 @@ impl RustyleafMap {
             let url_clone = url.clone();
             let img_clone = image.clone();
             let context_clone = context.clone();
+            let tile_textures = Rc::clone(&self.tile_textures);
 
             // Set up onload handler
             let onload_closure = Closure::wrap(Box::new(move || {
@@ -1473,9 +1606,7 @@ impl RustyleafMap {
 
                 if let Ok(_) = result {
                     // Store the texture
-                    TILE_TEXTURES.with(|store| {
-                        store.borrow_mut().insert(tile_key_clone.clone(), texture);
-                    });
+                    tile_textures.borrow_mut().insert(tile_key_clone.clone(), texture);
                 }
             }) as Box<dyn FnMut()>);
 
@@ -1486,48 +1617,6 @@ impl RustyleafMap {
             // Start loading the image
             image.set_src(&url);
         }
-    }
-
-    fn lat_lng_to_pixel(&self, lat: f64, lng: f64, zoom: u32) -> (f64, f64) {
-        // Clamp latitude to Web Mercator bounds
-        let clamped_lat = lat.max(-85.05112878).min(85.05112878);
-
-        let n = (1u32 << zoom) as f64;
-
-        // X: linear with longitude
-        let x_tile = (lng + 180.0) / 360.0 * n;
-
-        // Y: Web Mercator projection (matches inverse atan(sinh(...)))
-        let lat_rad = clamped_lat.to_radians();
-        let y_tile = (1.0 - ((std::f64::consts::FRAC_PI_4 + lat_rad / 2.0).tan().ln() / std::f64::consts::PI)) / 2.0 * n;
-
-        // Convert to pixel coordinates
-        (x_tile * self.tile_size as f64, y_tile * self.tile_size as f64)
-    }
-
-    fn lat_lng_to_normalized(&self, lat: f64, lng: f64) -> (f64, f64) {
-        // Normalized Web Mercator coordinates in [0..1] range (zoom-independent)
-        let clamped_lat = lat.max(-85.05112878).min(85.05112878);
-        let x = (lng + 180.0) / 360.0;
-        let lat_rad = clamped_lat.to_radians();
-        let y = (1.0 - ((std::f64::consts::FRAC_PI_4 + lat_rad / 2.0).tan().ln() / std::f64::consts::PI)) / 2.0;
-        (x, y)
-    }
-
-    fn pixel_to_lat_lng(&self, x: f64, y: f64, zoom: u32) -> (f64, f64) {
-        let n = (1u32 << zoom) as f64;
-        let tile_x = x / self.tile_size as f64;
-        let tile_y = y / self.tile_size as f64;
-
-        // Inverse for longitude
-        let lng = tile_x / n * 360.0 - 180.0;
-
-        // Inverse Web Mercator for latitude
-        let a = std::f64::consts::PI * (1.0 - 2.0 * (tile_y / n));
-        let lat_rad = a.sinh().atan();
-        let lat = lat_rad.to_degrees();
-
-        (lat, lng)
     }
 
     // Event handling methods (simplified)
@@ -1779,7 +1868,7 @@ impl RustyleafMap {
     #[wasm_bindgen]
     pub fn pan(&mut self, delta_x: f64, delta_y: f64) {
         let zoom = self.zoom.round() as u32;
-        let pixel_center = self.lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
+        let pixel_center = self.viewport().lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
 
         // Note: delta_x and delta_y are in screen pixels (standard web coordinates)
         // Positive delta_x means mouse moved right, so we want to show area to the left (west)
@@ -1788,7 +1877,7 @@ impl RustyleafMap {
         let new_pixel_x = pixel_center.0 - delta_x;
         let new_pixel_y = pixel_center.1 - delta_y;
 
-        let (new_lat, new_lng) = self.pixel_to_lat_lng(new_pixel_x, new_pixel_y, zoom);
+        let (new_lat, new_lng) = self.viewport().pixel_to_lat_lng(new_pixel_x, new_pixel_y, zoom);
 
         // Clamp coordinates to valid Web Mercator ranges
         // Latitude: -85.05112878 to 85.05112878 degrees (to avoid singularity at poles)
@@ -1857,15 +1946,15 @@ impl RustyleafMap {
     pub fn get_bounds(&self) -> Array {
         // Calculate current visible bounds based on center, zoom, and viewport dimensions
         let zoom = self.zoom.round() as u32;
-        let center_pixel = self.lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
+        let center_pixel = self.viewport().lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
         
         let start_x = center_pixel.0 - (self.width as f64 / 2.0);
         let start_y = center_pixel.1 - (self.height as f64 / 2.0);
         let end_x = center_pixel.0 + (self.width as f64 / 2.0);
         let end_y = center_pixel.1 + (self.height as f64 / 2.0);
         
-        let (sw_lat, sw_lng) = self.pixel_to_lat_lng(start_x, end_y, zoom);
-        let (ne_lat, ne_lng) = self.pixel_to_lat_lng(end_x, start_y, zoom);
+        let (sw_lat, sw_lng) = self.viewport().pixel_to_lat_lng(start_x, end_y, zoom);
+        let (ne_lat, ne_lng) = self.viewport().pixel_to_lat_lng(end_x, start_y, zoom);
         
         let arr = Array::new();
         arr.push(&JsValue::from_f64(sw_lat));
@@ -1947,15 +2036,15 @@ impl RustyleafMap {
     }
 
     fn get_view_bounds_at_zoom(&self, center_lat: f64, center_lng: f64, zoom: u32) -> [f64; 4] {
-        let center_pixel = self.lat_lng_to_pixel(center_lat, center_lng, zoom);
+        let center_pixel = self.viewport().lat_lng_to_pixel(center_lat, center_lng, zoom);
         
         let start_x = center_pixel.0 - (self.width as f64 / 2.0);
         let start_y = center_pixel.1 - (self.height as f64 / 2.0);
         let end_x = center_pixel.0 + (self.width as f64 / 2.0);
         let end_y = center_pixel.1 + (self.height as f64 / 2.0);
         
-        let (sw_lat, sw_lng) = self.pixel_to_lat_lng(start_x, end_y, zoom);
-        let (ne_lat, ne_lng) = self.pixel_to_lat_lng(end_x, start_y, zoom);
+        let (sw_lat, sw_lng) = self.viewport().pixel_to_lat_lng(start_x, end_y, zoom);
+        let (ne_lat, ne_lng) = self.viewport().pixel_to_lat_lng(end_x, start_y, zoom);
         
         [sw_lat, sw_lng, ne_lat, ne_lng]
     }
@@ -1972,8 +2061,8 @@ impl RustyleafMap {
         let lng = latlng_array.get(1).as_f64().unwrap_or(0.0);
         
         let zoom = self.zoom.round() as u32;
-        let center_pixel = self.lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
-        let point_pixel = self.lat_lng_to_pixel(lat, lng, zoom);
+        let center_pixel = self.viewport().lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
+        let point_pixel = self.viewport().lat_lng_to_pixel(lat, lng, zoom);
         
         let screen_x = point_pixel.0 - center_pixel.0 + (self.width as f64 / 2.0);
         let screen_y = point_pixel.1 - center_pixel.1 + (self.height as f64 / 2.0);
@@ -1996,12 +2085,12 @@ impl RustyleafMap {
         let screen_y = point_array.get(1).as_f64().unwrap_or(0.0);
         
         let zoom = self.zoom.round() as u32;
-        let center_pixel = self.lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
+        let center_pixel = self.viewport().lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
         
         let point_x = screen_x - (self.width as f64 / 2.0) + center_pixel.0;
         let point_y = screen_y - (self.height as f64 / 2.0) + center_pixel.1;
         
-        let (lat, lng) = self.pixel_to_lat_lng(point_x, point_y, zoom);
+        let (lat, lng) = self.viewport().pixel_to_lat_lng(point_x, point_y, zoom);
         
         let arr = Array::new();
         arr.push(&JsValue::from_f64(lat));
@@ -2104,7 +2193,7 @@ impl RustyleafMap {
 
             let color_str = js_sys::Reflect::get(&line_obj, &JsValue::from_str("color"))?
                 .as_string().unwrap_or("#ff0000".to_string());
-            let color = self.parse_color(&color_str);
+            let color = parse_color(&color_str);
 
             let width = js_sys::Reflect::get(&line_obj, &JsValue::from_str("width"))?
                 .as_f64().unwrap_or(2.0) as f32;
@@ -2174,7 +2263,7 @@ impl RustyleafMap {
 
             let color_str = js_sys::Reflect::get(&polygon_obj, &JsValue::from_str("color"))?
                 .as_string().unwrap_or("#ff0000".to_string());
-            let color = self.parse_color(&color_str);
+            let color = parse_color(&color_str);
 
             let meta = js_sys::Reflect::get(&polygon_obj, &JsValue::from_str("meta"))?;
             let meta_json = if meta.is_object() {
@@ -2304,9 +2393,9 @@ impl RustyleafMap {
         self.geojson_layers[layer_index].cached_points.clear();
         self.geojson_layers[layer_index].cached_lines.clear();
         self.geojson_layers[layer_index].cached_polygon_triangles.clear();
-        self.geojson_layers[layer_index].polygon_vertex_buffer = RefCell::new(None);
+        self.geojson_layers[layer_index].polygon_vertex_buffer.borrow_mut().take();
+        self.geojson_layers[layer_index].line_vertex_buffer.borrow_mut().take();
         self.geojson_layers[layer_index].polygon_vertex_count = Cell::new(0);
-        self.geojson_layers[layer_index].line_vertex_buffer = RefCell::new(None);
         self.geojson_layers[layer_index].line_vertex_count = Cell::new(0);
         self.spatial_index_dirty = true;
         Ok(())
@@ -2334,19 +2423,19 @@ impl RustyleafMap {
             let mut style = self.geojson_layers[layer_index].style.clone();
 
             if let Some(point_color) = style_obj.get("pointColor").and_then(|c| c.as_str()) {
-                style.point_color = self.parse_color(point_color);
+                style.point_color = parse_color(point_color);
             }
             if let Some(point_size) = style_obj.get("pointSize").and_then(|s| s.as_f64()) {
                 style.point_size = point_size as f32;
             }
             if let Some(line_color) = style_obj.get("lineColor").and_then(|c| c.as_str()) {
-                style.line_color = self.parse_color(line_color);
+                style.line_color = parse_color(line_color);
             }
             if let Some(line_width) = style_obj.get("lineWidth").and_then(|w| w.as_f64()) {
                 style.line_width = line_width as f32;
             }
             if let Some(polygon_color) = style_obj.get("polygonColor").and_then(|c| c.as_str()) {
-                style.polygon_color = self.parse_color(polygon_color);
+                style.polygon_color = parse_color(polygon_color);
             }
 
             self.geojson_layers[layer_index].style = style;
@@ -2667,14 +2756,14 @@ impl RustyleafMap {
 
     fn render_geojson_points(&self, context: &WebGl2RenderingContext, points: &[PointFeature]) -> Result<(), JsValue> {
         if let Some(ref gl_state) = self.gl_state {
-            context.use_program(Some(&gl_state.programs.point_program));
-            context.bind_vertex_array(Some(&gl_state.point_vao));
+            context.use_program(Some(gl_state.programs.point_program.inner()));
+            context.bind_vertex_array(Some(gl_state.point_vao.inner()));
 
             // Collect all point data
             let mut vertex_data = Vec::new();
 
             for point in points {
-                let screen_pos = self.lat_lng_to_screen(point.lat, point.lng);
+                let screen_pos = self.viewport().lat_lng_to_screen(point.lat, point.lng);
                 vertex_data.extend_from_slice(&[
                     screen_pos.0 as f32, screen_pos.1 as f32,
                     point.size,
@@ -2688,7 +2777,7 @@ impl RustyleafMap {
                     vertices.set_index(i as u32, val);
                 }
 
-                context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(&gl_state.point_buffer));
+                context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(gl_state.point_buffer.inner()));
                 context.buffer_data_with_array_buffer_view(
                     WebGl2RenderingContext::ARRAY_BUFFER,
                     &vertices,
@@ -2706,7 +2795,7 @@ impl RustyleafMap {
 
                 // Projection matrix uniform
                 let projection_matrix = self.create_projection_matrix();
-                let u_matrix_loc = context.get_uniform_location(&gl_state.programs.point_program, "u_matrix");
+                let u_matrix_loc = context.get_uniform_location(gl_state.programs.point_program.inner(), "u_matrix");
                 if let Some(loc) = u_matrix_loc.as_ref() {
                     context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
                 }
@@ -2720,12 +2809,12 @@ impl RustyleafMap {
 
     fn render_geojson_lines(&self, context: &WebGl2RenderingContext, lines: &[LineFeature]) -> Result<(), JsValue> {
         if let Some(ref gl_state) = self.gl_state {
-            context.use_program(Some(&gl_state.programs.line_program));
-            context.bind_vertex_array(Some(&gl_state.line_vao));
+            context.use_program(Some(gl_state.programs.line_program.inner()));
+            context.bind_vertex_array(Some(gl_state.line_vao.inner()));
 
             // Render from cached GPU buffer if available
             if let Some(buffer) = self.geojson_layers.iter().find(|l| l.visible && l.line_vertex_buffer.borrow().is_some()).and_then(|l| l.line_vertex_buffer.borrow().clone()) {
-                context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(&buffer));
+                context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(buffer.inner()));
                 let stride = 6 * 4; // pos(2) + color(4)
                 context.enable_vertex_attrib_array(0);
                 context.vertex_attrib_pointer_with_i32(0, 2, WebGl2RenderingContext::FLOAT, false, stride, 0);
@@ -2733,14 +2822,14 @@ impl RustyleafMap {
                 context.vertex_attrib_pointer_with_i32(1, 4, WebGl2RenderingContext::FLOAT, false, stride, 2 * 4);
 
                 let projection_matrix = self.create_projection_matrix();
-                let u_matrix_loc = context.get_uniform_location(&gl_state.programs.line_program, "u_matrix");
+                let u_matrix_loc = context.get_uniform_location(gl_state.programs.line_program.inner(), "u_matrix");
                 if let Some(loc) = u_matrix_loc.as_ref() {
                     context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
                 }
 
                 if let Some(ref loc) = gl_state.line_u_origin {
                     let zoom = self.zoom.round() as u32;
-                    let center_pixel = self.lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
+                    let center_pixel = self.viewport().lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
                     let origin_x = center_pixel.0 - (self.width as f64 / 2.0);
                     let origin_y = center_pixel.1 - (self.height as f64 / 2.0);
                     context.uniform2f(Some(loc), origin_x as f32, origin_y as f32);
@@ -2765,8 +2854,8 @@ impl RustyleafMap {
                     let start = line.points[i];
                     let end = line.points[i + 1];
                     
-                    let (sx, sy) = self.lat_lng_to_normalized(start[0], start[1]);
-                    let (ex, ey) = self.lat_lng_to_normalized(end[0], end[1]);
+                    let (sx, sy) = self.viewport().lat_lng_to_normalized(start[0], start[1]);
+                    let (ex, ey) = self.viewport().lat_lng_to_normalized(end[0], end[1]);
                     
                     vertex_data.extend_from_slice(&[
                         sx as f32, sy as f32,
@@ -2783,7 +2872,7 @@ impl RustyleafMap {
                     vertices.set_index(i as u32, val);
                 }
 
-                context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(&gl_state.line_buffer));
+                context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(gl_state.line_buffer.inner()));
                 context.buffer_data_with_array_buffer_view(
                     WebGl2RenderingContext::ARRAY_BUFFER,
                     &vertices,
@@ -2801,7 +2890,7 @@ impl RustyleafMap {
 
                 // Projection matrix uniform
                 let projection_matrix = self.create_projection_matrix();
-                let u_matrix_loc = context.get_uniform_location(&gl_state.programs.line_program, "u_matrix");
+                let u_matrix_loc = context.get_uniform_location(gl_state.programs.line_program.inner(), "u_matrix");
                 if let Some(loc) = u_matrix_loc.as_ref() {
                     context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
                 }
@@ -2809,7 +2898,7 @@ impl RustyleafMap {
                 // Set u_origin and u_world_scale for pixel-coord subtraction in vertex shader
                 if let Some(ref loc) = gl_state.line_u_origin {
                     let zoom = self.zoom.round() as u32;
-                    let center_pixel = self.lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
+                    let center_pixel = self.viewport().lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
                     let origin_x = center_pixel.0 - (self.width as f64 / 2.0);
                     let origin_y = center_pixel.1 - (self.height as f64 / 2.0);
                     context.uniform2f(Some(loc), origin_x as f32, origin_y as f32);
@@ -2832,12 +2921,12 @@ impl RustyleafMap {
         web_sys::console::log_2(&"Rendering polygons count:".into(), &polygons.len().into());
 
         if let Some(ref gl_state) = self.gl_state {
-            context.use_program(Some(&gl_state.programs.polygon_program));
-            context.bind_vertex_array(Some(&gl_state.polygon_vao));
+            context.use_program(Some(gl_state.programs.polygon_program.inner()));
+            context.bind_vertex_array(Some(gl_state.polygon_vao.inner()));
 
             // Render from cached GPU buffer if available
             if let Some(buffer) = self.geojson_layers.iter().find(|l| l.visible && !l.cached_polygon_triangles.is_empty()).and_then(|l| l.polygon_vertex_buffer.borrow().clone()) {
-                context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(&buffer));
+                context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(buffer.inner()));
                 let stride = 6 * 4; // pos(2) + color(4)
                 context.enable_vertex_attrib_array(0);
                 context.vertex_attrib_pointer_with_i32(0, 2, WebGl2RenderingContext::FLOAT, false, stride, 0);
@@ -2845,7 +2934,7 @@ impl RustyleafMap {
                 context.vertex_attrib_pointer_with_i32(1, 4, WebGl2RenderingContext::FLOAT, false, stride, 2 * 4);
 
                 let projection_matrix = self.create_projection_matrix();
-                let u_matrix_loc = context.get_uniform_location(&gl_state.programs.polygon_program, "u_matrix");
+                let u_matrix_loc = context.get_uniform_location(gl_state.programs.polygon_program.inner(), "u_matrix");
                 if let Some(loc) = u_matrix_loc.as_ref() {
                     context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
                 }
@@ -2853,7 +2942,7 @@ impl RustyleafMap {
                 // Set u_origin for pixel-coord subtraction in vertex shader
                 if let Some(ref loc) = gl_state.polygon_u_origin {
                     let zoom = self.zoom.round() as u32;
-                    let center_pixel = self.lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
+                    let center_pixel = self.viewport().lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
                     let origin_x = center_pixel.0 - (self.width as f64 / 2.0);
                     let origin_y = center_pixel.1 - (self.height as f64 / 2.0);
                     context.uniform2f(Some(loc), origin_x as f32, origin_y as f32);
@@ -2899,7 +2988,7 @@ impl RustyleafMap {
                     for triangle in triangles.chunks(3) {
                         if triangle.len() == 3 {
                             for &[lat, lng] in triangle {
-                                let screen_pos = self.lat_lng_to_screen(lat, lng);
+                                let screen_pos = self.viewport().lat_lng_to_screen(lat, lng);
                                 vertex_data.extend_from_slice(&[
                                     screen_pos.0 as f32, screen_pos.1 as f32,
                                     polygon.color[0], polygon.color[1], polygon.color[2], polygon.color[3],
@@ -2931,7 +3020,7 @@ impl RustyleafMap {
                     vertices.set_index(i as u32, val);
                 }
 
-                context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(&gl_state.polygon_buffer));
+                context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(gl_state.polygon_buffer.inner()));
                 context.buffer_data_with_array_buffer_view(
                     WebGl2RenderingContext::ARRAY_BUFFER,
                     &vertices,
@@ -2949,7 +3038,7 @@ impl RustyleafMap {
 
                 // Set up the projection matrix uniform
                 let projection_matrix = self.create_projection_matrix();
-                let u_matrix_loc = context.get_uniform_location(&gl_state.programs.polygon_program, "u_matrix");
+                let u_matrix_loc = context.get_uniform_location(gl_state.programs.polygon_program.inner(), "u_matrix");
                 if let Some(loc) = u_matrix_loc.as_ref() {
                     context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
                 }
@@ -2979,15 +3068,15 @@ impl RustyleafMap {
 
     fn render_geojson_polygon_triangles(&self, context: &WebGl2RenderingContext, triangles: &[[f64; 2]], color: [f32; 4]) -> Result<(), JsValue> {
         if let Some(ref gl_state) = self.gl_state {
-            context.use_program(Some(&gl_state.programs.polygon_program));
-            context.bind_vertex_array(Some(&gl_state.polygon_vao));
+            context.use_program(Some(gl_state.programs.polygon_program.inner()));
+            context.bind_vertex_array(Some(gl_state.polygon_vao.inner()));
 
             // Viewport culling in lat/lng space
             let visible = self.cull_triangles_to_view(triangles);
 
             let mut vertex_data = Vec::with_capacity(visible.len() * 6);
             for &[lat, lng] in visible.iter() {
-                let screen_pos = self.lat_lng_to_screen(lat, lng);
+                let screen_pos = self.viewport().lat_lng_to_screen(lat, lng);
                 vertex_data.extend_from_slice(&[
                     screen_pos.0 as f32, screen_pos.1 as f32,
                     color[0], color[1], color[2], color[3],
@@ -3000,7 +3089,7 @@ impl RustyleafMap {
                     vertices.set_index(i as u32, val);
                 }
 
-                context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(&gl_state.polygon_buffer));
+                context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(gl_state.polygon_buffer.inner()));
                 context.buffer_data_with_array_buffer_view(
                     WebGl2RenderingContext::ARRAY_BUFFER,
                     &vertices,
@@ -3015,7 +3104,7 @@ impl RustyleafMap {
 
                 // Projection
                 let projection_matrix = self.create_projection_matrix();
-                let u_matrix_loc = context.get_uniform_location(&gl_state.programs.polygon_program, "u_matrix");
+                let u_matrix_loc = context.get_uniform_location(gl_state.programs.polygon_program.inner(), "u_matrix");
                 if let Some(loc) = u_matrix_loc.as_ref() {
                     context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
                 }
@@ -3572,64 +3661,6 @@ impl RustyleafMap {
         None
     }
 
-    // Parse CSS color string to RGBA array
-    fn parse_color(&self, color_str: &str) -> [f32; 4] {
-        let s = color_str.trim().to_lowercase();
-        // Hex #RRGGBB or #RRGGBBAA
-        if let Some(stripped) = s.strip_prefix('#') {
-            if stripped.len() == 6 {
-                if let Ok(val) = u32::from_str_radix(stripped, 16) {
-                    let r = ((val >> 16) & 0xff) as f32 / 255.0;
-                    let g = ((val >> 8) & 0xff) as f32 / 255.0;
-                    let b = (val & 0xff) as f32 / 255.0;
-                    return [r, g, b, 1.0];
-                }
-            } else if stripped.len() == 8 {
-                if let Ok(val) = u32::from_str_radix(stripped, 16) {
-                    let r = ((val >> 24) & 0xff) as f32 / 255.0;
-                    let g = ((val >> 16) & 0xff) as f32 / 255.0;
-                    let b = ((val >> 8) & 0xff) as f32 / 255.0;
-                    let a = (val & 0xff) as f32 / 255.0;
-                    return [r, g, b, a];
-                }
-            } else if stripped.len() == 3 {
-                // #RGB
-                let r = u8::from_str_radix(&stripped[0..1], 16).unwrap_or(0);
-                let g = u8::from_str_radix(&stripped[1..2], 16).unwrap_or(0);
-                let b = u8::from_str_radix(&stripped[2..3], 16).unwrap_or(0);
-                return [
-                    (r as f32) / 15.0,
-                    (g as f32) / 15.0,
-                    (b as f32) / 15.0,
-                    1.0,
-                ];
-            } else if stripped.len() == 4 {
-                // #RGBA
-                let r = u8::from_str_radix(&stripped[0..1], 16).unwrap_or(0);
-                let g = u8::from_str_radix(&stripped[1..2], 16).unwrap_or(0);
-                let b = u8::from_str_radix(&stripped[2..3], 16).unwrap_or(0);
-                let a = u8::from_str_radix(&stripped[3..4], 16).unwrap_or(15);
-                return [
-                    (r as f32) / 15.0,
-                    (g as f32) / 15.0,
-                    (b as f32) / 15.0,
-                    (a as f32) / 15.0,
-                ];
-            }
-        }
-        match s.as_str() {
-            "red" => [1.0, 0.0, 0.0, 1.0],
-            "green" => [0.0, 1.0, 0.0, 1.0],
-            "blue" => [0.0, 0.0, 1.0, 1.0],
-            "white" => [1.0, 1.0, 1.0, 1.0],
-            "black" => [0.0, 0.0, 0.0, 1.0],
-            "yellow" => [1.0, 1.0, 0.0, 1.0],
-            "magenta" => [1.0, 0.0, 1.0, 1.0],
-            "cyan" => [0.0, 1.0, 1.0, 1.0],
-            _ => [0.0, 0.0, 0.0, 1.0],
-        }
-    }
-
     fn rebuild_geojson_cache(&mut self, layer_index: usize) -> Result<(), JsValue> {
         if layer_index >= self.geojson_layers.len() {
             return Err(JsValue::from_str("GeoJSON layer index out of bounds"));
@@ -3718,13 +3749,20 @@ impl RustyleafMap {
             let context = &gl_state.context;
             let mut vertex_data: Vec<f32> = Vec::new();
             for &[lat, lng] in &self.geojson_layers[layer_index].cached_polygon_triangles {
-                let (nx, ny) = self.lat_lng_to_normalized(lat, lng);
+                let (nx, ny) = self.viewport().lat_lng_to_normalized(lat, lng);
                 vertex_data.push(nx as f32);
                 vertex_data.push(ny as f32);
                 vertex_data.push(style.polygon_color[0]);
                 vertex_data.push(style.polygon_color[1]);
                 vertex_data.push(style.polygon_color[2]);
                 vertex_data.push(style.polygon_color[3]);
+            }
+
+            {
+                let old_poly_buf = self.geojson_layers[layer_index].polygon_vertex_buffer.borrow_mut().take();
+                if let Some(buf) = old_poly_buf {
+                    context.delete_buffer(Some(buf.inner()));
+                }
             }
 
             if !vertex_data.is_empty() {
@@ -3734,11 +3772,10 @@ impl RustyleafMap {
                     let array = Float32Array::new_with_length(vertex_data.len() as u32);
                     for (i, v) in vertex_data.iter().enumerate() { array.set_index(i as u32, *v); }
                     context.buffer_data_with_array_buffer_view(WebGl2RenderingContext::ARRAY_BUFFER, &array, WebGl2RenderingContext::STATIC_DRAW);
-                    *self.geojson_layers[layer_index].polygon_vertex_buffer.borrow_mut() = buffer;
+                    *self.geojson_layers[layer_index].polygon_vertex_buffer.borrow_mut() = buffer.map(|b| OwnedBuffer::new(&gl_state.context, b));
                     self.geojson_layers[layer_index].polygon_vertex_count.set(vertex_data.len() / 6);
                 }
             } else {
-                *self.geojson_layers[layer_index].polygon_vertex_buffer.borrow_mut() = None;
                 self.geojson_layers[layer_index].polygon_vertex_count.set(0);
             }
 
@@ -3748,14 +3785,21 @@ impl RustyleafMap {
                 for i in 0..line.points.len().saturating_sub(1) {
                     let start = line.points[i];
                     let end = line.points[i + 1];
-                    let (sx, sy) = self.lat_lng_to_normalized(start[0], start[1]);
-                    let (ex, ey) = self.lat_lng_to_normalized(end[0], end[1]);
+                    let (sx, sy) = self.viewport().lat_lng_to_normalized(start[0], start[1]);
+                    let (ex, ey) = self.viewport().lat_lng_to_normalized(end[0], end[1]);
                     line_vertex_data.extend_from_slice(&[
                         sx as f32, sy as f32,
                         line.color[0], line.color[1], line.color[2], line.color[3],
                         ex as f32, ey as f32,
                         line.color[0], line.color[1], line.color[2], line.color[3],
                     ]);
+                }
+            }
+
+            {
+                let old_line_buf = self.geojson_layers[layer_index].line_vertex_buffer.borrow_mut().take();
+                if let Some(buf) = old_line_buf {
+                    context.delete_buffer(Some(buf.inner()));
                 }
             }
 
@@ -3766,11 +3810,10 @@ impl RustyleafMap {
                     let array = Float32Array::new_with_length(line_vertex_data.len() as u32);
                     for (i, v) in line_vertex_data.iter().enumerate() { array.set_index(i as u32, *v); }
                     context.buffer_data_with_array_buffer_view(WebGl2RenderingContext::ARRAY_BUFFER, &array, WebGl2RenderingContext::STATIC_DRAW);
-                    *self.geojson_layers[layer_index].line_vertex_buffer.borrow_mut() = buffer;
+                    *self.geojson_layers[layer_index].line_vertex_buffer.borrow_mut() = buffer.map(|b| OwnedBuffer::new(&gl_state.context, b));
                     self.geojson_layers[layer_index].line_vertex_count.set(line_vertex_data.len() / 6);
                 }
             } else {
-                *self.geojson_layers[layer_index].line_vertex_buffer.borrow_mut() = None;
                 self.geojson_layers[layer_index].line_vertex_count.set(0);
             }
         }
@@ -3829,7 +3872,7 @@ impl RustyleafMap {
             if tri.len() < 3 { continue; }
             let mut any_inside = false;
             for &[lat, lng] in tri {
-                let p = self.lat_lng_to_screen(lat, lng);
+                let p = self.viewport().lat_lng_to_screen(lat, lng);
                 if p.0 >= -50.0 && p.0 <= w + 50.0 && p.1 >= -50.0 && p.1 <= h + 50.0 {
                     any_inside = true; break;
                 }
@@ -3901,7 +3944,7 @@ impl PointLayerApi {
 
             let color_str = js_sys::Reflect::get(&point_obj, &JsValue::from_str("color"))?
                 .as_string().unwrap_or("#0080ff".to_string());
-            let color = self.parse_color(&color_str);
+            let color = parse_color(&color_str);
 
             let meta = js_sys::Reflect::get(&point_obj, &JsValue::from_str("meta"))?;
             let meta_json = if meta.is_object() {
@@ -3931,22 +3974,6 @@ impl PointLayerApi {
     #[wasm_bindgen]
     pub fn on_hover(&mut self, _callback: &js_sys::Function) {
         // Store callback for later use (simplified for now)
-    }
-
-    // Parse CSS color string to RGBA array
-    fn parse_color(&self, color_str: &str) -> [f32; 4] {
-        match color_str {
-            "#ff0000" | "red" => [1.0, 0.0, 0.0, 1.0],
-            "#00ff00" | "green" => [0.0, 1.0, 0.0, 1.0],
-            "#0000ff" | "blue" => [0.0, 0.0, 1.0, 1.0],
-            "#ffffff" | "white" => [1.0, 1.0, 1.0, 1.0],
-            "#000000" | "black" => [0.0, 0.0, 0.0, 1.0],
-            "#ffff00" | "yellow" => [1.0, 1.0, 0.0, 1.0],
-            "#ff00ff" | "magenta" => [1.0, 0.0, 1.0, 1.0],
-            "#00ffff" | "cyan" => [0.0, 1.0, 1.0, 1.0],
-            "#0080ff" => [0.0, 0.5, 1.0, 1.0],
-            _ => [0.0, 0.0, 0.0, 1.0], // Default to black
-        }
     }
 }
 

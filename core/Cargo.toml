@@ -25,6 +25,7 @@ web-sys = { version = "0.3", features = [
   "WebGlTexture",
   "WebGlUniformLocation",
   "WebGlVertexArrayObject",
+  "WebGlContextAttributes",
   "ImageData",
   "HtmlImageElement",
   "EventTarget",

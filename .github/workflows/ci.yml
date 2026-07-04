@@ -8,18 +8,31 @@ on:
 
 jobs:
   rust:
-    name: Rust (cargo check + test)
+    name: Rust (check + test + clippy)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+          components: clippy
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            core/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('core/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
       - run: cargo check --manifest-path core/Cargo.toml --target wasm32-unknown-unknown
+      - run: cargo clippy --manifest-path core/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
       - run: cargo test --manifest-path core/Cargo.toml --target wasm32-unknown-unknown
 
   js:
-    name: JS (lint + typecheck + unit tests)
+    name: JS (lint + typecheck + jest)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -27,6 +40,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: 'npm'
+
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
@@ -35,17 +50,48 @@ jobs:
   e2e:
     name: E2E (Playwright)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     needs: rust
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: 'npm'
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            core/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('core/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
       - run: cargo install wasm-pack
       - run: npm ci
       - run: npx playwright install chromium --with-deps
-      - run: npm run test:e2e
+
+      - name: Build WASM
+        run: npm run build:wasm
+
+      - name: Create visual baselines (first-run) or run tests
+        run: |
+          if [ ! -f e2e/tests/baselines/chromium/visual.spec.ts/vector-points.png ]; then
+            npx playwright test --config e2e/playwright.config.ts e2e/tests/visual.spec.ts --update-snapshots
+          fi
+          npx playwright test --config e2e/playwright.config.ts
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-artifacts
+          path: |
+            e2e/artifacts/
+            e2e/report/
+          retention-days: 7

@@ -25,7 +25,7 @@
     "test:e2e": "npm run build:wasm && playwright test --config e2e/playwright.config.ts",
     "test:e2e:visual": "npm run build:wasm && playwright test --config e2e/playwright.config.ts e2e/tests/visual.spec.ts",
     "test:e2e:soak": "npm run build:wasm && playwright test --config e2e/playwright.config.ts e2e/tests/memory-soak.spec.ts",
-    "test:e2e:fps": "npm run build:wasm && playwright test --config e2e/playwright.config.ts e2e/tests/fps-benchmark.spec.ts",
+    "test:e2e:fps": "npm run build:wasm && playwright test --config e2e/playwright.config.ts e2e/tests/00-fps-benchmark.spec.ts",
     "test:e2e:update": "npm run build:wasm && playwright test --config e2e/playwright.config.ts --update-snapshots",
     "postinstall": "npx playwright install chromium",
     "lint": "eslint . --ext .ts,.js",

@@ -20,6 +20,17 @@ const MINIMUM_API = {
 };
 
 test.describe('API surface honesty (11.1)', () => {
+  test.afterEach(async ({ page }) => {
+    // Release the WebGL context before the page closes so headless Chromium's
+    // software rasterizer doesn't accumulate contexts across tests.
+    await page.evaluate(() => {
+      const w = window as any;
+      if (w.__map && typeof w.__map.remove === 'function') {
+        w.__map.remove();
+      }
+    }).catch(() => {});
+  });
+
   test('Map has all documented methods', async ({ page }) => {
     await page.goto('/e2e/fixtures/minimal.html');
     await waitForMap(page);

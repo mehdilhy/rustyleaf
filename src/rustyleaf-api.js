@@ -43,7 +43,7 @@ await __ensureRustyleafWasmReady();
 function checkWebGLSupport() {
   try {
     const canvas = document.createElement('canvas');
-    const gl = canvas.getContext('webgl2') || canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+    const gl = canvas.getContext('webgl2', { preserveDrawingBuffer: true }) || canvas.getContext('webgl', { preserveDrawingBuffer: true }) || canvas.getContext('experimental-webgl', { preserveDrawingBuffer: true });
     
     if (!gl) {
       return {
@@ -59,7 +59,7 @@ function checkWebGLSupport() {
     }
     
     const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
-    const isWebGL2 = !!canvas.getContext('webgl2');
+    const isWebGL2 = !!canvas.getContext('webgl2', { preserveDrawingBuffer: true });
     
     return {
       supported: true,
@@ -404,11 +404,12 @@ class Map {
       this.wasmMap.handle_contextmenu(e.clientX, e.clientY);
     });
 
-    window.addEventListener('resize', () => {
+    this._resizeHandler = () => {
       this._handleResize();
-    });
+    };
+    window.addEventListener('resize', this._resizeHandler);
   }
-  
+
   _handleResize() {
     const rect = this.containerElement.getBoundingClientRect();
     this.width = rect.width;
@@ -417,13 +418,45 @@ class Map {
     this.canvas.height = this.height;
     this.wasmMap.resize(this.width, this.height);
   }
-  
+
   _startRenderLoop() {
     const render = () => {
+      if (this._destroyed) return;
       this.wasmMap.render(this.canvas.id);
-      requestAnimationFrame(render);
+      this._rafId = requestAnimationFrame(render);
     };
     render();
+  }
+
+  // Release the WebGL context, GPU resources, and event listeners.
+  // Leaflet-compatible name; also exposed as destroy().
+  remove() {
+    if (this._destroyed) return this;
+    this._destroyed = true;
+
+    if (this._rafId !== undefined) {
+      cancelAnimationFrame(this._rafId);
+      this._rafId = undefined;
+    }
+
+    if (this._resizeHandler) {
+      window.removeEventListener('resize', this._resizeHandler);
+      this._resizeHandler = null;
+    }
+
+    if (this.wasmMap && typeof this.wasmMap.destroy === 'function') {
+      this.wasmMap.destroy();
+    }
+
+    if (this.canvas && this.canvas.parentNode) {
+      this.canvas.parentNode.removeChild(this.canvas);
+    }
+
+    return this;
+  }
+
+  destroy() {
+    return this.remove();
   }
 }
 
