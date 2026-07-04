@@ -2,7 +2,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use web_sys::{
-    window, HtmlCanvasElement, HtmlImageElement,
+    window, HtmlCanvasElement,
     WebGl2RenderingContext, WebGlProgram, WebGlShader, WebGlBuffer, WebGlTexture,
     WebGlUniformLocation, WebGlVertexArrayObject
 };
@@ -105,47 +105,26 @@ fn cancel_animation_frame(handle: i32) -> Result<(), JsValue> {
 }
 use std::cell::{RefCell, Cell};
 use std::rc::Rc;
-use std::collections::{HashMap, HashSet};
 use js_sys::{Array, Float32Array};
-use rstar::{RTree, RTreeObject, AABB};
+use rstar::RTree;
 use lyon_tessellation::{BuffersBuilder, FillOptions, FillTessellator, FillVertex, VertexBuffers};
 use lyon_path::Path;
 
 mod projection;
 mod color;
+mod tiles;
+mod spatial;
+mod error;
+mod input;
 use crate::projection::Viewport;
 use crate::color::parse_color;
+use crate::tiles::{TileCoord, TileLayer, TileLoader};
+use crate::spatial::{SpatialFeature, rebuild_spatial_index, hit_test as spatial_hit_test};
+use crate::input::MouseState;
+use crate::input::momentum::{apply_drag, apply_momentum, start_momentum_animation};
 
-// Coordinate and spatial data structures
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct TileCoord {
-    x: i32,
-    y: i32,
-    z: u32,
-}
-
-#[derive(Clone)]
-struct Tile {
-    coord: TileCoord,
-    texture: Option<WebGlTexture>,
-    loading: bool,
-}
-
-// Spatial index for hit testing
-#[derive(Clone, Debug)]
-struct SpatialFeature {
-    id: u32,
-    bounds: AABB<[f64; 2]>,
-    meta: serde_json::Value,
-}
-
-impl RTreeObject for SpatialFeature {
-    type Envelope = AABB<[f64; 2]>;
-
-    fn envelope(&self) -> Self::Envelope {
-        self.bounds
-    }
-}
+// Coordinate and spatial data structures (TileCoord, Tile moved to crate::tiles, SpatialFeature moved to crate::spatial)
+// MouseState moved to crate::input
 
 // Shader programs for different rendering types — OwnedProgram owns its shaders
 struct ShaderPrograms {
@@ -176,64 +155,50 @@ struct WebGlState {
 // Event callback types
 type EventCallback = Box<dyn FnMut(JsValue)>;
 
-// Mouse interaction state
-#[derive(Clone)]
-struct MouseState {
-    is_dragging: bool,
-    last_x: f64,
-    last_y: f64,
-    button_down: bool,
-}
+// MouseState moved to crate::input
 
-// Layer types for the map
-#[derive(Clone)]
-pub struct TileLayer {
-    url_template: String,
-    subdomains: Vec<String>,
-    max_zoom: u32,
-    min_zoom: u32,
-}
+// Layer types for the map (TileLayer moved to crate::tiles)
 
 #[derive(Clone)]
 pub struct PointLayer {
-    points: Vec<PointFeature>,
-    visible: bool,
+    pub(crate) points: Vec<PointFeature>,
+    pub(crate) visible: bool,
 }
 
 #[derive(Clone)]
 pub struct PointFeature {
-    lat: f64,
-    lng: f64,
-    size: f32,
-    color: [f32; 4],
-    meta: serde_json::Value,
+    pub(crate) lat: f64,
+    pub(crate) lng: f64,
+    pub(crate) size: f32,
+    pub(crate) color: [f32; 4],
+    pub(crate) meta: serde_json::Value,
 }
 
 #[derive(Clone)]
 pub struct LineFeature {
-    points: Vec<[f64; 2]>, // [[lat, lng], ...]
-    color: [f32; 4],
-    width: f32,
-    meta: serde_json::Value,
+    pub(crate) points: Vec<[f64; 2]>, // [[lat, lng], ...]
+    pub(crate) color: [f32; 4],
+    pub(crate) width: f32,
+    pub(crate) meta: serde_json::Value,
 }
 
 #[derive(Clone)]
 pub struct LineLayer {
-    lines: Vec<LineFeature>,
-    visible: bool,
+    pub(crate) lines: Vec<LineFeature>,
+    pub(crate) visible: bool,
 }
 
 #[derive(Clone)]
 pub struct PolygonFeature {
-    rings: Vec<Vec<[f64; 2]>>, // Outer ring + holes: [[[lat, lng], ...], ...]
-    color: [f32; 4],
-    meta: serde_json::Value,
+    pub(crate) rings: Vec<Vec<[f64; 2]>>, // Outer ring + holes: [[[lat, lng], ...], ...]
+    pub(crate) color: [f32; 4],
+    pub(crate) meta: serde_json::Value,
 }
 
 #[derive(Clone)]
 pub struct PolygonLayer {
-    polygons: Vec<PolygonFeature>,
-    visible: bool,
+    pub(crate) polygons: Vec<PolygonFeature>,
+    pub(crate) visible: bool,
 }
 
 #[derive(Clone)]
@@ -405,12 +370,9 @@ pub struct RustyleafMap {
     zoom: f64,
     canvas: Option<HtmlCanvasElement>,
     gl_state: Option<WebGlState>,
-    tiles: HashMap<String, Tile>,
-    tile_textures: Rc<RefCell<HashMap<String, WebGlTexture>>>,
+    tile_loader: TileLoader,
     tile_size: u32,
-    requested: HashSet<String>,
     tile_layer: Option<TileLayer>,
-    tile_closures: Vec<Closure<dyn FnMut()>>,
     point_layers: Vec<PointLayer>,
     line_layers: Vec<LineLayer>,
     polygon_layers: Vec<PolygonLayer>,
@@ -453,12 +415,9 @@ impl RustyleafMap {
             zoom: 2.0,
             canvas: None,
             gl_state: None,
-            tiles: HashMap::new(),
-            tile_textures: Rc::new(RefCell::new(HashMap::new())),
+            tile_loader: TileLoader::new(),
             tile_size: 256,
-            requested: HashSet::new(),
             tile_layer: None,
-            tile_closures: Vec::new(),
             point_layers: Vec::new(),
             line_layers: Vec::new(),
             polygon_layers: Vec::new(),
@@ -504,29 +463,34 @@ impl RustyleafMap {
         }
     }
 
-    // Tile keys needed to fill the current viewport (plus a one-tile buffer), matching
-    // the visibility computation in render_tiles()/load_visible_tiles(). Used so tile-cache
-    // eviction never throws out a tile that's actually on screen right now.
-    fn visible_tile_keys(&self, zoom: u32) -> HashSet<String> {
-        let center_pixel = self.viewport().lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
-        let start_x = center_pixel.0 - (self.width as f64 / 2.0);
-        let start_y = center_pixel.1 - (self.height as f64 / 2.0);
-        let start_tile_x = (start_x / self.tile_size as f64).floor() as i32;
-        let start_tile_y = (start_y / self.tile_size as f64).floor() as i32;
-        let tiles_x = (self.width as f64 / self.tile_size as f64).ceil() as i32 + 2;
-        let tiles_y = (self.height as f64 / self.tile_size as f64).ceil() as i32 + 2;
+    // Tile cache management — delegates to TileLoader
+    fn cleanup_old_tiles(&mut self) {
+        if let Some(ref gl_state) = self.gl_state {
+            self.tile_loader
+                .cleanup_old_tiles(&gl_state.context, &self.viewport());
+        }
+    }
 
-        let mut keys = HashSet::new();
-        for i in 0..tiles_x {
-            for j in 0..tiles_y {
-                let tile_x = start_tile_x + i;
-                let tile_y = start_tile_y + j;
-                if tile_x >= 0 && tile_y >= 0 && tile_x < (1 << zoom) && tile_y < (1 << zoom) {
-                    keys.insert(format!("{}/{}/{}", zoom, tile_x, tile_y));
-                }
+    fn load_visible_tiles(&mut self) {
+        if let Some(ref tile_layer) = self.tile_layer {
+            if let Some(ref gl_state) = self.gl_state {
+                self.tile_loader.load_visible_tiles(
+                    &self.viewport(),
+                    tile_layer,
+                    &gl_state.context,
+                    self.tile_size,
+                );
             }
         }
-        keys
+    }
+
+    fn load_tile(&mut self, coord: TileCoord) {
+        if let Some(ref tile_layer) = self.tile_layer {
+            if let Some(ref gl_state) = self.gl_state {
+                self.tile_loader
+                    .load_tile(coord, tile_layer, &gl_state.context);
+            }
+        }
     }
 
     pub fn set_view(&mut self, lat: f64, lng: f64, zoom: f64) {
@@ -546,23 +510,14 @@ impl RustyleafMap {
     }
 
     fn apply_drag(&mut self, delta_x: f64, delta_y: f64) {
-        // Convert pixel drag to lat/lng change
-        let zoom = self.zoom.round() as u32;
-        let meters_per_pixel = self.meters_per_pixel(zoom);
-        
-        // More accurate coordinate transformation
-        let lat_change = delta_y * meters_per_pixel / 111000.0; // meters to degrees
-        let lng_change = delta_x * meters_per_pixel / (111000.0 * self.center_lat.to_radians().cos());
-        
-        self.center_lat -= lat_change;
-        self.center_lng -= lng_change;
-        
-        // Ensure lat stays within bounds
-        self.center_lat = self.center_lat.max(-85.0).min(85.0);
-        
-        // Clean up old tiles and load new ones
-        self.cleanup_old_tiles();
-        self.load_visible_tiles();
+        apply_drag(
+            delta_x, delta_y,
+            &mut self.drag_velocity,
+            &mut self.drag_accumulated_x, &mut self.drag_accumulated_y,
+            &mut self.last_drag_time,
+            0.7,
+            2000.0,
+        );
     }
     
     fn meters_per_pixel(&self, zoom: u32) -> f64 {
@@ -572,138 +527,25 @@ impl RustyleafMap {
     }
     
     fn apply_momentum(&mut self) {
-        // Google Maps-style momentum with more realistic physics
-        let friction = 0.95; // Slightly higher friction for better control
-        let min_velocity = 2.0; // Lower minimum for smoother stop
-        let max_velocity = 2000.0; // Cap maximum velocity for safety
-
-        // Cap velocity to prevent excessive movement
-        let velocity_magnitude = (self.drag_velocity.0 * self.drag_velocity.0 + self.drag_velocity.1 * self.drag_velocity.1).sqrt();
-        if velocity_magnitude > max_velocity {
-            let scale = max_velocity / velocity_magnitude;
-            self.drag_velocity.0 *= scale;
-            self.drag_velocity.1 *= scale;
-        }
-
-        // Apply friction to velocity
-        self.drag_velocity.0 *= friction;
-        self.drag_velocity.1 *= friction;
-
-        // Calculate actual time delta for smooth animation
-        let current_time = js_sys::Date::now();
-        let delta_time = if self.last_frame_time > 0.0 {
-            (current_time - self.last_frame_time) / 1000.0
-        } else {
-            1.0 / 60.0
-        };
-        self.last_frame_time = current_time;
-
-        // Cap delta time to prevent jumps
-        let delta_time = delta_time.min(1.0 / 30.0).max(1.0 / 120.0);
-
-        // Calculate momentum movement
-        let momentum_x = self.drag_velocity.0 * delta_time;
-        let momentum_y = self.drag_velocity.1 * delta_time;
-
-        // Apply momentum movement with smooth deceleration
-        if momentum_x.abs() > 0.05 || momentum_y.abs() > 0.05 {
-            self.pan(momentum_x, momentum_y);
-        }
-
-        // Check if momentum should stop
-        let current_velocity_magnitude = (self.drag_velocity.0 * self.drag_velocity.0 + self.drag_velocity.1 * self.drag_velocity.1).sqrt();
-        if current_velocity_magnitude < min_velocity {
-            self.drag_velocity = (0.0, 0.0);
-            self.has_momentum = false;
-            self.last_frame_time = 0.0;
+        apply_momentum(
+            &mut self.center_lat, &mut self.center_lng,
+            &mut self.drag_velocity,
+            &mut self.drag_accumulated_x, &mut self.drag_accumulated_y,
+            &mut self.has_momentum,
+            &mut self.last_frame_time,
+        );
+        if self.drag_accumulated_x.abs() > 0.05 || self.drag_accumulated_y.abs() > 0.05 {
+            self.pan(self.drag_accumulated_x, self.drag_accumulated_y);
         }
     }
 
     fn start_momentum_animation(&mut self) {
-        // Only start if we have significant velocity
-        let velocity_magnitude = (self.drag_velocity.0 * self.drag_velocity.0 + self.drag_velocity.1 * self.drag_velocity.1).sqrt();
-        if velocity_magnitude < 15.0 { // Lower threshold for more responsive momentum
-            return;
-        }
-
-        // Set up momentum animation flag
-        self.has_momentum = true;
-
-        // The momentum will be applied in the render loop
-        // This is handled in the render method
-    }
-
-    fn cleanup_old_tiles(&mut self) {
-        let current_zoom = self.zoom.round() as u32;
-        let visible_keys = self.visible_tile_keys(current_zoom);
-        // Budget scales with what the viewport can actually show, so a full screen of
-        // tiles is never itself over the cap (that alone used to cause thrashing at rest).
-        let max_cache_size = (visible_keys.len() * 3).max(20);
-
-        if let Some(ref gl_state) = self.gl_state {
-            let context = &gl_state.context;
-
-            let mut textures = self.tile_textures.borrow_mut();
-
-            // Evict tiles from any other zoom level — never the current visible set.
-            let keys_to_remove: Vec<String> = textures.iter()
-                .filter(|(key, _)| {
-                    let parts: Vec<&str> = key.split('/').collect();
-                    if parts.len() == 3 {
-                        if let Ok(zoom) = parts[0].parse::<u32>() {
-                            zoom != current_zoom
-                        } else { true }
-                    } else { true }
-                })
-                .map(|(key, _)| key.clone())
-                .collect();
-
-            for key in keys_to_remove {
-                if let Some(texture) = textures.remove(&key) {
-                    context.delete_texture(Some(&texture));
-                }
-            }
-
-            // If still over budget, evict same-zoom tiles that are NOT currently on screen.
-            // Tiles in `visible_keys` are never evicted, so a drag can't starve the tiles
-            // it's actively displaying.
-            if textures.len() > max_cache_size {
-                let overflow = textures.len() - max_cache_size;
-                let to_remove: Vec<String> = textures.keys()
-                    .filter(|k| !visible_keys.contains(*k))
-                    .take(overflow)
-                    .cloned()
-                    .collect();
-                for key in to_remove {
-                    if let Some(texture) = textures.remove(&key) {
-                        context.delete_texture(Some(&texture));
-                    }
-                }
-            }
-        }
-        
-        // Clean up requested set to prevent memory bloat
-        if self.requested.len() > 50 {
-            let current_zoom = self.zoom.round() as u32;
-            self.requested.retain(|key| {
-                let parts: Vec<&str> = key.split('/').collect();
-                if parts.len() == 3 {
-                    if let Ok(zoom) = parts[0].parse::<u32>() {
-                        // Only keep requests for current zoom level
-                        zoom == current_zoom
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            });
-        }
+        start_momentum_animation(&self.drag_velocity, &mut self.has_momentum);
     }
 
     fn cleanup_gl_resources(&mut self) {
         // Delete tile textures (still raw, not RAII-wrapped)
-        let mut textures = self.tile_textures.borrow_mut();
+        let mut textures = self.tile_loader.textures.borrow_mut();
         if let Some(ref gl_state) = self.gl_state {
             for (_key, texture) in textures.drain() {
                 gl_state.context.delete_texture(Some(&texture));
@@ -1069,15 +911,9 @@ impl RustyleafMap {
             return Ok(());
         };
 
-        // Apply momentum if active
+        // Apply momentum if active (stop conditions handled internally)
         if self.has_momentum {
             self.apply_momentum();
-            // Stop momentum if velocity becomes too low
-            let velocity_magnitude = (self.drag_velocity.0 * self.drag_velocity.0 + self.drag_velocity.1 * self.drag_velocity.1).sqrt();
-            if velocity_magnitude < 5.0 {
-                self.has_momentum = false;
-                self.drag_velocity = (0.0, 0.0);
-            }
         }
 
         // Clear the canvas
@@ -1154,7 +990,7 @@ impl RustyleafMap {
                         let pixel_x = (tile_x * self.tile_size as i32) as f64 - start_x;
                         let pixel_y = (tile_y * self.tile_size as i32) as f64 - start_y;
 
-                        if let Some(texture) = self.tile_textures.borrow().get(&key) {
+                        if let Some(texture) = self.tile_loader.textures.borrow().get(&key) {
                                 tiles_found += 1;
                                 
                                 // Bind texture
@@ -1207,7 +1043,7 @@ impl RustyleafMap {
                             } else {
                                 // Request tile if not yet in cache - force immediate load
                                 let tile_coord = TileCoord { x: tile_x, y: tile_y, z: tile_zoom };
-                                let should_load = !self.requested.contains(&key);
+                                let should_load = !self.tile_loader.requested.contains(&key);
                                 if should_load {
                                     tiles_to_load.push((key.clone(), tile_coord));
                                 }
@@ -1222,7 +1058,7 @@ impl RustyleafMap {
             
             // Load tiles that were missing
             for (key, tile_coord) in tiles_to_load {
-                self.requested.insert(key);
+                self.tile_loader.requested.insert(key);
                 self.load_tile(tile_coord);
             }
             
@@ -1493,131 +1329,6 @@ impl RustyleafMap {
     }
 
     // removed stale canvas 2D debug renderer
-
-    fn load_visible_tiles(&mut self) {
-        self.cleanup_old_tiles();
-        let zoom = self.zoom.round() as u32;
-        let center_pixel = self.viewport().lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
-
-        let start_x = center_pixel.0 - (self.width as f64 / 2.0);
-        let start_y = center_pixel.1 - (self.height as f64 / 2.0);
-
-        let start_tile_x = (start_x / self.tile_size as f64).floor() as i32;
-        let start_tile_y = (start_y / self.tile_size as f64).floor() as i32;
-
-        let tiles_x = (self.width as f64 / self.tile_size as f64).ceil() as i32 + 1;
-        let tiles_y = (self.height as f64 / self.tile_size as f64).ceil() as i32 + 1;
-
-        // Limit the number of tiles we try to load at once
-        let mut load_count = 0;
-        let max_load_per_frame = 3; // Ultra conservative loading
-
-        for x in (start_tile_x)..(start_tile_x + tiles_x) {
-            for y in (start_tile_y)..(start_tile_y + tiles_y) {
-                if x >= 0 && y >= 0 && x < (1 << zoom) && y < (1 << zoom) {
-                    let tile_coord = TileCoord { x, y, z: zoom };
-                    let tile_key = format!("{}/{}/{}", zoom, x, y);
-                    let already_requested = self.requested.contains(&tile_key);
-                    let already_cached = self.tile_textures.borrow().contains_key(&tile_key);
-
-                    if !already_requested && !already_cached && load_count < max_load_per_frame {
-                        let tile = Tile {
-                            coord: tile_coord.clone(),
-                            texture: None,
-                            loading: false,
-                        };
-                        self.tiles.insert(tile_key.clone(), tile);
-                        self.requested.insert(tile_key.clone());
-                        self.load_tile(tile_coord);
-                        load_count += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    fn load_tile(&mut self, coord: TileCoord) {
-        let tile_key = format!("{}/{}/{}", coord.z, coord.x, coord.y);
-        let url = if let Some(layer) = &self.tile_layer {
-            // Support subdomains like {s}
-            let subdomain = layer.subdomains.get(((coord.x + coord.y) as usize) % layer.subdomains.len()).cloned().unwrap_or_else(|| "a".to_string());
-            layer.url_template
-                .replace("{s}", &subdomain)
-                .replace("{z}", &coord.z.to_string())
-                .replace("{x}", &coord.x.to_string())
-                .replace("{y}", &coord.y.to_string())
-        } else {
-            format!("https://tile.openstreetmap.org/{}/{}/{}.png", coord.z, coord.x, coord.y)
-        };
-
-        if let Some(tile) = self.tiles.get_mut(&tile_key) {
-            if tile.loading || tile.texture.is_some() {
-                return;
-            }
-            tile.loading = true;
-        }
-
-    
-        if let Some(ref gl_state) = self.gl_state {
-            let context = &gl_state.context;
-
-            // Create image element for tile
-            let image = HtmlImageElement::new().unwrap();
-            // Ensure CORS so textures can be used by WebGL
-            image.set_cross_origin(Some("anonymous"));
-
-            // Clone the tile key and context for the closure
-            let tile_key_clone = tile_key.clone();
-            let tile_key_clone2 = tile_key.clone(); // For error handler
-            let url_clone = url.clone();
-            let img_clone = image.clone();
-            let context_clone = context.clone();
-            let tile_textures = Rc::clone(&self.tile_textures);
-
-            // Set up onload handler
-            let onload_closure = Closure::wrap(Box::new(move || {
-                // Create WebGL texture from the loaded image
-                let texture = match context_clone.create_texture() {
-                    Some(tex) => tex,
-                    None => {
-                        web_sys::console::error_1(&JsValue::from_str(&format!(
-                            "Failed to create texture for tile: {}", tile_key_clone
-                        )));
-                        return;
-                    }
-                };
-                context_clone.bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(&texture));
-
-                // Set texture parameters for proper tile rendering
-                context_clone.tex_parameteri(WebGl2RenderingContext::TEXTURE_2D, WebGl2RenderingContext::TEXTURE_WRAP_S, WebGl2RenderingContext::CLAMP_TO_EDGE as i32);
-                context_clone.tex_parameteri(WebGl2RenderingContext::TEXTURE_2D, WebGl2RenderingContext::TEXTURE_WRAP_T, WebGl2RenderingContext::CLAMP_TO_EDGE as i32);
-                context_clone.tex_parameteri(WebGl2RenderingContext::TEXTURE_2D, WebGl2RenderingContext::TEXTURE_MIN_FILTER, WebGl2RenderingContext::LINEAR as i32);
-                context_clone.tex_parameteri(WebGl2RenderingContext::TEXTURE_2D, WebGl2RenderingContext::TEXTURE_MAG_FILTER, WebGl2RenderingContext::LINEAR as i32);
-
-                // Upload image to texture
-                let result = context_clone.tex_image_2d_with_u32_and_u32_and_html_image_element(
-                    WebGl2RenderingContext::TEXTURE_2D,
-                    0,
-                    WebGl2RenderingContext::RGBA as i32,
-                    WebGl2RenderingContext::RGBA,
-                    WebGl2RenderingContext::UNSIGNED_BYTE,
-                    &img_clone,
-                );
-
-                if let Ok(_) = result {
-                    // Store the texture
-                    tile_textures.borrow_mut().insert(tile_key_clone.clone(), texture);
-                }
-            }) as Box<dyn FnMut()>);
-
-            image.set_onload(Some(onload_closure.as_ref().unchecked_ref()));
-            image.set_onerror(Some(onload_closure.as_ref().unchecked_ref()));
-            self.tile_closures.push(onload_closure);
-
-            // Start loading the image
-            image.set_src(&url);
-        }
-    }
 
     // Event handling methods (simplified)
     fn trigger_feature_click(&mut self, hit_info: serde_json::Value) {
@@ -2359,7 +2070,7 @@ impl RustyleafMap {
         // Set event handlers
         xhr.set_onload(Some(onload.as_ref().unchecked_ref()));
         xhr.set_onerror(Some(onload.as_ref().unchecked_ref()));
-        self.tile_closures.push(onload);
+        self.tile_loader.closures.push(onload);
 
         // Send the request
         xhr.send().map_err(|e| JsValue::from_str(&format!("Failed to send request: {:?}", e)))?;
@@ -2481,31 +2192,21 @@ impl RustyleafMap {
             let delta_x = canvas_x - self.mouse_state.last_x;
             let delta_y = canvas_y - self.mouse_state.last_y;
 
-            // Calculate current time for velocity calculation
-            let current_time = js_sys::Date::now();
-            let time_delta = (current_time - self.last_drag_time) / 1000.0; // Convert to seconds
-
-            if time_delta > 0.0 && time_delta < 0.1 { // Prevent division by very small numbers
-                // Use weighted average for smoother velocity calculation
-                let new_velocity_x = delta_x / time_delta;
-                let new_velocity_y = delta_y / time_delta;
-
-                // Smooth velocity changes (similar to Google Maps)
-                let smoothing_factor = 0.7;
-                self.drag_velocity.0 = self.drag_velocity.0 * smoothing_factor + new_velocity_x * (1.0 - smoothing_factor);
-                self.drag_velocity.1 = self.drag_velocity.1 * smoothing_factor + new_velocity_y * (1.0 - smoothing_factor);
-            }
-
-            // Accumulate drag movement
-            self.drag_accumulated_x += delta_x;
-            self.drag_accumulated_y += delta_y;
+            // Apply drag velocity tracking and momentum accumulation
+            apply_drag(
+                delta_x, delta_y,
+                &mut self.drag_velocity,
+                &mut self.drag_accumulated_x, &mut self.drag_accumulated_y,
+                &mut self.last_drag_time,
+                0.7,
+                2000.0,
+            );
 
             // Apply drag immediately for smooth response using precise pixel-based panning
             self.pan(delta_x, delta_y);
 
             self.mouse_state.last_x = canvas_x;
             self.mouse_state.last_y = canvas_y;
-            self.last_drag_time = current_time;
         }
     }
 
@@ -3536,129 +3237,14 @@ impl RustyleafMap {
 
     // Spatial indexing and hit-testing methods
     fn rebuild_spatial_index(&mut self) {
-        if !self.spatial_index_dirty {
-            return;
-        }
-
-        let mut new_index = RTree::new();
-        let mut feature_id = 0;
-        let tolerance = 0.001; // degrees — ~111m at equator
-
-        // Index point features
-        for (layer_idx, layer) in self.point_layers.iter().enumerate() {
-            for (point_idx, point) in layer.points.iter().enumerate() {
-                let bounds = AABB::from_corners(
-                    [point.lng - tolerance, point.lat - tolerance],
-                    [point.lng + tolerance, point.lat + tolerance]
-                );
-
-                let mut meta = serde_json::json!({});
-                meta["layer_type"] = "point".into();
-                meta["layer_index"] = layer_idx.into();
-                meta["feature_index"] = point_idx.into();
-                meta["original_meta"] = point.meta.clone();
-
-                let feature = SpatialFeature {
-                    id: feature_id,
-                    bounds,
-                    meta,
-                };
-
-                new_index.insert(feature);
-                feature_id += 1;
-            }
-        }
-
-        // Index line features (simplified - index line segments)
-        for (layer_idx, layer) in self.line_layers.iter().enumerate() {
-            for (line_idx, line) in layer.lines.iter().enumerate() {
-                // Index each line segment with tolerance
-                for i in 0..line.points.len().saturating_sub(1) {
-                    let start = line.points[i];
-                    let end = line.points[i + 1];
-
-                    let min_x = start[1].min(end[1]) - tolerance;
-                    let max_x = start[1].max(end[1]) + tolerance;
-                    let min_y = start[0].min(end[0]) - tolerance;
-                    let max_y = start[0].max(end[0]) + tolerance;
-
-                    let bounds = AABB::from_corners([min_x, min_y], [max_x, max_y]);
-
-                    let mut meta = serde_json::json!({});
-                    meta["layer_type"] = "line".into();
-                    meta["layer_index"] = layer_idx.into();
-                    meta["feature_index"] = line_idx.into();
-                    meta["segment_index"] = i.into();
-                    meta["original_meta"] = line.meta.clone();
-
-                    let feature = SpatialFeature {
-                        id: feature_id,
-                        bounds,
-                        meta,
-                    };
-
-                    new_index.insert(feature);
-                    feature_id += 1;
-                }
-            }
-        }
-
-        // Index polygon features (centroid-based hits for now)
-        for (layer_idx, layer) in self.polygon_layers.iter().enumerate() {
-            for (poly_idx, poly) in layer.polygons.iter().enumerate() {
-                if let Some(ring) = poly.rings.first() {
-                    if ring.len() >= 3 {
-                        let (sum_lat, sum_lng) = ring.iter()
-                            .fold((0.0, 0.0), |(sy, sx), p| (sy + p[0], sx + p[1]));
-                        let n = ring.len() as f64;
-                        let (lat, lng) = (sum_lat / n, sum_lng / n);
-                        let bounds = AABB::from_corners(
-                            [lng - tolerance, lat - tolerance],
-                            [lng + tolerance, lat + tolerance]
-                        );
-                        let mut meta = serde_json::json!({});
-                        meta["layer_type"] = "polygon".into();
-                        meta["layer_index"] = layer_idx.into();
-                        meta["feature_index"] = poly_idx.into();
-                        meta["original_meta"] = poly.meta.clone();
-                        new_index.insert(SpatialFeature { id: feature_id, bounds, meta });
-                        feature_id += 1;
-                    }
-                }
-            }
-        }
-
-        self.spatial_index = new_index;
-        self.spatial_index_dirty = false;
+        rebuild_spatial_index(
+            &self.point_layers, &self.line_layers, &self.polygon_layers,
+            &mut self.spatial_index, &mut self.spatial_index_dirty
+        );
     }
 
     fn hit_test(&self, x: f64, y: f64) -> Option<serde_json::Value> {
-        let tolerance = 0.001; // degrees
-        let point_array = Array::new();
-        point_array.push(&JsValue::from_f64(x));
-        point_array.push(&JsValue::from_f64(y));
-        let latlng = self.unproject(&point_array.into());
-        if latlng.length() != 2 {
-            return None;
-        }
-        let lat = latlng.get(0).as_f64().unwrap_or(0.0);
-        let lng = latlng.get(1).as_f64().unwrap_or(0.0);
-
-        let search_bounds = AABB::from_corners(
-            [lng - tolerance, lat - tolerance],
-            [lng + tolerance, lat + tolerance]
-        );
-
-        let results: Vec<SpatialFeature> = self.spatial_index
-            .locate_in_envelope(&search_bounds)
-            .cloned()
-            .collect();
-
-        for feature in results {
-            return Some(feature.meta.clone());
-        }
-
-        None
+        spatial_hit_test(&self.viewport(), &self.spatial_index, x, y)
     }
 
     fn rebuild_geojson_cache(&mut self, layer_index: usize) -> Result<(), JsValue> {
