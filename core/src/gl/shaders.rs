@@ -1,4 +1,5 @@
 use crate::OwnedProgram;
+use crate::error::RustyleafError;
 use wasm_bindgen::JsValue;
 use web_sys::{WebGl2RenderingContext, WebGlProgram, WebGlShader};
 
@@ -120,7 +121,7 @@ pub(crate) fn create_shader(
 ) -> Result<WebGlShader, JsValue> {
     let shader = context
         .create_shader(shader_type)
-        .ok_or_else(|| JsValue::from_str("Failed to create shader"))?;
+        .ok_or_else(|| RustyleafError::ResourceError("Failed to create shader".into()))?;
     context.shader_source(&shader, source);
     context.compile_shader(&shader);
 
@@ -132,10 +133,16 @@ pub(crate) fn create_shader(
         let info = context
             .get_shader_info_log(&shader)
             .unwrap_or_else(|| "Unknown error".to_string());
-        return Err(JsValue::from_str(&format!(
-            "Shader compilation error: {}",
-            info
-        )));
+        let shader_type_str = match shader_type {
+            WebGl2RenderingContext::VERTEX_SHADER => "vertex",
+            WebGl2RenderingContext::FRAGMENT_SHADER => "fragment",
+            _ => "unknown",
+        };
+        return Err(RustyleafError::ShaderCompilation {
+            shader_type: shader_type_str.to_string(),
+            log: info,
+        }
+        .into());
     }
 
     Ok(shader)
@@ -148,7 +155,7 @@ pub(crate) fn create_program(
 ) -> Result<WebGlProgram, JsValue> {
     let program = context
         .create_program()
-        .ok_or_else(|| JsValue::from_str("Failed to create program"))?;
+        .ok_or_else(|| RustyleafError::ProgramCreation("Failed to create program".into()))?;
     context.attach_shader(&program, vertex_shader);
     context.attach_shader(&program, fragment_shader);
     context.link_program(&program);
@@ -161,10 +168,7 @@ pub(crate) fn create_program(
         let info = context
             .get_program_info_log(&program)
             .unwrap_or_else(|| "Unknown error".to_string());
-        return Err(JsValue::from_str(&format!(
-            "Program linking error: {}",
-            info
-        )));
+        return Err(RustyleafError::ShaderLink(info).into());
     }
 
     Ok(program)
@@ -178,7 +182,7 @@ pub(crate) fn create_program_with_bindings(
 ) -> Result<WebGlProgram, JsValue> {
     let program = context
         .create_program()
-        .ok_or_else(|| JsValue::from_str("Failed to create program"))?;
+        .ok_or_else(|| RustyleafError::ProgramCreation("Failed to create program".into()))?;
     context.attach_shader(&program, vertex_shader);
     context.attach_shader(&program, fragment_shader);
     for (index, name) in bindings {
@@ -194,10 +198,7 @@ pub(crate) fn create_program_with_bindings(
         let info = context
             .get_program_info_log(&program)
             .unwrap_or_else(|| "Unknown error".to_string());
-        return Err(JsValue::from_str(&format!(
-            "Program linking error: {}",
-            info
-        )));
+        return Err(RustyleafError::ShaderLink(info).into());
     }
 
     Ok(program)

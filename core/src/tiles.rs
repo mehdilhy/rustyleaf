@@ -7,6 +7,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
 use crate::projection::Viewport;
+use crate::error::RustyleafError;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TileCoord {
@@ -188,7 +189,15 @@ impl TileLoader {
             tile.loading = true;
         }
 
-        let image = HtmlImageElement::new().unwrap();
+        let image = match HtmlImageElement::new() {
+            Ok(img) => img,
+            Err(_) => {
+                web_sys::console::error_1(
+                    &JsValue::from(RustyleafError::DomError("Failed to create HTMLImageElement".into())),
+                );
+                return;
+            }
+        };
         image.set_cross_origin(Some("anonymous"));
 
         let tile_key_clone = tile_key.clone();
@@ -200,10 +209,10 @@ impl TileLoader {
             let texture = match context_clone.create_texture() {
                 Some(tex) => tex,
                 None => {
-                    web_sys::console::error_1(&JsValue::from_str(&format!(
+                    web_sys::console::error_1(&JsValue::from(RustyleafError::TextureCreation(format!(
                         "Failed to create texture for tile: {}",
                         tile_key_clone
-                    )));
+                    ))));
                     return;
                 }
             };

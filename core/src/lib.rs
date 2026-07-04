@@ -93,13 +93,13 @@ impl OwnedProgram {
 
 // Animation frame helpers
 fn request_animation_frame(closure: &js_sys::Function) -> Result<i32, JsValue> {
-    let window = window().ok_or_else(|| JsValue::from_str("Window not available"))?;
+    let window = window().ok_or_else(|| RustyleafError::DomError("Window not available".into()))?;
     window.request_animation_frame(closure)
-        .map_err(|_| JsValue::from_str("Failed to request animation frame"))
+        .map_err(|_| RustyleafError::ResourceError("Failed to request animation frame".into()).into())
 }
 
 fn cancel_animation_frame(handle: i32) -> Result<(), JsValue> {
-    let window = window().ok_or_else(|| JsValue::from_str("Window not available"))?;
+    let window = window().ok_or_else(|| RustyleafError::DomError("Window not available".into()))?;
     let _ = window.cancel_animation_frame(handle);
     Ok(())
 }
@@ -119,6 +119,7 @@ mod input;
 mod events;
 mod layers;
 mod gl;
+mod render;
 use crate::projection::Viewport;
 use crate::color::parse_color;
 use crate::tiles::{TileCoord, TileLayer, TileLoader};
@@ -131,27 +132,28 @@ use crate::layers::line::{LineFeature, LineLayer};
 use crate::layers::polygon::{PolygonFeature, PolygonLayer};
 use crate::layers::geojson::{GeoJSONLayer, GeoJSONFeature, GeoJSONGeometry, GeoJSONStyle};
 use crate::gl::shaders::{self, ShaderPrograms};
+use crate::error::RustyleafError;
 
 // Coordinate and spatial data structures (TileCoord, Tile moved to crate::tiles, SpatialFeature moved to crate::spatial)
 // MouseState moved to crate::input
 // ShaderPrograms moved to crate::gl::shaders
 
 // WebGL buffers and state
-struct WebGlState {
-    context: WebGl2RenderingContext,
-    programs: ShaderPrograms,
-    tile_vao: OwnedVAO,
-    point_vao: OwnedVAO,
-    line_vao: OwnedVAO,
-    polygon_vao: OwnedVAO,
-    tile_buffer: OwnedBuffer,
-    point_buffer: OwnedBuffer,
-    line_buffer: OwnedBuffer,
-    polygon_buffer: OwnedBuffer,
-    polygon_u_origin: Option<WebGlUniformLocation>,
-    polygon_u_world_scale: Option<WebGlUniformLocation>,
-    line_u_origin: Option<WebGlUniformLocation>,
-    line_u_world_scale: Option<WebGlUniformLocation>,
+pub(crate) struct WebGlState {
+    pub(crate) context: WebGl2RenderingContext,
+    pub(crate) programs: ShaderPrograms,
+    pub(crate) tile_vao: OwnedVAO,
+    pub(crate) point_vao: OwnedVAO,
+    pub(crate) line_vao: OwnedVAO,
+    pub(crate) polygon_vao: OwnedVAO,
+    pub(crate) tile_buffer: OwnedBuffer,
+    pub(crate) point_buffer: OwnedBuffer,
+    pub(crate) line_buffer: OwnedBuffer,
+    pub(crate) polygon_buffer: OwnedBuffer,
+    pub(crate) polygon_u_origin: Option<WebGlUniformLocation>,
+    pub(crate) polygon_u_world_scale: Option<WebGlUniformLocation>,
+    pub(crate) line_u_origin: Option<WebGlUniformLocation>,
+    pub(crate) line_u_world_scale: Option<WebGlUniformLocation>,
 }
 
 // Event callback types
@@ -206,15 +208,15 @@ impl WebGlSupportInfo {
     
     #[wasm_bindgen]
     pub fn check_webgl_support() -> Result<WebGlSupportInfo, JsValue> {
-        let window = window().ok_or_else(|| JsValue::from_str("Window not available"))?;
-        let document = window.document().ok_or_else(|| JsValue::from_str("Document not available"))?;
+        let window = window().ok_or_else(|| RustyleafError::DomError("Window not available".into()))?;
+        let document = window.document().ok_or_else(|| RustyleafError::DomError("Document not available".into()))?;
         
         // Create a temporary canvas to test WebGL support
         let canvas = document
             .create_element("canvas")
-            .map_err(|e| JsValue::from_str(&format!("Failed to create canvas: {:?}", e)))?
+            .map_err(|e| RustyleafError::CanvasInit(format!("Failed to create canvas: {:?}", e)))?
             .dyn_into::<HtmlCanvasElement>()
-            .map_err(|_| JsValue::from_str("Failed to create canvas element"))?;
+            .map_err(|_| RustyleafError::CanvasInit("Failed to create canvas element".into()))?;
         
         let mut info = WebGlSupportInfo {
             webgl2_available: false,
@@ -455,25 +457,26 @@ impl RustyleafMap {
         // Check WebGL compatibility first
         let webgl_info = WebGlSupportInfo::check_webgl_support()?;
         if !webgl_info.is_supported() {
-            return Err(JsValue::from_str(&format!(
+            return Err(RustyleafError::WebGlUnavailable(format!(
                 "WebGL not supported. Support level: {}. Please use a modern browser with WebGL enabled.",
                 webgl_info.get_support_level()
-            )));
+            ))
+            .into());
         }
         
         if !webgl_info.webgl2_available && webgl_info.webgl1_fallback {
-            web_sys::console::warn_1(&JsValue::from_str(
-                "⚠️ WebGL2 not available, falling back to WebGL1. Some features may be limited."
-            ));
+            web_sys::console::warn_1(&JsValue::from(RustyleafError::WebGlUnavailable(
+                "WebGL2 not available, falling back to WebGL1. Some features may be limited.".into()
+            )));
         }
 
-        let window = window().ok_or_else(|| JsValue::from_str("Window not available"))?;
-        let document = window.document().ok_or_else(|| JsValue::from_str("Document not available"))?;
+        let window = window().ok_or_else(|| RustyleafError::DomError("Window not available".into()))?;
+        let document = window.document().ok_or_else(|| RustyleafError::DomError("Document not available".into()))?;
         let canvas = document
             .get_element_by_id(canvas_id)
-            .ok_or_else(|| JsValue::from_str(&format!("Canvas element with id '{}' not found", canvas_id)))?
+            .ok_or_else(|| RustyleafError::DomError(format!("Canvas element with id '{}' not found", canvas_id)))?
             .dyn_into::<HtmlCanvasElement>()
-            .map_err(|_| JsValue::from_str("Element is not a canvas"))?;
+            .map_err(|_| RustyleafError::DomError("Element is not a canvas".into()))?;
 
         canvas.set_width(self.width);
         canvas.set_height(self.height);
@@ -483,9 +486,9 @@ impl RustyleafMap {
             attrs.set_preserve_drawing_buffer(true);
             canvas
                 .get_context_with_context_options("webgl2", &attrs.into())?
-                .ok_or_else(|| JsValue::from_str("WebGL2 context not available"))?
+                .ok_or_else(|| RustyleafError::WebGlUnavailable("WebGL2 context not available".into()))?
                 .dyn_into::<WebGl2RenderingContext>()
-                .map_err(|_| JsValue::from_str("Failed to get WebGL2 context"))?
+                .map_err(|_| RustyleafError::WebGlUnavailable("Failed to get WebGL2 context".into()))?
         };
 
         self.canvas = Some(canvas);
@@ -510,15 +513,15 @@ impl RustyleafMap {
         let line_u_world_scale = context.get_uniform_location(programs.line_program.inner(), "u_world_scale");
 
         // Create VAOs and buffers with error handling
-        let tile_vao = context.create_vertex_array().ok_or_else(|| JsValue::from_str("Failed to create tile VAO"))?;
-        let point_vao = context.create_vertex_array().ok_or_else(|| JsValue::from_str("Failed to create point VAO"))?;
-        let line_vao = context.create_vertex_array().ok_or_else(|| JsValue::from_str("Failed to create line VAO"))?;
-        let polygon_vao = context.create_vertex_array().ok_or_else(|| JsValue::from_str("Failed to create polygon VAO"))?;
+        let tile_vao = context.create_vertex_array().ok_or_else(|| RustyleafError::VaoCreation("Failed to create tile VAO".into()))?;
+        let point_vao = context.create_vertex_array().ok_or_else(|| RustyleafError::VaoCreation("Failed to create point VAO".into()))?;
+        let line_vao = context.create_vertex_array().ok_or_else(|| RustyleafError::VaoCreation("Failed to create line VAO".into()))?;
+        let polygon_vao = context.create_vertex_array().ok_or_else(|| RustyleafError::VaoCreation("Failed to create polygon VAO".into()))?;
 
-        let tile_buffer = context.create_buffer().ok_or_else(|| JsValue::from_str("Failed to create tile buffer"))?;
-        let point_buffer = context.create_buffer().ok_or_else(|| JsValue::from_str("Failed to create point buffer"))?;
-        let line_buffer = context.create_buffer().ok_or_else(|| JsValue::from_str("Failed to create line buffer"))?;
-        let polygon_buffer = context.create_buffer().ok_or_else(|| JsValue::from_str("Failed to create polygon buffer"))?;
+        let tile_buffer = context.create_buffer().ok_or_else(|| RustyleafError::BufferCreation("Failed to create tile buffer".into()))?;
+        let point_buffer = context.create_buffer().ok_or_else(|| RustyleafError::BufferCreation("Failed to create point buffer".into()))?;
+        let line_buffer = context.create_buffer().ok_or_else(|| RustyleafError::BufferCreation("Failed to create line buffer".into()))?;
+        let polygon_buffer = context.create_buffer().ok_or_else(|| RustyleafError::BufferCreation("Failed to create polygon buffer".into()))?;
 
         // Setup tile VAO with fixed attribute indices (matched via bind_attrib_location)
         context.bind_vertex_array(Some(&tile_vao));
@@ -608,131 +611,25 @@ impl RustyleafMap {
         }
 
         if let Some(ref gl_state) = self.gl_state {
-            let tile_zoom = self.zoom.round() as u32;
-            
-            let center_pixel = self.viewport().lat_lng_to_pixel(self.center_lat, self.center_lng, tile_zoom);
-            
-            let start_x = center_pixel.0 - (self.width as f64 / 2.0);
-            let start_y = center_pixel.1 - (self.height as f64 / 2.0);
-
-            let start_tile_x = (start_x / self.tile_size as f64).floor() as i32;
-            let start_tile_y = (start_y / self.tile_size as f64).floor() as i32;
-            let tiles_x = (self.width as f64 / self.tile_size as f64).ceil() as i32 + 2;
-            let tiles_y = (self.height as f64 / self.tile_size as f64).ceil() as i32 + 2;
-
-            // Use tile shader program
-            context.use_program(Some(gl_state.programs.tile_program.inner()));
-            context.bind_vertex_array(Some(gl_state.tile_vao.inner()));
-
-            // Set up projection matrix - orthographic projection for 2D tiles
             let projection_matrix = [
                 2.0 / self.width as f32, 0.0, 0.0, 0.0,
                 0.0, -2.0 / self.height as f32, 0.0, 0.0,
                 0.0, 0.0, -1.0, 0.0,
                 -1.0, 1.0, 0.0, 1.0,
             ];
-            let u_matrix: Option<WebGlUniformLocation> = context.get_uniform_location(gl_state.programs.tile_program.inner(), "u_matrix");
-            if let Some(loc) = u_matrix.as_ref() {
-                context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
-            }
+            let tiles_to_load = render::tiles::render_tiles(
+                context,
+                gl_state,
+                &self.tile_loader,
+                self.tile_size,
+                &self.viewport(),
+                &projection_matrix,
+            )?;
 
-            // Set up texture uniform
-            let u_texture: Option<WebGlUniformLocation> = context.get_uniform_location(gl_state.programs.tile_program.inner(), "u_texture");
-            if let Some(loc) = u_texture.as_ref() {
-                context.uniform1i(Some(loc), 0); // Use texture unit 0
-            }
-
-            // Enable blending for transparent tiles
-            context.enable(WebGl2RenderingContext::BLEND);
-            context.blend_func(WebGl2RenderingContext::SRC_ALPHA, WebGl2RenderingContext::ONE_MINUS_SRC_ALPHA);
-
-            let mut tiles_rendered = 0;
-            let mut tiles_found = 0;
-            let mut tiles_to_load = Vec::new();
-            for i in 0..tiles_x {
-                for j in 0..tiles_y {
-                    let tile_x = start_tile_x + i;
-                    let tile_y = start_tile_y + j;
-
-                    if tile_x >= 0 && tile_y >= 0 && tile_x < (1 << tile_zoom) && tile_y < (1 << tile_zoom) {
-                        let key = format!("{}/{}/{}", tile_zoom, tile_x, tile_y);
-                        let pixel_x = (tile_x * self.tile_size as i32) as f64 - start_x;
-                        let pixel_y = (tile_y * self.tile_size as i32) as f64 - start_y;
-
-                        if let Some(texture) = self.tile_loader.textures.borrow().get(&key) {
-                                tiles_found += 1;
-                                
-                                // Bind texture
-                                context.active_texture(WebGl2RenderingContext::TEXTURE0);
-                                context.bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(texture));
-
-                                // Create quad vertices for this tile in pixel coordinates
-                                let vertices = Float32Array::new_with_length(16);
-
-                                // Pixel coordinates (0,0 at top-left)
-                                let x0 = pixel_x as f32;
-                                let y0 = pixel_y as f32;
-                                let x1 = (pixel_x + self.tile_size as f64) as f32;
-                                let y1 = (pixel_y + self.tile_size as f64) as f32;
-
-                                // Top-left
-                                vertices.set_index(0, x0);
-                                vertices.set_index(1, y0);
-                                vertices.set_index(2, 0.0);
-                                vertices.set_index(3, 0.0);
-
-                                // Bottom-left
-                                vertices.set_index(4, x0);
-                                vertices.set_index(5, y1);
-                                vertices.set_index(6, 0.0);
-                                vertices.set_index(7, 1.0);
-
-                                // Top-right
-                                vertices.set_index(8, x1);
-                                vertices.set_index(9, y0);
-                                vertices.set_index(10, 1.0);
-                                vertices.set_index(11, 0.0);
-
-                                // Bottom-right
-                                vertices.set_index(12, x1);
-                                vertices.set_index(13, y1);
-                                vertices.set_index(14, 1.0);
-                                vertices.set_index(15, 1.0);
-
-                                context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(gl_state.tile_buffer.inner()));
-                                context.buffer_data_with_array_buffer_view(
-                                    WebGl2RenderingContext::ARRAY_BUFFER,
-                                    &vertices,
-                                    WebGl2RenderingContext::DYNAMIC_DRAW,
-                                );
-
-                                // Draw the tile
-                                context.draw_arrays(WebGl2RenderingContext::TRIANGLE_STRIP, 0, 4);
-                                tiles_rendered += 1;
-                            } else {
-                                // Request tile if not yet in cache - force immediate load
-                                let tile_coord = TileCoord { x: tile_x, y: tile_y, z: tile_zoom };
-                                let should_load = !self.tile_loader.requested.contains(&key);
-                                if should_load {
-                                    tiles_to_load.push((key.clone(), tile_coord));
-                                }
-                            }
-                        }
-                    }
-                }
-            
-            if tiles_rendered == 0 {
-                // No tiles rendered - could indicate various issues
-            }
-            
-            // Load tiles that were missing
             for (key, tile_coord) in tiles_to_load {
                 self.tile_loader.requested.insert(key);
                 self.load_tile(tile_coord);
             }
-            
-            // Disable blending when done
-            context.disable(WebGl2RenderingContext::BLEND);
         }
 
         Ok(())
@@ -744,46 +641,10 @@ impl RustyleafMap {
         }
 
         if let Some(ref gl_state) = self.gl_state {
-            context.use_program(Some(gl_state.programs.point_program.inner()));
-            context.bind_vertex_array(Some(gl_state.point_vao.inner()));
-
-            for layer in &self.point_layers {
-                if !layer.visible {
-                    continue;
-                }
-
-                // Collect all point data
-                let mut vertex_data = Vec::new();
-
-                for point in layer.points.iter() {
-                    let screen_pos = self.viewport().lat_lng_to_screen(point.lat, point.lng);
-                    vertex_data.extend_from_slice(&[
-                        screen_pos.0 as f32, screen_pos.1 as f32,
-                        point.size,
-                        point.color[0], point.color[1], point.color[2], point.color[3],
-                    ]);
-                }
-
-                if !vertex_data.is_empty() {
-                    let vertices = Float32Array::new_with_length(vertex_data.len() as u32);
-                    for (i, &val) in vertex_data.iter().enumerate() {
-                        vertices.set_index(i as u32, val);
-                    }
-
-                    context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(gl_state.point_buffer.inner()));
-                    context.buffer_data_with_array_buffer_view(
-                        WebGl2RenderingContext::ARRAY_BUFFER,
-                        &vertices,
-                        WebGl2RenderingContext::STATIC_DRAW,
-                    );
-
-                    // Draw points
-                    context.draw_arrays(WebGl2RenderingContext::POINTS, 0, layer.points.len() as i32);
-                }
-            }
+            render::points::render_points(context, gl_state, &self.point_layers, &self.viewport())
+        } else {
+            Ok(())
         }
-
-        Ok(())
     }
 
     fn render_lines(&mut self, context: &WebGl2RenderingContext) -> Result<(), JsValue> {
@@ -792,77 +653,10 @@ impl RustyleafMap {
         }
 
         if let Some(ref gl_state) = self.gl_state {
-            context.use_program(Some(gl_state.programs.line_program.inner()));
-            context.bind_vertex_array(Some(gl_state.line_vao.inner()));
-
-            for layer in &self.line_layers {
-                if !layer.visible {
-                    continue;
-                }
-
-                // Collect all line segment data
-                let mut vertex_data = Vec::new();
-
-                for line in layer.lines.iter() {
-                    // Convert line points to screen coordinates and create segments
-                    for i in 0..line.points.len().saturating_sub(1) {
-                        let start = line.points[i];
-                        let end = line.points[i + 1];
-                        
-                        let start_screen = self.viewport().lat_lng_to_screen(start[0], start[1]);
-                        let end_screen = self.viewport().lat_lng_to_screen(end[0], end[1]);
-                        
-                        // Create line segment with points and attributes
-                        // Each segment gets both endpoints with the same color
-                        vertex_data.extend_from_slice(&[
-                            start_screen.0 as f32, start_screen.1 as f32,
-                            line.color[0], line.color[1], line.color[2], line.color[3],
-                            end_screen.0 as f32, end_screen.1 as f32,
-                            line.color[0], line.color[1], line.color[2], line.color[3],
-                        ]);
-                    }
-                }
-
-                if !vertex_data.is_empty() {
-                    let vertices = Float32Array::new_with_length(vertex_data.len() as u32);
-                    for (i, &val) in vertex_data.iter().enumerate() {
-                        vertices.set_index(i as u32, val);
-                    }
-
-                    context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(gl_state.line_buffer.inner()));
-                    context.buffer_data_with_array_buffer_view(
-                        WebGl2RenderingContext::ARRAY_BUFFER,
-                        &vertices,
-                        WebGl2RenderingContext::STATIC_DRAW,
-                    );
-
-                    // Set up attributes for line rendering
-                    let stride = 6 * 4; // 6 floats per vertex * 4 bytes
-                    
-                    // Position attribute (vec2)
-                    context.enable_vertex_attrib_array(0);
-                    context.vertex_attrib_pointer_with_i32(0, 2, WebGl2RenderingContext::FLOAT, false, stride, 0);
-                    
-                    // Color attribute (vec4)
-                    context.enable_vertex_attrib_array(1);
-                    context.vertex_attrib_pointer_with_i32(1, 4, WebGl2RenderingContext::FLOAT, false, stride, 2 * 4);
-
-                    // Set u_origin and u_world_scale for line shader (screen coords, so identity transform)
-                    if let Some(ref loc) = gl_state.line_u_origin {
-                        context.uniform2f(Some(loc), 0.0, 0.0);
-                    }
-                    if let Some(ref loc) = gl_state.line_u_world_scale {
-                        context.uniform1f(Some(loc), 1.0);
-                    }
-
-                    // Draw lines as line segments
-                    let total_vertices = vertex_data.len() / 6; // 6 floats per vertex
-                    context.draw_arrays(WebGl2RenderingContext::LINES, 0, total_vertices as i32);
-                }
-            }
+            render::lines::render_lines(context, gl_state, &self.line_layers, &self.viewport())
+        } else {
+            Ok(())
         }
-
-        Ok(())
     }
 
     fn render_polygons(&mut self, context: &WebGl2RenderingContext) -> Result<(), JsValue> {
@@ -871,78 +665,10 @@ impl RustyleafMap {
         }
 
         if let Some(ref gl_state) = self.gl_state {
-            context.use_program(Some(gl_state.programs.polygon_program.inner()));
-            context.bind_vertex_array(Some(gl_state.polygon_vao.inner()));
-
-            for layer in &self.polygon_layers {
-                if !layer.visible {
-                    continue;
-                }
-
-                // Collect all polygon triangle data
-                let mut vertex_data = Vec::new();
-
-                for polygon in layer.polygons.iter() {
-                    if polygon.rings.is_empty() {
-                        continue;
-                    }
-
-                    // Process outer ring and holes
-                    for ring in &polygon.rings {
-                        if ring.len() < 3 {
-                            continue;
-                        }
-
-                        // Triangulate the ring
-                        let triangles = self.triangulate_polygon(ring);
-                        
-                        // Convert triangles to screen coordinates
-                        for triangle in triangles.chunks(3) {
-                            if triangle.len() == 3 {
-                                for &[lat, lng] in triangle {
-                                    let screen_pos = self.viewport().lat_lng_to_screen(lat, lng);
-                                    vertex_data.extend_from_slice(&[
-                                        screen_pos.0 as f32, screen_pos.1 as f32,
-                                        polygon.color[0], polygon.color[1], polygon.color[2], polygon.color[3],
-                                    ]);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if !vertex_data.is_empty() {
-                    let vertices = Float32Array::new_with_length(vertex_data.len() as u32);
-                    for (i, &val) in vertex_data.iter().enumerate() {
-                        vertices.set_index(i as u32, val);
-                    }
-
-                    context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(gl_state.polygon_buffer.inner()));
-                    context.buffer_data_with_array_buffer_view(
-                        WebGl2RenderingContext::ARRAY_BUFFER,
-                        &vertices,
-                        WebGl2RenderingContext::STATIC_DRAW,
-                    );
-
-                    // Set up attributes for polygon rendering
-                    let stride = 6 * 4; // 6 floats per vertex * 4 bytes
-                    
-                    // Position attribute (vec2)
-                    context.enable_vertex_attrib_array(0);
-                    context.vertex_attrib_pointer_with_i32(0, 2, WebGl2RenderingContext::FLOAT, false, stride, 0);
-                    
-                    // Color attribute (vec4)
-                    context.enable_vertex_attrib_array(1);
-                    context.vertex_attrib_pointer_with_i32(1, 4, WebGl2RenderingContext::FLOAT, false, stride, 2 * 4);
-
-                    // Draw polygons as triangles
-                    let total_vertices = vertex_data.len() / 6; // 6 floats per vertex
-                    context.draw_arrays(WebGl2RenderingContext::TRIANGLES, 0, total_vertices as i32);
-                }
-            }
+            render::polygons::render_polygons(context, gl_state, &self.polygon_layers, &self.viewport())
+        } else {
+            Ok(())
         }
-
-        Ok(())
     }
 
     fn create_projection_matrix(&self) -> [f32; 16] {
@@ -1001,9 +727,7 @@ impl RustyleafMap {
 
     // Event handling methods (simplified)
     fn trigger_feature_click(&mut self, hit_info: serde_json::Value) {
-        // Feature click event triggered with hit information
-        // In a full implementation, this would call registered JavaScript callbacks
-        web_sys::console::log_1(&JsValue::from_str(&format!("Feature clicked: {:?}", hit_info)));
+        web_sys::console::log_1(&format!("Feature clicked: {:?}", hit_info).into());
     }
 
     // Public event registration methods
@@ -1281,35 +1005,35 @@ impl RustyleafMap {
         let bounds_array = js_sys::Array::from(bounds_data);
         
         if bounds_array.length() != 4 {
-            return Err(JsValue::from_str("Bounds must be an array of [sw_lat, sw_lng, ne_lat, ne_lng]"));
+            return Err(RustyleafError::ResourceError("Bounds must be an array of [sw_lat, sw_lng, ne_lat, ne_lng]".into()).into());
         }
         
         // Validate all elements are numbers and within valid coordinate ranges
-        let sw_lat = bounds_array.get(0).as_f64().ok_or_else(|| JsValue::from_str("sw_lat must be a number"))?;
-        let sw_lng = bounds_array.get(1).as_f64().ok_or_else(|| JsValue::from_str("sw_lng must be a number"))?;
-        let ne_lat = bounds_array.get(2).as_f64().ok_or_else(|| JsValue::from_str("ne_lat must be a number"))?;
-        let ne_lng = bounds_array.get(3).as_f64().ok_or_else(|| JsValue::from_str("ne_lng must be a number"))?;
+        let sw_lat = bounds_array.get(0).as_f64().ok_or_else(|| RustyleafError::InvalidCoordinate { lat: 0.0, lng: 0.0 })?;
+        let sw_lng = bounds_array.get(1).as_f64().ok_or_else(|| RustyleafError::InvalidCoordinate { lat: 0.0, lng: 0.0 })?;
+        let ne_lat = bounds_array.get(2).as_f64().ok_or_else(|| RustyleafError::InvalidCoordinate { lat: 0.0, lng: 0.0 })?;
+        let ne_lng = bounds_array.get(3).as_f64().ok_or_else(|| RustyleafError::InvalidCoordinate { lat: 0.0, lng: 0.0 })?;
         
         // Validate coordinate ranges
         if !(sw_lat >= -90.0 && sw_lat <= 90.0) {
-            return Err(JsValue::from_str("sw_lat must be between -90 and 90"));
+            return Err(RustyleafError::InvalidCoordinate { lat: sw_lat, lng: sw_lng }.into());
         }
         if !(sw_lng >= -180.0 && sw_lng <= 180.0) {
-            return Err(JsValue::from_str("sw_lng must be between -180 and 180"));
+            return Err(RustyleafError::InvalidCoordinate { lat: sw_lat, lng: sw_lng }.into());
         }
         if !(ne_lat >= -90.0 && ne_lat <= 90.0) {
-            return Err(JsValue::from_str("ne_lat must be between -90 and 90"));
+            return Err(RustyleafError::InvalidCoordinate { lat: ne_lat, lng: ne_lng }.into());
         }
         if !(ne_lng >= -180.0 && ne_lng <= 180.0) {
-            return Err(JsValue::from_str("ne_lng must be between -180 and 180"));
+            return Err(RustyleafError::InvalidCoordinate { lat: ne_lat, lng: ne_lng }.into());
         }
         
         // Validate that bounds are valid (ne > sw)
         if ne_lat <= sw_lat {
-            return Err(JsValue::from_str("ne_lat must be greater than sw_lat"));
+            return Err(RustyleafError::InvalidCoordinate { lat: ne_lat, lng: ne_lng }.into());
         }
         if ne_lng <= sw_lng {
-            return Err(JsValue::from_str("ne_lng must be greater than sw_lng"));
+            return Err(RustyleafError::InvalidCoordinate { lat: ne_lat, lng: ne_lng }.into());
         }
         
         // Calculate center of bounds
@@ -1434,7 +1158,7 @@ impl RustyleafMap {
     #[wasm_bindgen]
     pub fn add_points(&mut self, layer_index: usize, points_data: &JsValue) -> Result<(), JsValue> {
         if layer_index >= self.point_layers.len() {
-            return Err(JsValue::from_str("Layer index out of bounds"));
+            return Err(RustyleafError::LayerOutOfBounds { index: layer_index, len: self.point_layers.len() }.into());
         }
 
         let points_array = js_sys::Array::from(points_data);
@@ -1481,7 +1205,7 @@ impl RustyleafMap {
     #[wasm_bindgen]
     pub fn add_lines(&mut self, layer_index: usize, lines_data: &JsValue) -> Result<(), JsValue> {
         if layer_index >= self.line_layers.len() {
-            return Err(JsValue::from_str("Line layer index out of bounds"));
+            return Err(RustyleafError::LayerOutOfBounds { index: layer_index, len: self.line_layers.len() }.into());
         }
 
         let lines_array = js_sys::Array::from(lines_data);
@@ -1542,7 +1266,7 @@ impl RustyleafMap {
     #[wasm_bindgen]
     pub fn add_polygons(&mut self, layer_index: usize, polygons_data: &JsValue) -> Result<(), JsValue> {
         if layer_index >= self.polygon_layers.len() {
-            return Err(JsValue::from_str("Polygon layer index out of bounds"));
+            return Err(RustyleafError::LayerOutOfBounds { index: layer_index, len: self.polygon_layers.len() }.into());
         }
 
         let polygons_array = js_sys::Array::from(polygons_data);
@@ -1616,7 +1340,7 @@ impl RustyleafMap {
     #[wasm_bindgen]
     pub fn load_geojson(&mut self, layer_index: usize, geojson_str: &str) -> Result<(), JsValue> {
         if layer_index >= self.geojson_layers.len() {
-            return Err(JsValue::from_str("GeoJSON layer index out of bounds"));
+            return Err(RustyleafError::LayerOutOfBounds { index: layer_index, len: self.geojson_layers.len() }.into());
         }
 
         // Parse GeoJSON string
@@ -1631,15 +1355,15 @@ impl RustyleafMap {
     #[wasm_bindgen]
     pub fn load_geojson_from_url(&mut self, layer_index: usize, url: &str) -> Result<(), JsValue> {
         if layer_index >= self.geojson_layers.len() {
-            return Err(JsValue::from_str("GeoJSON layer index out of bounds"));
+            return Err(RustyleafError::LayerOutOfBounds { index: layer_index, len: self.geojson_layers.len() }.into());
         }
 
         // Simple synchronous fetch using XMLHttpRequest for now
         let xhr = web_sys::XmlHttpRequest::new()
-            .map_err(|e| JsValue::from_str(&format!("Failed to create XMLHttpRequest: {:?}", e)))?;
+            .map_err(|e| RustyleafError::RequestError(format!("Failed to create XMLHttpRequest: {:?}", e)))?;
 
         // Configure the request
-        xhr.open("GET", url).map_err(|e| JsValue::from_str(&format!("Failed to open request: {:?}", e)))?;
+        xhr.open("GET", url).map_err(|e| RustyleafError::RequestError(format!("Failed to open request: {:?}", e)))?;
         xhr.set_response_type(web_sys::XmlHttpRequestResponseType::Text);
 
         // Create closure for onload event - we'll just log the success and let JS handle the actual loading
@@ -1673,7 +1397,7 @@ impl RustyleafMap {
         self.tile_loader.closures.push(onload);
 
         // Send the request
-        xhr.send().map_err(|e| JsValue::from_str(&format!("Failed to send request: {:?}", e)))?;
+        xhr.send().map_err(|e| RustyleafError::RequestError(format!("Failed to send request: {:?}", e)))?;
 
         Ok(())
     }
@@ -1681,7 +1405,7 @@ impl RustyleafMap {
     #[wasm_bindgen]
     pub fn load_geojson_chunk(&mut self, layer_index: usize, chunk_str: &str, is_final: bool) -> Result<(), JsValue> {
         if layer_index >= self.geojson_layers.len() {
-            return Err(JsValue::from_str("GeoJSON layer index out of bounds"));
+            return Err(RustyleafError::LayerOutOfBounds { index: layer_index, len: self.geojson_layers.len() }.into());
         }
 
         // Parse chunk and accumulate features
@@ -1697,7 +1421,7 @@ impl RustyleafMap {
     #[wasm_bindgen]
     pub fn clear_geojson_layer(&mut self, layer_index: usize) -> Result<(), JsValue> {
         if layer_index >= self.geojson_layers.len() {
-            return Err(JsValue::from_str("GeoJSON layer index out of bounds"));
+            return Err(RustyleafError::LayerOutOfBounds { index: layer_index, len: self.geojson_layers.len() }.into());
         }
 
         self.geojson_layers[layer_index].features.clear();
@@ -1715,7 +1439,7 @@ impl RustyleafMap {
     #[wasm_bindgen]
     pub fn get_geojson_feature_count(&mut self, layer_index: usize) -> Result<usize, JsValue> {
         if layer_index >= self.geojson_layers.len() {
-            return Err(JsValue::from_str("GeoJSON layer index out of bounds"));
+            return Err(RustyleafError::LayerOutOfBounds { index: layer_index, len: self.geojson_layers.len() }.into());
         }
 
         Ok(self.geojson_layers[layer_index].features.len())
@@ -1724,7 +1448,7 @@ impl RustyleafMap {
     #[wasm_bindgen]
     pub fn set_geojson_style(&mut self, layer_index: usize, style_data: &JsValue) -> Result<(), JsValue> {
         if layer_index >= self.geojson_layers.len() {
-            return Err(JsValue::from_str("GeoJSON layer index out of bounds"));
+            return Err(RustyleafError::LayerOutOfBounds { index: layer_index, len: self.geojson_layers.len() }.into());
         }
 
         // Convert JsValue to serde_json::Value for easier manipulation
@@ -1893,538 +1617,73 @@ impl RustyleafMap {
             return Ok(());
         }
 
-        // For each GeoJSON layer, convert features to internal layer types and render
-        for geojson_layer in &self.geojson_layers {
-            if !geojson_layer.visible {
-                continue;
-            }
-
-            // Fast path: if caches are populated, render them directly
-            if !(geojson_layer.cached_points.is_empty()
-                && geojson_layer.cached_lines.is_empty()
-                && geojson_layer.cached_polygon_triangles.is_empty()) {
-                if !geojson_layer.cached_polygon_triangles.is_empty() {
-                    // Try GPU buffer fast path first when available
-                    let has_gpu_buffer = self.geojson_layers.iter()
-                        .any(|l| l.visible && l.polygon_vertex_buffer.borrow().is_some());
-                    if has_gpu_buffer {
-                        self.render_geojson_polygons(context, &[])?;
-                    } else {
-                        self.render_geojson_polygon_triangles(context, &geojson_layer.cached_polygon_triangles, geojson_layer.style.polygon_color)?;
-                    }
-                }
-                if !geojson_layer.cached_lines.is_empty() {
-                    // Try GPU buffer fast path first when available
-                    let has_line_gpu_buffer = self.geojson_layers.iter()
-                        .any(|l| l.visible && l.line_vertex_buffer.borrow().is_some());
-                    if has_line_gpu_buffer {
-                        self.render_geojson_lines(context, &[])?;
-                    } else {
-                        self.render_geojson_lines(context, &geojson_layer.cached_lines)?;
-                    }
-                }
-                if !geojson_layer.cached_points.is_empty() {
-                    self.render_geojson_points(context, &geojson_layer.cached_points)?;
-                }
-                continue;
-            }
-
-            // Convert GeoJSON features to internal point, line, and polygon features
-            let mut point_features = Vec::new();
-            let mut line_features = Vec::new();
-            let mut polygon_features = Vec::new();
-
-            if !geojson_layer.features.is_empty() {
-            web_sys::console::log_2(&"Processing GeoJSON features:".into(), &geojson_layer.features.len().into());
+        if let Some(ref gl_state) = self.gl_state {
+            let ctx = render::geojson::GeoJsonRenderCtx {
+                context,
+                gl_state,
+                geojson_layers: &self.geojson_layers,
+                viewport: &self.viewport(),
+            };
+            render::geojson::render_geojson(&ctx)
+        } else {
+            Ok(())
         }
-
-            for feature in &geojson_layer.features {
-                let style = &geojson_layer.style;
-                
-                match &feature.geometry {
-                    GeoJSONGeometry::Point { coordinates } => {
-                        let point_feature = PointFeature {
-                            lat: coordinates[1],  // GeoJSON is [lng, lat]
-                            lng: coordinates[0],
-                            size: style.point_size,
-                            color: style.point_color,
-                            meta: feature.properties.clone(),
-                        };
-                        point_features.push(point_feature);
-                    },
-                    GeoJSONGeometry::MultiPoint { coordinates } => {
-                        for coord in coordinates {
-                            let point_feature = PointFeature {
-                                lat: coord[1],  // GeoJSON is [lng, lat]
-                                lng: coord[0],
-                                size: style.point_size,
-                                color: style.point_color,
-                                meta: feature.properties.clone(),
-                            };
-                            point_features.push(point_feature);
-                        }
-                    },
-                    GeoJSONGeometry::LineString { coordinates } => {
-                        let line_points: Vec<[f64; 2]> = coordinates.iter()
-                            .map(|coord| [coord[1], coord[0]])  // Convert [lng, lat] to [lat, lng]
-                            .collect();
-                        
-                        if line_points.len() >= 2 {
-                            let line_feature = LineFeature {
-                                points: line_points,
-                                color: style.line_color,
-                                width: style.line_width,
-                                meta: feature.properties.clone(),
-                            };
-                            line_features.push(line_feature);
-                        }
-                    },
-                    GeoJSONGeometry::MultiLineString { coordinates } => {
-                        for line_coords in coordinates {
-                            let line_points: Vec<[f64; 2]> = line_coords.iter()
-                                .map(|coord| [coord[1], coord[0]])  // Convert [lng, lat] to [lat, lng]
-                                .collect();
-                            
-                            if line_points.len() >= 2 {
-                                let line_feature = LineFeature {
-                                    points: line_points,
-                                    color: style.line_color,
-                                    width: style.line_width,
-                                    meta: feature.properties.clone(),
-                                };
-                                line_features.push(line_feature);
-                            }
-                        }
-                    },
-                    GeoJSONGeometry::Polygon { coordinates } => {
-                        let polygon_rings: Vec<Vec<[f64; 2]>> = coordinates.iter()
-                            .map(|ring| ring.iter()
-                                .map(|coord| [coord[1], coord[0]])  // Convert [lng, lat] to [lat, lng]
-                                .collect())
-                            .collect();
-
-                        if !polygon_rings.is_empty() && polygon_rings[0].len() >= 3 {
-                            let polygon_feature = PolygonFeature {
-                                rings: polygon_rings,
-                                color: style.polygon_color,
-                                meta: feature.properties.clone(),
-                            };
-                            polygon_features.push(polygon_feature);
-                        }
-                    },
-                    GeoJSONGeometry::MultiPolygon { coordinates } => {
-                        web_sys::console::log_1(&"Found MultiPolygon geometry".into());
-                        for polygon_coords in coordinates {
-                            let polygon_rings: Vec<Vec<[f64; 2]>> = polygon_coords.iter()
-                                .map(|ring| ring.iter()
-                                    .map(|coord| [coord[1], coord[0]])  // Convert [lng, lat] to [lat, lng]
-                                    .collect())
-                                .collect();
-                            
-                            if !polygon_rings.is_empty() && polygon_rings[0].len() >= 3 {
-                                let polygon_feature = PolygonFeature {
-                                    rings: polygon_rings,
-                                    color: style.polygon_color,
-                                    meta: feature.properties.clone(),
-                                };
-                                polygon_features.push(polygon_feature);
-                            }
-                        }
-                    },
-                }
-            }
-
-            // Render converted features: polygons first, outlines second
-            web_sys::console::log_2(&"Final polygon features count:".into(), &polygon_features.len().into());
-
-            if !polygon_features.is_empty() {
-                self.render_geojson_polygons(context, &polygon_features)?;
-            } else {
-                web_sys::console::log_1(&"No polygon features to render".into());
-            }
-
-            if !line_features.is_empty() {
-                self.render_geojson_lines(context, &line_features)?;
-            }
-
-            if !point_features.is_empty() {
-                self.render_geojson_points(context, &point_features)?;
-            }
-        }
-
-        Ok(())
     }
 
     fn render_geojson_points(&self, context: &WebGl2RenderingContext, points: &[PointFeature]) -> Result<(), JsValue> {
         if let Some(ref gl_state) = self.gl_state {
-            context.use_program(Some(gl_state.programs.point_program.inner()));
-            context.bind_vertex_array(Some(gl_state.point_vao.inner()));
-
-            // Collect all point data
-            let mut vertex_data = Vec::new();
-
-            for point in points {
-                let screen_pos = self.viewport().lat_lng_to_screen(point.lat, point.lng);
-                vertex_data.extend_from_slice(&[
-                    screen_pos.0 as f32, screen_pos.1 as f32,
-                    point.size,
-                    point.color[0], point.color[1], point.color[2], point.color[3],
-                ]);
-            }
-
-            if !vertex_data.is_empty() {
-                let vertices = Float32Array::new_with_length(vertex_data.len() as u32);
-                for (i, &val) in vertex_data.iter().enumerate() {
-                    vertices.set_index(i as u32, val);
-                }
-
-                context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(gl_state.point_buffer.inner()));
-                context.buffer_data_with_array_buffer_view(
-                    WebGl2RenderingContext::ARRAY_BUFFER,
-                    &vertices,
-                    WebGl2RenderingContext::STATIC_DRAW,
-                );
-
-                // Set up attributes: position(2), size(1), color(4)
-                let stride = 7 * 4; // 7 floats * 4 bytes
-                context.enable_vertex_attrib_array(0);
-                context.vertex_attrib_pointer_with_i32(0, 2, WebGl2RenderingContext::FLOAT, false, stride, 0);
-                context.enable_vertex_attrib_array(1);
-                context.vertex_attrib_pointer_with_i32(1, 1, WebGl2RenderingContext::FLOAT, false, stride, 2 * 4);
-                context.enable_vertex_attrib_array(2);
-                context.vertex_attrib_pointer_with_i32(2, 4, WebGl2RenderingContext::FLOAT, false, stride, 3 * 4);
-
-                // Projection matrix uniform
-                let projection_matrix = self.create_projection_matrix();
-                let u_matrix_loc = context.get_uniform_location(gl_state.programs.point_program.inner(), "u_matrix");
-                if let Some(loc) = u_matrix_loc.as_ref() {
-                    context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
-                }
-
-                context.draw_arrays(WebGl2RenderingContext::POINTS, 0, points.len() as i32);
-            }
+            let ctx = render::geojson::GeoJsonRenderCtx {
+                context,
+                gl_state,
+                geojson_layers: &self.geojson_layers,
+                viewport: &self.viewport(),
+            };
+            render::geojson::render_geojson_points(&ctx, points)
+        } else {
+            Ok(())
         }
-
-        Ok(())
     }
 
     fn render_geojson_lines(&self, context: &WebGl2RenderingContext, lines: &[LineFeature]) -> Result<(), JsValue> {
         if let Some(ref gl_state) = self.gl_state {
-            context.use_program(Some(gl_state.programs.line_program.inner()));
-            context.bind_vertex_array(Some(gl_state.line_vao.inner()));
-
-            // Render from cached GPU buffer if available
-            if let Some(buffer) = self.geojson_layers.iter().find(|l| l.visible && l.line_vertex_buffer.borrow().is_some()).and_then(|l| l.line_vertex_buffer.borrow().clone()) {
-                context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(buffer.inner()));
-                let stride = 6 * 4; // pos(2) + color(4)
-                context.enable_vertex_attrib_array(0);
-                context.vertex_attrib_pointer_with_i32(0, 2, WebGl2RenderingContext::FLOAT, false, stride, 0);
-                context.enable_vertex_attrib_array(1);
-                context.vertex_attrib_pointer_with_i32(1, 4, WebGl2RenderingContext::FLOAT, false, stride, 2 * 4);
-
-                let projection_matrix = self.create_projection_matrix();
-                let u_matrix_loc = context.get_uniform_location(gl_state.programs.line_program.inner(), "u_matrix");
-                if let Some(loc) = u_matrix_loc.as_ref() {
-                    context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
-                }
-
-                if let Some(ref loc) = gl_state.line_u_origin {
-                    let zoom = self.zoom.round() as u32;
-                    let center_pixel = self.viewport().lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
-                    let origin_x = center_pixel.0 - (self.width as f64 / 2.0);
-                    let origin_y = center_pixel.1 - (self.height as f64 / 2.0);
-                    context.uniform2f(Some(loc), origin_x as f32, origin_y as f32);
-                }
-                if let Some(ref loc) = gl_state.line_u_world_scale {
-                    let zoom = self.zoom.round() as u32;
-                    let world_scale = self.tile_size as f32 * (1u32 << zoom) as f32;
-                    context.uniform1f(Some(loc), world_scale);
-                }
-
-                if let Some(layer) = self.geojson_layers.iter().find(|l| l.visible && l.line_vertex_buffer.borrow().is_some()) {
-                    let total_vertices = layer.line_vertex_count.get() as i32;
-                    if total_vertices > 0 { context.draw_arrays(WebGl2RenderingContext::LINES, 0, total_vertices); return Ok(()); }
-                }
-            }
-
-            // Collect all line segment data using normalized [0..1] world coords
-            let mut vertex_data = Vec::new();
-
-            for line in lines {
-                for i in 0..line.points.len().saturating_sub(1) {
-                    let start = line.points[i];
-                    let end = line.points[i + 1];
-                    
-                    let (sx, sy) = self.viewport().lat_lng_to_normalized(start[0], start[1]);
-                    let (ex, ey) = self.viewport().lat_lng_to_normalized(end[0], end[1]);
-                    
-                    vertex_data.extend_from_slice(&[
-                        sx as f32, sy as f32,
-                        line.color[0], line.color[1], line.color[2], line.color[3],
-                        ex as f32, ey as f32,
-                        line.color[0], line.color[1], line.color[2], line.color[3],
-                    ]);
-                }
-            }
-
-            if !vertex_data.is_empty() {
-                let vertices = Float32Array::new_with_length(vertex_data.len() as u32);
-                for (i, &val) in vertex_data.iter().enumerate() {
-                    vertices.set_index(i as u32, val);
-                }
-
-                context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(gl_state.line_buffer.inner()));
-                context.buffer_data_with_array_buffer_view(
-                    WebGl2RenderingContext::ARRAY_BUFFER,
-                    &vertices,
-                    WebGl2RenderingContext::STATIC_DRAW,
-                );
-
-                // Set up attributes for line rendering
-                let stride = 6 * 4; // 6 floats per vertex * 4 bytes
-                
-                context.enable_vertex_attrib_array(0);
-                context.vertex_attrib_pointer_with_i32(0, 2, WebGl2RenderingContext::FLOAT, false, stride, 0);
-                
-                context.enable_vertex_attrib_array(1);
-                context.vertex_attrib_pointer_with_i32(1, 4, WebGl2RenderingContext::FLOAT, false, stride, 2 * 4);
-
-                // Projection matrix uniform
-                let projection_matrix = self.create_projection_matrix();
-                let u_matrix_loc = context.get_uniform_location(gl_state.programs.line_program.inner(), "u_matrix");
-                if let Some(loc) = u_matrix_loc.as_ref() {
-                    context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
-                }
-
-                // Set u_origin and u_world_scale for pixel-coord subtraction in vertex shader
-                if let Some(ref loc) = gl_state.line_u_origin {
-                    let zoom = self.zoom.round() as u32;
-                    let center_pixel = self.viewport().lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
-                    let origin_x = center_pixel.0 - (self.width as f64 / 2.0);
-                    let origin_y = center_pixel.1 - (self.height as f64 / 2.0);
-                    context.uniform2f(Some(loc), origin_x as f32, origin_y as f32);
-                }
-                if let Some(ref loc) = gl_state.line_u_world_scale {
-                    let zoom = self.zoom.round() as u32;
-                    let world_scale = self.tile_size as f32 * (1u32 << zoom) as f32;
-                    context.uniform1f(Some(loc), world_scale);
-                }
-
-                let total_vertices = vertex_data.len() / 6;
-                context.draw_arrays(WebGl2RenderingContext::LINES, 0, total_vertices as i32);
-            }
+            let ctx = render::geojson::GeoJsonRenderCtx {
+                context,
+                gl_state,
+                geojson_layers: &self.geojson_layers,
+                viewport: &self.viewport(),
+            };
+            render::geojson::render_geojson_lines(&ctx, lines)
+        } else {
+            Ok(())
         }
-
-        Ok(())
     }
 
     fn render_geojson_polygons(&self, context: &WebGl2RenderingContext, polygons: &[PolygonFeature]) -> Result<(), JsValue> {
-        web_sys::console::log_2(&"Rendering polygons count:".into(), &polygons.len().into());
-
         if let Some(ref gl_state) = self.gl_state {
-            context.use_program(Some(gl_state.programs.polygon_program.inner()));
-            context.bind_vertex_array(Some(gl_state.polygon_vao.inner()));
-
-            // Render from cached GPU buffer if available
-            if let Some(buffer) = self.geojson_layers.iter().find(|l| l.visible && !l.cached_polygon_triangles.is_empty()).and_then(|l| l.polygon_vertex_buffer.borrow().clone()) {
-                context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(buffer.inner()));
-                let stride = 6 * 4; // pos(2) + color(4)
-                context.enable_vertex_attrib_array(0);
-                context.vertex_attrib_pointer_with_i32(0, 2, WebGl2RenderingContext::FLOAT, false, stride, 0);
-                context.enable_vertex_attrib_array(1);
-                context.vertex_attrib_pointer_with_i32(1, 4, WebGl2RenderingContext::FLOAT, false, stride, 2 * 4);
-
-                let projection_matrix = self.create_projection_matrix();
-                let u_matrix_loc = context.get_uniform_location(gl_state.programs.polygon_program.inner(), "u_matrix");
-                if let Some(loc) = u_matrix_loc.as_ref() {
-                    context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
-                }
-
-                // Set u_origin for pixel-coord subtraction in vertex shader
-                if let Some(ref loc) = gl_state.polygon_u_origin {
-                    let zoom = self.zoom.round() as u32;
-                    let center_pixel = self.viewport().lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
-                    let origin_x = center_pixel.0 - (self.width as f64 / 2.0);
-                    let origin_y = center_pixel.1 - (self.height as f64 / 2.0);
-                    context.uniform2f(Some(loc), origin_x as f32, origin_y as f32);
-                }
-                // Set u_world_scale for normalized-to-pixel conversion
-                if let Some(ref loc) = gl_state.polygon_u_world_scale {
-                    let zoom = self.zoom.round() as u32;
-                    let world_scale = self.tile_size as f32 * (1u32 << zoom) as f32;
-                    context.uniform1f(Some(loc), world_scale);
-                }
-
-                // Find count from the same layer
-                if let Some(layer) = self.geojson_layers.iter().find(|l| l.visible && l.polygon_vertex_buffer.borrow().is_some()) {
-                    let total_vertices = layer.polygon_vertex_count.get() as i32;
-                    if total_vertices > 0 { context.draw_arrays(WebGl2RenderingContext::TRIANGLES, 0, total_vertices); return Ok(()); }
-                }
-            }
-
-            // Collect all polygon triangle data with memory limits
-            let mut vertex_data = Vec::new();
-            const MAX_VERTICES: usize = 1000000; // Safety limit: 1M vertices = ~6MB
-
-            for polygon in polygons {
-                if polygon.rings.is_empty() {
-                    continue;
-                }
-
-                // Process outer ring and holes
-                for ring in &polygon.rings {
-                    if ring.len() < 3 {
-                        continue;
-                    }
-
-                    // Skip very complex rings to prevent memory issues
-                    if ring.len() > 1000 {
-                        continue;
-                    }
-
-                    // Triangulate the ring
-                    let triangles = self.triangulate_polygon(ring);
-
-                    // Convert triangles to screen coordinates
-                    for triangle in triangles.chunks(3) {
-                        if triangle.len() == 3 {
-                            for &[lat, lng] in triangle {
-                                let screen_pos = self.viewport().lat_lng_to_screen(lat, lng);
-                                vertex_data.extend_from_slice(&[
-                                    screen_pos.0 as f32, screen_pos.1 as f32,
-                                    polygon.color[0], polygon.color[1], polygon.color[2], polygon.color[3],
-                                ]);
-
-                                // Safety check to prevent memory explosion
-                                if vertex_data.len() > MAX_VERTICES * 6 {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    // Break if we hit the vertex limit
-                    if vertex_data.len() > MAX_VERTICES * 6 {
-                        break;
-                    }
-                }
-
-                // Break if we hit the vertex limit
-                if vertex_data.len() > MAX_VERTICES * 6 {
-                    break;
-                }
-            }
-
-            if !vertex_data.is_empty() {
-                let vertices = Float32Array::new_with_length(vertex_data.len() as u32);
-                for (i, &val) in vertex_data.iter().enumerate() {
-                    vertices.set_index(i as u32, val);
-                }
-
-                context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(gl_state.polygon_buffer.inner()));
-                context.buffer_data_with_array_buffer_view(
-                    WebGl2RenderingContext::ARRAY_BUFFER,
-                    &vertices,
-                    WebGl2RenderingContext::STATIC_DRAW,
-                );
-
-                // Set up attributes for polygon rendering
-                let stride = 6 * 4; // 6 floats per vertex * 4 bytes
-                
-                context.enable_vertex_attrib_array(0);
-                context.vertex_attrib_pointer_with_i32(0, 2, WebGl2RenderingContext::FLOAT, false, stride, 0);
-                
-                context.enable_vertex_attrib_array(1);
-                context.vertex_attrib_pointer_with_i32(1, 4, WebGl2RenderingContext::FLOAT, false, stride, 2 * 4);
-
-                // Set up the projection matrix uniform
-                let projection_matrix = self.create_projection_matrix();
-                let u_matrix_loc = context.get_uniform_location(gl_state.programs.polygon_program.inner(), "u_matrix");
-                if let Some(loc) = u_matrix_loc.as_ref() {
-                    context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
-                }
-
-                // Set u_origin for pixel-coord subtraction in vertex shader
-                // Slow path: vertices are already in screen coords, use identity
-                if let Some(ref loc) = gl_state.polygon_u_origin {
-                    context.uniform2f(Some(loc), 0.0, 0.0);
-                }
-                // Set u_world_scale: screen coords don't need scaling
-                if let Some(ref loc) = gl_state.polygon_u_world_scale {
-                    context.uniform1f(Some(loc), 1.0);
-                }
-
-                let total_vertices = vertex_data.len() / 6;
-                web_sys::console::log_2(&"Drawing triangles:".into(), &total_vertices.into());
-                context.draw_arrays(WebGl2RenderingContext::TRIANGLES, 0, total_vertices as i32);
-            } else {
-                web_sys::console::log_1(&"No vertex data to render".into());
-            }
+            let ctx = render::geojson::GeoJsonRenderCtx {
+                context,
+                gl_state,
+                geojson_layers: &self.geojson_layers,
+                viewport: &self.viewport(),
+            };
+            render::geojson::render_geojson_polygons(&ctx, polygons)
         } else {
-            web_sys::console::log_1(&"No GL state available for polygon rendering".into());
+            Ok(())
         }
-
-        Ok(())
     }
 
     fn render_geojson_polygon_triangles(&self, context: &WebGl2RenderingContext, triangles: &[[f64; 2]], color: [f32; 4]) -> Result<(), JsValue> {
         if let Some(ref gl_state) = self.gl_state {
-            context.use_program(Some(gl_state.programs.polygon_program.inner()));
-            context.bind_vertex_array(Some(gl_state.polygon_vao.inner()));
-
-            // Viewport culling in lat/lng space
-            let visible = self.cull_triangles_to_view(triangles);
-
-            let mut vertex_data = Vec::with_capacity(visible.len() * 6);
-            for &[lat, lng] in visible.iter() {
-                let screen_pos = self.viewport().lat_lng_to_screen(lat, lng);
-                vertex_data.extend_from_slice(&[
-                    screen_pos.0 as f32, screen_pos.1 as f32,
-                    color[0], color[1], color[2], color[3],
-                ]);
-            }
-
-            if !vertex_data.is_empty() {
-                let vertices = Float32Array::new_with_length(vertex_data.len() as u32);
-                for (i, &val) in vertex_data.iter().enumerate() {
-                    vertices.set_index(i as u32, val);
-                }
-
-                context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(gl_state.polygon_buffer.inner()));
-                context.buffer_data_with_array_buffer_view(
-                    WebGl2RenderingContext::ARRAY_BUFFER,
-                    &vertices,
-                    WebGl2RenderingContext::DYNAMIC_DRAW,
-                );
-
-                let stride = 6 * 4;
-                context.enable_vertex_attrib_array(0);
-                context.vertex_attrib_pointer_with_i32(0, 2, WebGl2RenderingContext::FLOAT, false, stride, 0);
-                context.enable_vertex_attrib_array(1);
-                context.vertex_attrib_pointer_with_i32(1, 4, WebGl2RenderingContext::FLOAT, false, stride, 2 * 4);
-
-                // Projection
-                let projection_matrix = self.create_projection_matrix();
-                let u_matrix_loc = context.get_uniform_location(gl_state.programs.polygon_program.inner(), "u_matrix");
-                if let Some(loc) = u_matrix_loc.as_ref() {
-                    context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
-                }
-
-                // Set u_origin for pixel-coord subtraction in vertex shader
-                // Slow path: vertices are already in screen coords, use identity
-                if let Some(ref loc) = gl_state.polygon_u_origin {
-                    context.uniform2f(Some(loc), 0.0, 0.0);
-                }
-                // Set u_world_scale: screen coords don't need scaling
-                if let Some(ref loc) = gl_state.polygon_u_world_scale {
-                    context.uniform1f(Some(loc), 1.0);
-                }
-
-                let total_vertices = vertex_data.len() / 6;
-                context.draw_arrays(WebGl2RenderingContext::TRIANGLES, 0, total_vertices as i32);
-            }
+            let ctx = render::geojson::GeoJsonRenderCtx {
+                context,
+                gl_state,
+                geojson_layers: &self.geojson_layers,
+                viewport: &self.viewport(),
+            };
+            render::geojson::render_geojson_polygon_triangles(&ctx, triangles, color)
+        } else {
+            Ok(())
         }
-        Ok(())
     }
 
     // GeoJSON processing methods
@@ -2435,7 +1694,7 @@ impl RustyleafMap {
         let geojson_value: serde_json::Value = serde_json::from_str(geojson_str)
             .map_err(|e| {
                 web_sys::console::log_2(&"GeoJSON parse error:".into(), &e.to_string().into());
-                JsValue::from_str(&format!("Failed to parse GeoJSON: {}", e))
+                RustyleafError::GeoJsonParse(format!("Failed to parse GeoJSON: {}", e))
             })?;
 
         web_sys::console::log_1(&"GeoJSON parsed successfully, now processing features".into());
@@ -2449,7 +1708,7 @@ impl RustyleafMap {
             serde_json::Value::Object(obj) => {
                 let geojson_type = obj.get("type")
                     .and_then(|t| t.as_str())
-                    .ok_or_else(|| JsValue::from_str("GeoJSON missing 'type' field"))?;
+                    .ok_or_else(|| RustyleafError::GeoJsonParse("GeoJSON missing 'type' field".into()))?;
 
                 match geojson_type {
                     "FeatureCollection" => {
@@ -2491,7 +1750,7 @@ impl RustyleafMap {
                     },
                 }
             },
-            _ => return Err(JsValue::from_str("GeoJSON must be an object")),
+            _ => return Err(RustyleafError::GeoJsonParse("GeoJSON must be an object".into()).into()),
         }
 
         web_sys::console::log_2(&"Total features parsed:".into(), &features.len().into());
@@ -2500,10 +1759,10 @@ impl RustyleafMap {
 
     fn parse_geojson_feature(&self, feature_value: &serde_json::Value) -> Result<GeoJSONFeature, JsValue> {
         let obj = feature_value.as_object()
-            .ok_or_else(|| JsValue::from_str("Feature must be an object"))?;
+            .ok_or_else(|| RustyleafError::GeoJsonParse("Feature must be an object".into()))?;
 
         let geometry = obj.get("geometry")
-            .ok_or_else(|| JsValue::from_str("Feature missing 'geometry' field"))?;
+            .ok_or_else(|| RustyleafError::GeoJsonParse("Feature missing 'geometry' field".into()))?;
         let geometry = self.parse_geojson_geometry(geometry)?;
 
         let properties = obj.get("properties")
@@ -2531,14 +1790,14 @@ impl RustyleafMap {
 
     fn parse_geojson_geometry(&self, geometry_value: &serde_json::Value) -> Result<GeoJSONGeometry, JsValue> {
         let obj = geometry_value.as_object()
-            .ok_or_else(|| JsValue::from_str("Geometry must be an object"))?;
+            .ok_or_else(|| RustyleafError::GeoJsonParse("Geometry must be an object".into()))?;
 
         let geometry_type = obj.get("type")
             .and_then(|t| t.as_str())
-            .ok_or_else(|| JsValue::from_str("Geometry missing 'type' field"))?;
+            .ok_or_else(|| RustyleafError::GeoJsonParse("Geometry missing 'type' field".into()))?;
 
         let coordinates = obj.get("coordinates")
-            .ok_or_else(|| JsValue::from_str("Geometry missing 'coordinates' field"))?;
+            .ok_or_else(|| RustyleafError::GeoJsonParse("Geometry missing 'coordinates' field".into()))?;
 
         match geometry_type {
             "Point" => {
@@ -2565,27 +1824,27 @@ impl RustyleafMap {
                 let coords = self.parse_multi_polygon_coordinates(coordinates)?;
                 Ok(GeoJSONGeometry::MultiPolygon { coordinates: coords })
             },
-            _ => Err(JsValue::from_str(&format!("Unsupported geometry type: {}", geometry_type))),
+            _ => Err(RustyleafError::GeoJsonParse(format!("Unsupported geometry type: {}", geometry_type)).into()),
         }
     }
 
     fn parse_point_coordinates(&self, value: &serde_json::Value) -> Result<[f64; 2], JsValue> {
         let arr = value.as_array()
-            .ok_or_else(|| JsValue::from_str("Point coordinates must be an array"))?;
+            .ok_or_else(|| RustyleafError::GeoJsonParse("Point coordinates must be an array".into()))?;
         
         if arr.len() < 2 {
-            return Err(JsValue::from_str("Point coordinates must have at least 2 values"));
+            return Err(RustyleafError::GeoJsonParse("Point coordinates must have at least 2 values".into()).into());
         }
 
-        let x = arr[0].as_f64().ok_or_else(|| JsValue::from_str("Invalid x coordinate"))?;
-        let y = arr[1].as_f64().ok_or_else(|| JsValue::from_str("Invalid y coordinate"))?;
+        let x = arr[0].as_f64().ok_or_else(|| RustyleafError::GeoJsonParse("Invalid x coordinate".into()))?;
+        let y = arr[1].as_f64().ok_or_else(|| RustyleafError::GeoJsonParse("Invalid y coordinate".into()))?;
 
         Ok([x, y])
     }
 
     fn parse_multi_point_coordinates(&self, value: &serde_json::Value) -> Result<Vec<[f64; 2]>, JsValue> {
         let arr = value.as_array()
-            .ok_or_else(|| JsValue::from_str("MultiPoint coordinates must be an array"))?;
+            .ok_or_else(|| RustyleafError::GeoJsonParse("MultiPoint coordinates must be an array".into()))?;
         
         let mut points = Vec::new();
         for point_value in arr {
@@ -2597,7 +1856,7 @@ impl RustyleafMap {
 
     fn parse_line_string_coordinates(&self, value: &serde_json::Value) -> Result<Vec<[f64; 2]>, JsValue> {
         let arr = value.as_array()
-            .ok_or_else(|| JsValue::from_str("LineString coordinates must be an array"))?;
+            .ok_or_else(|| RustyleafError::GeoJsonParse("LineString coordinates must be an array".into()))?;
         
         let mut points = Vec::new();
         for point_value in arr {
@@ -2605,7 +1864,7 @@ impl RustyleafMap {
         }
 
         if points.len() < 2 {
-            return Err(JsValue::from_str("LineString must have at least 2 points"));
+            return Err(RustyleafError::GeoJsonParse("LineString must have at least 2 points".into()).into());
         }
 
         Ok(points)
@@ -2613,7 +1872,7 @@ impl RustyleafMap {
 
     fn parse_multi_line_string_coordinates(&self, value: &serde_json::Value) -> Result<Vec<Vec<[f64; 2]>>, JsValue> {
         let arr = value.as_array()
-            .ok_or_else(|| JsValue::from_str("MultiLineString coordinates must be an array"))?;
+            .ok_or_else(|| RustyleafError::GeoJsonParse("MultiLineString coordinates must be an array".into()))?;
         
         let mut lines = Vec::new();
         for line_value in arr {
@@ -2625,19 +1884,19 @@ impl RustyleafMap {
 
     fn parse_polygon_coordinates(&self, value: &serde_json::Value) -> Result<Vec<Vec<[f64; 2]>>, JsValue> {
         let arr = value.as_array()
-            .ok_or_else(|| JsValue::from_str("Polygon coordinates must be an array"))?;
+            .ok_or_else(|| RustyleafError::GeoJsonParse("Polygon coordinates must be an array".into()))?;
         
         let mut rings = Vec::new();
         for ring_value in arr {
             let ring = self.parse_line_string_coordinates(ring_value)?; // Reuse line string parsing
             if ring.len() < 3 {
-                return Err(JsValue::from_str("Polygon ring must have at least 3 points"));
+                return Err(RustyleafError::GeoJsonParse("Polygon ring must have at least 3 points".into()).into());
             }
             rings.push(ring);
         }
 
         if rings.is_empty() {
-            return Err(JsValue::from_str("Polygon must have at least one ring"));
+            return Err(RustyleafError::GeoJsonParse("Polygon must have at least one ring".into()).into());
         }
 
         Ok(rings)
@@ -2645,7 +1904,7 @@ impl RustyleafMap {
 
     fn parse_multi_polygon_coordinates(&self, value: &serde_json::Value) -> Result<Vec<Vec<Vec<[f64; 2]>>>, JsValue> {
         let arr = value.as_array()
-            .ok_or_else(|| JsValue::from_str("MultiPolygon coordinates must be an array"))?;
+            .ok_or_else(|| RustyleafError::GeoJsonParse("MultiPolygon coordinates must be an array".into()))?;
         
         let mut polygons = Vec::new();
         for polygon_value in arr {
@@ -2783,7 +2042,7 @@ impl RustyleafMap {
         // This is a simple approach - in production, you'd use a proper streaming JSON parser
         let feature_pattern = r#""type"\s*:\s*"Feature""#;
         let re = regex::Regex::new(feature_pattern)
-            .map_err(|e| JsValue::from_str(&format!("Failed to create regex: {}", e)))?;
+            .map_err(|e| RustyleafError::GeoJsonParse(format!("Failed to create regex: {}", e)))?;
         
         for (pos, _) in re.find_iter(json_str).enumerate() {
             // Try to extract a complete feature around this position
@@ -2849,7 +2108,7 @@ impl RustyleafMap {
 
     fn rebuild_geojson_cache(&mut self, layer_index: usize) -> Result<(), JsValue> {
         if layer_index >= self.geojson_layers.len() {
-            return Err(JsValue::from_str("GeoJSON layer index out of bounds"));
+            return Err(RustyleafError::LayerOutOfBounds { index: layer_index, len: self.geojson_layers.len() }.into());
         }
 
         let style = self.geojson_layers[layer_index].style.clone();
@@ -3050,24 +2309,17 @@ impl RustyleafMap {
     }
 
     fn cull_triangles_to_view(&self, triangles: &[[f64; 2]]) -> Vec<[f64; 2]> {
-        if triangles.is_empty() { return Vec::new(); }
-        let mut out: Vec<[f64; 2]> = Vec::with_capacity(triangles.len());
-        let w = self.width as f64;
-        let h = self.height as f64;
-        for tri in triangles.chunks(3) {
-            if tri.len() < 3 { continue; }
-            let mut any_inside = false;
-            for &[lat, lng] in tri {
-                let p = self.viewport().lat_lng_to_screen(lat, lng);
-                if p.0 >= -50.0 && p.0 <= w + 50.0 && p.1 >= -50.0 && p.1 <= h + 50.0 {
-                    any_inside = true; break;
-                }
-            }
-            if any_inside {
-                out.extend_from_slice(tri);
-            }
+        if let Some(ref gl_state) = self.gl_state {
+            let ctx = render::geojson::GeoJsonRenderCtx {
+                context: &gl_state.context,
+                gl_state,
+                geojson_layers: &self.geojson_layers,
+                viewport: &self.viewport(),
+            };
+            render::geojson::cull_triangles_to_view(&ctx, triangles)
+        } else {
+            Vec::new()
         }
-        out
     }
 }
 
