@@ -1,0 +1,56 @@
+use std::cell::{RefCell, Cell};
+use crate::OwnedBuffer;
+use super::point::PointFeature;
+use super::line::LineFeature;
+
+#[derive(Clone)]
+pub struct GeoJSONLayer {
+    pub(crate) features: Vec<GeoJSONFeature>,
+    pub(crate) visible: bool,
+    pub(crate) style: GeoJSONStyle,
+    pub(crate) cached_points: Vec<PointFeature>,
+    pub(crate) cached_lines: Vec<LineFeature>,
+    pub(crate) cached_polygon_triangles: Vec<[f64; 2]>,
+    pub(crate) polygon_vertex_buffer: RefCell<Option<OwnedBuffer>>,
+    pub(crate) polygon_vertex_count: Cell<usize>,
+    pub(crate) line_vertex_buffer: RefCell<Option<OwnedBuffer>>,
+    pub(crate) line_vertex_count: Cell<usize>,
+}
+
+#[derive(Clone)]
+pub struct GeoJSONFeature {
+    pub(crate) geometry: GeoJSONGeometry,
+    pub(crate) properties: serde_json::Value,
+    pub(crate) id: Option<String>,
+}
+
+#[derive(Clone)]
+pub enum GeoJSONGeometry {
+    Point { coordinates: [f64; 2] },
+    MultiPoint { coordinates: Vec<[f64; 2]> },
+    LineString { coordinates: Vec<[f64; 2]> },
+    MultiLineString { coordinates: Vec<Vec<[f64; 2]>> },
+    Polygon { coordinates: Vec<Vec<[f64; 2]>> },
+    MultiPolygon { coordinates: Vec<Vec<Vec<[f64; 2]>>> },
+}
+
+#[derive(Clone)]
+pub struct GeoJSONStyle {
+    pub(crate) point_color: [f32; 4],
+    pub(crate) point_size: f32,
+    pub(crate) line_color: [f32; 4],
+    pub(crate) line_width: f32,
+    pub(crate) polygon_color: [f32; 4],
+}
+
+impl Default for GeoJSONStyle {
+    fn default() -> Self {
+        Self {
+            point_color: [0.0, 0.5, 1.0, 1.0],
+            point_size: 5.0,
+            line_color: [1.0, 0.0, 0.0, 1.0],
+            line_width: 2.0,
+            polygon_color: [0.0, 1.0, 0.0, 0.5],
+        }
+    }
+}

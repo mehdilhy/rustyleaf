@@ -116,23 +116,25 @@ mod tiles;
 mod spatial;
 mod error;
 mod input;
+mod events;
+mod layers;
+mod gl;
 use crate::projection::Viewport;
 use crate::color::parse_color;
 use crate::tiles::{TileCoord, TileLayer, TileLoader};
 use crate::spatial::{SpatialFeature, rebuild_spatial_index, hit_test as spatial_hit_test};
 use crate::input::MouseState;
 use crate::input::momentum::{apply_drag, apply_momentum, start_momentum_animation};
+use crate::events::{EventSystem, trigger_move_event, trigger_zoom_event, trigger_click_event, trigger_hover_event, trigger_mousedown_event, trigger_mouseup_event, trigger_contextmenu_event, trigger_keydown_event, trigger_keyup_event, trigger_dragend_event, create_map_event, create_click_event, create_hover_event};
+use crate::layers::point::{PointFeature, PointLayer};
+use crate::layers::line::{LineFeature, LineLayer};
+use crate::layers::polygon::{PolygonFeature, PolygonLayer};
+use crate::layers::geojson::{GeoJSONLayer, GeoJSONFeature, GeoJSONGeometry, GeoJSONStyle};
+use crate::gl::shaders::{self, ShaderPrograms};
 
 // Coordinate and spatial data structures (TileCoord, Tile moved to crate::tiles, SpatialFeature moved to crate::spatial)
 // MouseState moved to crate::input
-
-// Shader programs for different rendering types — OwnedProgram owns its shaders
-struct ShaderPrograms {
-    tile_program: OwnedProgram,
-    point_program: OwnedProgram,
-    line_program: OwnedProgram,
-    polygon_program: OwnedProgram,
-}
+// ShaderPrograms moved to crate::gl::shaders
 
 // WebGL buffers and state
 struct WebGlState {
@@ -157,105 +159,7 @@ type EventCallback = Box<dyn FnMut(JsValue)>;
 
 // MouseState moved to crate::input
 
-// Layer types for the map (TileLayer moved to crate::tiles)
-
-#[derive(Clone)]
-pub struct PointLayer {
-    pub(crate) points: Vec<PointFeature>,
-    pub(crate) visible: bool,
-}
-
-#[derive(Clone)]
-pub struct PointFeature {
-    pub(crate) lat: f64,
-    pub(crate) lng: f64,
-    pub(crate) size: f32,
-    pub(crate) color: [f32; 4],
-    pub(crate) meta: serde_json::Value,
-}
-
-#[derive(Clone)]
-pub struct LineFeature {
-    pub(crate) points: Vec<[f64; 2]>, // [[lat, lng], ...]
-    pub(crate) color: [f32; 4],
-    pub(crate) width: f32,
-    pub(crate) meta: serde_json::Value,
-}
-
-#[derive(Clone)]
-pub struct LineLayer {
-    pub(crate) lines: Vec<LineFeature>,
-    pub(crate) visible: bool,
-}
-
-#[derive(Clone)]
-pub struct PolygonFeature {
-    pub(crate) rings: Vec<Vec<[f64; 2]>>, // Outer ring + holes: [[[lat, lng], ...], ...]
-    pub(crate) color: [f32; 4],
-    pub(crate) meta: serde_json::Value,
-}
-
-#[derive(Clone)]
-pub struct PolygonLayer {
-    pub(crate) polygons: Vec<PolygonFeature>,
-    pub(crate) visible: bool,
-}
-
-#[derive(Clone)]
-pub struct GeoJSONLayer {
-    features: Vec<GeoJSONFeature>,
-    visible: bool,
-    style: GeoJSONStyle,
-    // Cached, preprocessed primitives to avoid per-frame parsing/triangulation
-    cached_points: Vec<PointFeature>,
-    cached_lines: Vec<LineFeature>,
-    // Flattened triangles in lat/lng coordinate pairs: [lat, lng, lat, lng, lat, lng, ...]
-    cached_polygon_triangles: Vec<[f64; 2]>,
-    // GPU buffer for normalized-world polygon vertices (uploaded once per data load)
-    polygon_vertex_buffer: RefCell<Option<OwnedBuffer>>,
-    polygon_vertex_count: Cell<usize>,
-    // GPU buffer for normalized-world line vertices (uploaded once per data load)
-    line_vertex_buffer: RefCell<Option<OwnedBuffer>>,
-    line_vertex_count: Cell<usize>,
-}
-
-#[derive(Clone)]
-pub struct GeoJSONFeature {
-    geometry: GeoJSONGeometry,
-    properties: serde_json::Value,
-    id: Option<String>,
-}
-
-#[derive(Clone)]
-pub enum GeoJSONGeometry {
-    Point { coordinates: [f64; 2] },
-    MultiPoint { coordinates: Vec<[f64; 2]> },
-    LineString { coordinates: Vec<[f64; 2]> },
-    MultiLineString { coordinates: Vec<Vec<[f64; 2]>> },
-    Polygon { coordinates: Vec<Vec<[f64; 2]>> },
-    MultiPolygon { coordinates: Vec<Vec<Vec<[f64; 2]>>> },
-}
-
-#[derive(Clone)]
-pub struct GeoJSONStyle {
-    point_color: [f32; 4],
-    point_size: f32,
-    line_color: [f32; 4],
-    line_width: f32,
-    polygon_color: [f32; 4],
-}
-
-impl Default for GeoJSONStyle {
-    fn default() -> Self {
-        Self {
-            point_color: [0.0, 0.5, 1.0, 1.0],  // Blue
-            point_size: 5.0,
-            line_color: [1.0, 0.0, 0.0, 1.0],  // Red
-            line_width: 2.0,
-            polygon_color: [0.0, 1.0, 0.0, 0.5],  // Semi-transparent green
-        }
-    }
-}
+// Layer types moved to crate::layers
 
 // WebGL support information for compatibility checking
 #[wasm_bindgen]
@@ -390,17 +294,7 @@ pub struct RustyleafMap {
     // Performance monitoring
     frame_count: u32,
     last_frame_time: f64,
-    // Event callbacks - store as boxed functions to allow removal
-    move_callbacks: Vec<Box<js_sys::Function>>,
-    zoom_callbacks: Vec<Box<js_sys::Function>>,
-    click_callbacks: Vec<Box<js_sys::Function>>,
-    hover_callbacks: Vec<Box<js_sys::Function>>,
-    mousedown_callbacks: Vec<Box<js_sys::Function>>,
-    mouseup_callbacks: Vec<Box<js_sys::Function>>,
-    contextmenu_callbacks: Vec<Box<js_sys::Function>>,
-    keydown_callbacks: Vec<Box<js_sys::Function>>,
-    keyup_callbacks: Vec<Box<js_sys::Function>>,
-    dragend_callbacks: Vec<Box<js_sys::Function>>,
+    events: EventSystem,
 }
 
 #[wasm_bindgen]
@@ -438,17 +332,7 @@ impl RustyleafMap {
             animation_frame: None,
             frame_count: 0,
             last_frame_time: 0.0,
-            // Event callbacks
-            move_callbacks: Vec::new(),
-            zoom_callbacks: Vec::new(),
-            click_callbacks: Vec::new(),
-            hover_callbacks: Vec::new(),
-            mousedown_callbacks: Vec::new(),
-            mouseup_callbacks: Vec::new(),
-            contextmenu_callbacks: Vec::new(),
-            keydown_callbacks: Vec::new(),
-            keyup_callbacks: Vec::new(),
-            dragend_callbacks: Vec::new(),
+            events: EventSystem::new(),
         }
     }
 
@@ -678,222 +562,7 @@ impl RustyleafMap {
     }
 
     fn create_shader_programs(&self, context: &WebGl2RenderingContext) -> Result<ShaderPrograms, JsValue> {
-        // Tile shader program with proper orthographic projection
-        let tile_vertex_shader = self.create_shader(
-            context,
-            WebGl2RenderingContext::VERTEX_SHADER,
-            r#"
-            attribute vec2 a_position;
-            attribute vec2 a_texCoord;
-            uniform mat4 u_matrix;
-            varying vec2 v_texCoord;
-
-            void main() {
-                vec4 position = u_matrix * vec4(a_position, 0.0, 1.0);
-                gl_Position = position;
-                v_texCoord = a_texCoord;
-            }
-            "#,
-        )?;
-
-        let tile_fragment_shader = self.create_shader(
-            context,
-            WebGl2RenderingContext::FRAGMENT_SHADER,
-            r#"
-            precision mediump float;
-            uniform sampler2D u_texture;
-            varying vec2 v_texCoord;
-
-            void main() {
-                gl_FragColor = texture2D(u_texture, v_texCoord);
-            }
-            "#,
-        )?;
-
-        let tile_program = self.create_program_with_bindings(
-            context,
-            &tile_vertex_shader,
-            &tile_fragment_shader,
-            &[(0, "a_position"), (1, "a_texCoord")],
-        )?;
-
-        // Point shader program
-        let point_vertex_shader = self.create_shader(
-            context,
-            WebGl2RenderingContext::VERTEX_SHADER,
-            r#"
-            attribute vec2 a_position;
-            attribute float a_size;
-            attribute vec4 a_color;
-            uniform mat4 u_matrix;
-            varying vec4 v_color;
-
-            void main() {
-                gl_Position = u_matrix * vec4(a_position, 0.0, 1.0);
-                gl_PointSize = a_size;
-                v_color = a_color;
-            }
-            "#,
-        )?;
-
-        let point_fragment_shader = self.create_shader(
-            context,
-            WebGl2RenderingContext::FRAGMENT_SHADER,
-            r#"
-            precision mediump float;
-            varying vec4 v_color;
-
-            void main() {
-                float dist = length(gl_PointCoord - vec2(0.5));
-                if (dist > 0.5) discard;
-                gl_FragColor = v_color;
-            }
-            "#,
-        )?;
-
-        let line_vertex_shader = self.create_shader(
-            context,
-            WebGl2RenderingContext::VERTEX_SHADER,
-            r#"
-            attribute vec2 a_position;
-            attribute vec4 a_color;
-            varying vec4 v_color;
-            uniform mat4 u_matrix;
-            uniform float u_world_scale;
-            uniform vec2 u_origin;
-
-            void main() {
-                vec2 pixel_pos = a_position * u_world_scale;
-                vec2 screen_pos = pixel_pos - u_origin;
-                gl_Position = u_matrix * vec4(screen_pos, 0.0, 1.0);
-                v_color = a_color;
-            }
-            "#,
-        )?;
-
-        let line_fragment_shader = self.create_shader(
-            context,
-            WebGl2RenderingContext::FRAGMENT_SHADER,
-            r#"
-            precision mediump float;
-            varying vec4 v_color;
-
-            void main() {
-                gl_FragColor = v_color;
-            }
-            "#,
-        )?;
-
-        let point_program = self.create_program_with_bindings(
-            context,
-            &point_vertex_shader,
-            &point_fragment_shader,
-            &[(0, "a_position"), (1, "a_size"), (2, "a_color")],
-        )?;
-
-        // Line program
-        let line_program = self.create_program_with_bindings(
-            context,
-            &line_vertex_shader,
-            &line_fragment_shader,
-            &[(0, "a_position"), (1, "a_color")],
-        )?;
-
-        // Polygon shader program
-        let polygon_vertex_shader = self.create_shader(
-            context,
-            WebGl2RenderingContext::VERTEX_SHADER,
-            r#"
-            attribute vec2 a_position;
-            attribute vec4 a_color;
-            varying vec4 v_color;
-            uniform mat4 u_matrix;
-            uniform float u_world_scale;
-            uniform vec2 u_origin;
-
-            void main() {
-                vec2 pixel_pos = a_position * u_world_scale;
-                vec2 screen_pos = pixel_pos - u_origin;
-                gl_Position = u_matrix * vec4(screen_pos, 0.0, 1.0);
-                v_color = a_color;
-            }
-            "#,
-        )?;
-
-        let polygon_fragment_shader = self.create_shader(
-            context,
-            WebGl2RenderingContext::FRAGMENT_SHADER,
-            r#"
-            precision mediump float;
-            varying vec4 v_color;
-
-            void main() {
-                gl_FragColor = v_color;
-            }
-            "#,
-        )?;
-
-        let polygon_program = self.create_program_with_bindings(
-            context,
-            &polygon_vertex_shader,
-            &polygon_fragment_shader,
-            &[(0, "a_position"), (1, "a_color")],
-        )?;
-
-        Ok(ShaderPrograms {
-            tile_program: OwnedProgram::new(context, tile_program, tile_vertex_shader, tile_fragment_shader),
-            point_program: OwnedProgram::new(context, point_program, point_vertex_shader, point_fragment_shader),
-            line_program: OwnedProgram::new(context, line_program, line_vertex_shader, line_fragment_shader),
-            polygon_program: OwnedProgram::new(context, polygon_program, polygon_vertex_shader, polygon_fragment_shader),
-        })
-    }
-
-    fn create_shader(&self, context: &WebGl2RenderingContext, shader_type: u32, source: &str) -> Result<WebGlShader, JsValue> {
-        let shader = context.create_shader(shader_type)
-            .ok_or_else(|| JsValue::from_str("Failed to create shader"))?;
-        context.shader_source(&shader, source);
-        context.compile_shader(&shader);
-
-        if !context.get_shader_parameter(&shader, WebGl2RenderingContext::COMPILE_STATUS).as_bool().unwrap_or(false) {
-            let info = context.get_shader_info_log(&shader).unwrap_or_else(|| "Unknown error".to_string());
-            return Err(JsValue::from_str(&format!("Shader compilation error: {}", info)));
-        }
-
-        Ok(shader)
-    }
-
-    fn create_program(&self, context: &WebGl2RenderingContext, vertex_shader: &WebGlShader, fragment_shader: &WebGlShader) -> Result<WebGlProgram, JsValue> {
-        let program = context.create_program()
-            .ok_or_else(|| JsValue::from_str("Failed to create program"))?;
-        context.attach_shader(&program, vertex_shader);
-        context.attach_shader(&program, fragment_shader);
-        context.link_program(&program);
-
-        if !context.get_program_parameter(&program, WebGl2RenderingContext::LINK_STATUS).as_bool().unwrap_or(false) {
-            let info = context.get_program_info_log(&program).unwrap_or_else(|| "Unknown error".to_string());
-            return Err(JsValue::from_str(&format!("Program linking error: {}", info)));
-        }
-
-        Ok(program)
-    }
-
-    fn create_program_with_bindings(&self, context: &WebGl2RenderingContext, vertex_shader: &WebGlShader, fragment_shader: &WebGlShader, bindings: &[(u32, &str)]) -> Result<WebGlProgram, JsValue> {
-        let program = context.create_program()
-            .ok_or_else(|| JsValue::from_str("Failed to create program"))?;
-        context.attach_shader(&program, vertex_shader);
-        context.attach_shader(&program, fragment_shader);
-        // Bind attribute locations before linking
-        for (index, name) in bindings {
-            context.bind_attrib_location(&program, *index, name);
-        }
-        context.link_program(&program);
-
-        if !context.get_program_parameter(&program, WebGl2RenderingContext::LINK_STATUS).as_bool().unwrap_or(false) {
-            let info = context.get_program_info_log(&program).unwrap_or_else(|| "Unknown error".to_string());
-            return Err(JsValue::from_str(&format!("Program linking error: {}", info)));
-        }
-
-        Ok(program)
+        shaders::create_shader_programs(context)
     }
 
     pub fn render(&mut self, canvas_id: &str) -> Result<(), JsValue> {
@@ -1340,239 +1009,170 @@ impl RustyleafMap {
     // Public event registration methods
     #[wasm_bindgen]
     pub fn on_move(&mut self, callback: &js_sys::Function) {
-        self.move_callbacks.push(Box::new(callback.clone()));
+        self.events.on_move(callback);
     }
 
     #[wasm_bindgen]
     pub fn on_zoom(&mut self, callback: &js_sys::Function) {
-        self.zoom_callbacks.push(Box::new(callback.clone()));
+        self.events.on_zoom(callback);
     }
 
     #[wasm_bindgen]
     pub fn on_click(&mut self, callback: &js_sys::Function) {
-        self.click_callbacks.push(Box::new(callback.clone()));
+        self.events.on_click(callback);
     }
 
     #[wasm_bindgen]
     pub fn on_hover(&mut self, callback: &js_sys::Function) {
-        self.hover_callbacks.push(Box::new(callback.clone()));
+        self.events.on_hover(callback);
     }
 
     // Event removal methods - remove all matching callbacks
     #[wasm_bindgen]
     pub fn off_move(&mut self, callback: &js_sys::Function) {
-        self.move_callbacks.retain(|cb| cb.as_ref() != callback);
+        self.events.off_move(callback);
     }
 
     #[wasm_bindgen]
     pub fn off_zoom(&mut self, callback: &js_sys::Function) {
-        self.zoom_callbacks.retain(|cb| cb.as_ref() != callback);
+        self.events.off_zoom(callback);
     }
 
     #[wasm_bindgen]
     pub fn off_click(&mut self, callback: &js_sys::Function) {
-        self.click_callbacks.retain(|cb| cb.as_ref() != callback);
+        self.events.off_click(callback);
     }
 
     #[wasm_bindgen]
     pub fn off_hover(&mut self, callback: &js_sys::Function) {
-        self.hover_callbacks.retain(|cb| cb.as_ref() != callback);
+        self.events.off_hover(callback);
     }
 
     // Additional event registration methods
     #[wasm_bindgen]
     pub fn on_mouse_down(&mut self, callback: &js_sys::Function) {
-        self.mousedown_callbacks.push(Box::new(callback.clone()));
+        self.events.on_mousedown(callback);
     }
 
     #[wasm_bindgen]
     pub fn on_mouse_up(&mut self, callback: &js_sys::Function) {
-        self.mouseup_callbacks.push(Box::new(callback.clone()));
+        self.events.on_mouseup(callback);
     }
 
     #[wasm_bindgen]
     pub fn on_contextmenu(&mut self, callback: &js_sys::Function) {
-        self.contextmenu_callbacks.push(Box::new(callback.clone()));
+        self.events.on_contextmenu(callback);
     }
 
     #[wasm_bindgen]
     pub fn on_key_down(&mut self, callback: &js_sys::Function) {
-        self.keydown_callbacks.push(Box::new(callback.clone()));
+        self.events.on_keydown(callback);
     }
 
     #[wasm_bindgen]
     pub fn on_key_up(&mut self, callback: &js_sys::Function) {
-        self.keyup_callbacks.push(Box::new(callback.clone()));
+        self.events.on_keyup(callback);
     }
 
     // Additional event removal methods
     #[wasm_bindgen]
     pub fn off_mouse_down(&mut self, callback: &js_sys::Function) {
-        self.mousedown_callbacks.retain(|cb| cb.as_ref() != callback);
+        self.events.off_mousedown(callback);
     }
 
     #[wasm_bindgen]
     pub fn off_mouse_up(&mut self, callback: &js_sys::Function) {
-        self.mouseup_callbacks.retain(|cb| cb.as_ref() != callback);
+        self.events.off_mouseup(callback);
     }
 
     #[wasm_bindgen]
     pub fn off_contextmenu(&mut self, callback: &js_sys::Function) {
-        self.contextmenu_callbacks.retain(|cb| cb.as_ref() != callback);
+        self.events.off_contextmenu(callback);
     }
 
     #[wasm_bindgen]
     pub fn off_key_down(&mut self, callback: &js_sys::Function) {
-        self.keydown_callbacks.retain(|cb| cb.as_ref() != callback);
+        self.events.off_keydown(callback);
     }
 
     #[wasm_bindgen]
     pub fn off_key_up(&mut self, callback: &js_sys::Function) {
-        self.keyup_callbacks.retain(|cb| cb.as_ref() != callback);
+        self.events.off_keyup(callback);
     }
 
   #[wasm_bindgen]
     pub fn on_dragend(&mut self, callback: &js_sys::Function) {
-        self.dragend_callbacks.push(Box::new(callback.clone()));
+        self.events.on_dragend(callback);
     }
 
   #[wasm_bindgen]
     pub fn off_dragend(&mut self, callback: &js_sys::Function) {
-        self.dragend_callbacks.retain(|cb| cb.as_ref() != callback);
+        self.events.off_dragend(callback);
     }
 
     // Event trigger methods
     fn trigger_move_event(&self) {
-        if let Ok(event_obj) = self.create_map_event("move") {
-            for callback in &self.move_callbacks {
-                let _ = callback.call1(&JsValue::null(), &event_obj);
-            }
+        if let Ok(event_obj) = create_map_event("move", &self.get_center(), self.zoom, &self.get_bounds()) {
+            trigger_move_event(&self.events.move_callbacks, &event_obj);
         }
     }
 
     fn trigger_zoom_event(&self) {
-        if let Ok(event_obj) = self.create_map_event("zoom") {
-            for callback in &self.zoom_callbacks {
-                let _ = callback.call1(&JsValue::null(), &event_obj);
-            }
+        if let Ok(event_obj) = create_map_event("zoom", &self.get_center(), self.zoom, &self.get_bounds()) {
+            trigger_zoom_event(&self.events.zoom_callbacks, &event_obj);
         }
     }
 
-    fn trigger_click_event(&self, lat: f64, lng: f64, original_event: Option<&web_sys::MouseEvent>) {
-        if let Ok(event_obj) = self.create_click_event(lat, lng, original_event) {
-            for callback in &self.click_callbacks {
-                let _ = callback.call1(&JsValue::null(), &event_obj);
-            }
+    fn trigger_click_event(&self, lat: f64, lng: f64, _original_event: Option<&web_sys::MouseEvent>) {
+        let latlng = Array::new();
+        latlng.push(&JsValue::from_f64(lat));
+        latlng.push(&JsValue::from_f64(lng));
+        let point = self.project(&JsValue::from(latlng));
+        if let Ok(event_obj) = create_click_event(lat, lng, &point) {
+            trigger_click_event(&self.events.click_callbacks, &event_obj);
         }
     }
 
-    fn trigger_hover_event(&self, lat: f64, lng: f64, original_event: Option<&web_sys::MouseEvent>) {
-        if let Ok(event_obj) = self.create_hover_event(lat, lng, original_event) {
-            for callback in &self.hover_callbacks {
-                let _ = callback.call1(&JsValue::null(), &event_obj);
-            }
+    fn trigger_hover_event(&self, lat: f64, lng: f64, _original_event: Option<&web_sys::MouseEvent>) {
+        if let Ok(event_obj) = create_hover_event(lat, lng) {
+            trigger_hover_event(&self.events.hover_callbacks, &event_obj);
         }
     }
 
-    fn trigger_mousedown_event(&self, lat: f64, lng: f64, original_event: Option<&web_sys::MouseEvent>) {
-        if let Ok(event_obj) = self.create_click_event(lat, lng, original_event) {
-            for callback in &self.mousedown_callbacks {
-                let _ = callback.call1(&JsValue::null(), &event_obj);
-            }
+    fn trigger_mousedown_event(&self, lat: f64, lng: f64, _original_event: Option<&web_sys::MouseEvent>) {
+        let latlng = Array::new();
+        latlng.push(&JsValue::from_f64(lat));
+        latlng.push(&JsValue::from_f64(lng));
+        let point = self.project(&JsValue::from(latlng));
+        if let Ok(event_obj) = create_click_event(lat, lng, &point) {
+            trigger_mousedown_event(&self.events.mousedown_callbacks, &event_obj);
         }
     }
 
-    fn trigger_mouseup_event(&self, lat: f64, lng: f64, original_event: Option<&web_sys::MouseEvent>) {
-        if let Ok(event_obj) = self.create_click_event(lat, lng, original_event) {
-            for callback in &self.mouseup_callbacks {
-                let _ = callback.call1(&JsValue::null(), &event_obj);
-            }
+    fn trigger_mouseup_event(&self, lat: f64, lng: f64, _original_event: Option<&web_sys::MouseEvent>) {
+        let latlng = Array::new();
+        latlng.push(&JsValue::from_f64(lat));
+        latlng.push(&JsValue::from_f64(lng));
+        let point = self.project(&JsValue::from(latlng));
+        if let Ok(event_obj) = create_click_event(lat, lng, &point) {
+            trigger_mouseup_event(&self.events.mouseup_callbacks, &event_obj);
         }
     }
 
-    fn trigger_contextmenu_event(&self, lat: f64, lng: f64, original_event: Option<&web_sys::MouseEvent>) {
-        if let Ok(event_obj) = self.create_click_event(lat, lng, original_event) {
-            for callback in &self.contextmenu_callbacks {
-                let _ = callback.call1(&JsValue::null(), &event_obj);
-            }
+    fn trigger_contextmenu_event(&self, lat: f64, lng: f64, _original_event: Option<&web_sys::MouseEvent>) {
+        let latlng = Array::new();
+        latlng.push(&JsValue::from_f64(lat));
+        latlng.push(&JsValue::from_f64(lng));
+        let point = self.project(&JsValue::from(latlng));
+        if let Ok(event_obj) = create_click_event(lat, lng, &point) {
+            trigger_contextmenu_event(&self.events.contextmenu_callbacks, &event_obj);
         }
     }
 
     fn trigger_dragend_event(&self) {
-        if let Ok(event_obj) = self.create_map_event("dragend") {
-            for callback in &self.dragend_callbacks {
-                let _ = callback.call1(&JsValue::null(), &event_obj);
-            }
+        if let Ok(event_obj) = create_map_event("dragend", &self.get_center(), self.zoom, &self.get_bounds()) {
+            trigger_dragend_event(&self.events.dragend_callbacks, &event_obj);
         }
-    }
-
-    // Event object creation methods
-    fn create_map_event(&self, event_type: &str) -> Result<JsValue, JsValue> {
-        let obj = js_sys::Object::new();
-        js_sys::Reflect::set(&obj, &JsValue::from_str("type"), &JsValue::from_str(event_type))
-            .map_err(|e| JsValue::from_str(&format!("Failed to set event type: {:?}", e)))?;
-        js_sys::Reflect::set(&obj, &JsValue::from_str("target"), &JsValue::null())
-            .map_err(|e| JsValue::from_str(&format!("Failed to set target: {:?}", e)))?;
-        js_sys::Reflect::set(&obj, &JsValue::from_str("sourceTarget"), &JsValue::null())
-            .map_err(|e| JsValue::from_str(&format!("Failed to set sourceTarget: {:?}", e)))?;
-        
-        // Add map state
-        let center = self.get_center();
-        js_sys::Reflect::set(&obj, &JsValue::from_str("center"), &center)
-            .map_err(|e| JsValue::from_str(&format!("Failed to set center: {:?}", e)))?;
-        
-        let zoom = JsValue::from_f64(self.zoom);
-        js_sys::Reflect::set(&obj, &JsValue::from_str("zoom"), &zoom)
-            .map_err(|e| JsValue::from_str(&format!("Failed to set zoom: {:?}", e)))?;
-        
-        let bounds = self.get_bounds();
-        js_sys::Reflect::set(&obj, &JsValue::from_str("bounds"), &bounds)
-            .map_err(|e| JsValue::from_str(&format!("Failed to set bounds: {:?}", e)))?;
-        
-        Ok(obj.into())
-    }
-
-    fn create_click_event(&self, lat: f64, lng: f64, _original_event: Option<&web_sys::MouseEvent>) -> Result<JsValue, JsValue> {
-        let obj = js_sys::Object::new();
-        js_sys::Reflect::set(&obj, &JsValue::from_str("type"), &JsValue::from_str("click"))
-            .map_err(|e| JsValue::from_str(&format!("Failed to set click type: {:?}", e)))?;
-        js_sys::Reflect::set(&obj, &JsValue::from_str("target"), &JsValue::null())
-            .map_err(|e| JsValue::from_str(&format!("Failed to set click target: {:?}", e)))?;
-        
-        // Add latlng
-        let latlng = Array::new();
-        latlng.push(&JsValue::from_f64(lat));
-        latlng.push(&JsValue::from_f64(lng));
-        js_sys::Reflect::set(&obj, &JsValue::from_str("latlng"), &latlng)
-            .map_err(|e| JsValue::from_str(&format!("Failed to set click latlng: {:?}", e)))?;
-        
-        // Add container point
-        let point = self.project(&JsValue::from(latlng));
-        js_sys::Reflect::set(&obj, &JsValue::from_str("containerPoint"), &point)
-            .map_err(|e| JsValue::from_str(&format!("Failed to set click containerPoint: {:?}", e)))?;
-        
-        // Add layer point (same as container point for map-level events)
-        js_sys::Reflect::set(&obj, &JsValue::from_str("layerPoint"), &point)
-            .map_err(|e| JsValue::from_str(&format!("Failed to set click layerPoint: {:?}", e)))?;
-        
-        Ok(obj.into())
-    }
-
-    fn create_hover_event(&self, lat: f64, lng: f64, _original_event: Option<&web_sys::MouseEvent>) -> Result<JsValue, JsValue> {
-        let obj = js_sys::Object::new();
-        js_sys::Reflect::set(&obj, &JsValue::from_str("type"), &JsValue::from_str("hover"))
-            .map_err(|e| JsValue::from_str(&format!("Failed to set hover type: {:?}", e)))?;
-        js_sys::Reflect::set(&obj, &JsValue::from_str("target"), &JsValue::null())
-            .map_err(|e| JsValue::from_str(&format!("Failed to set hover target: {:?}", e)))?;
-        
-        // Add latlng
-        let latlng = Array::new();
-        latlng.push(&JsValue::from_f64(lat));
-        latlng.push(&JsValue::from_f64(lng));
-        js_sys::Reflect::set(&obj, &JsValue::from_str("latlng"), &latlng)
-            .map_err(|e| JsValue::from_str(&format!("Failed to set hover latlng: {:?}", e)))?;
-        
-        Ok(obj.into())
     }
 
     // Public methods for JavaScript

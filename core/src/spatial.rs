@@ -1,5 +1,7 @@
 use rstar::{RTree, RTreeObject, AABB};
-use crate::{PointLayer, LineLayer, PolygonLayer};
+use crate::layers::point::PointLayer;
+use crate::layers::line::LineLayer;
+use crate::layers::polygon::PolygonLayer;
 use crate::projection::Viewport;
 
 #[derive(Clone, Debug)]
