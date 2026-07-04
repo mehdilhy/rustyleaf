@@ -19,7 +19,7 @@ fn cancel_animation_frame(handle: i32) -> Result<(), JsValue> {
     let _ = window.cancel_animation_frame(handle);
     Ok(())
 }
-use std::cell::RefCell;
+use std::cell::{RefCell, Cell};
 use std::collections::{HashMap, HashSet};
 use js_sys::{Array, Float32Array};
 use rstar::{RTree, RTreeObject, AABB};
@@ -78,11 +78,14 @@ struct WebGlState {
     point_buffer: WebGlBuffer,
     line_buffer: WebGlBuffer,
     polygon_buffer: WebGlBuffer,
+    polygon_u_origin: Option<WebGlUniformLocation>,
+    polygon_u_world_scale: Option<WebGlUniformLocation>,
+    line_u_origin: Option<WebGlUniformLocation>,
+    line_u_world_scale: Option<WebGlUniformLocation>,
 }
 
 thread_local! {
     static TILE_TEXTURES: RefCell<HashMap<String, WebGlTexture>> = RefCell::new(HashMap::new());
-    static SPATIAL_INDEX: RefCell<RTree<SpatialFeature>> = RefCell::new(RTree::new());
 }
 
 // Event callback types
@@ -159,8 +162,11 @@ pub struct GeoJSONLayer {
     // Flattened triangles in lat/lng coordinate pairs: [lat, lng, lat, lng, lat, lng, ...]
     cached_polygon_triangles: Vec<[f64; 2]>,
     // GPU buffer for normalized-world polygon vertices (uploaded once per data load)
-    polygon_vertex_buffer: Option<WebGlBuffer>,
-    polygon_vertex_count: usize,
+    polygon_vertex_buffer: RefCell<Option<WebGlBuffer>>,
+    polygon_vertex_count: Cell<usize>,
+    // GPU buffer for normalized-world line vertices (uploaded once per data load)
+    line_vertex_buffer: RefCell<Option<WebGlBuffer>>,
+    line_vertex_count: Cell<usize>,
 }
 
 #[derive(Clone)]
@@ -318,10 +324,13 @@ pub struct RustyleafMap {
     tile_size: u32,
     requested: HashSet<String>,
     tile_layer: Option<TileLayer>,
+    tile_closures: Vec<Closure<dyn FnMut()>>,
     point_layers: Vec<PointLayer>,
     line_layers: Vec<LineLayer>,
     polygon_layers: Vec<PolygonLayer>,
     geojson_layers: Vec<GeoJSONLayer>,
+    spatial_index: RTree<SpatialFeature>,
+    spatial_index_dirty: bool,
     mouse_state: MouseState,
     // Smooth dragging with momentum
     drag_velocity: (f64, f64),
@@ -362,10 +371,13 @@ impl RustyleafMap {
             tile_size: 256,
             requested: HashSet::new(),
             tile_layer: None,
+            tile_closures: Vec::new(),
             point_layers: Vec::new(),
             line_layers: Vec::new(),
             polygon_layers: Vec::new(),
             geojson_layers: Vec::new(),
+            spatial_index: RTree::new(),
+            spatial_index_dirty: true,
             mouse_state: MouseState {
                 is_dragging: false,
                 last_x: 0.0,
@@ -500,48 +512,47 @@ impl RustyleafMap {
 
     fn cleanup_old_tiles(&mut self) {
         let current_zoom = self.zoom.round() as i32;
-        let max_cache_size = 20; // Ultra aggressive cleanup for tiny memory footprint
-        
-        TILE_TEXTURES.with(|store| {
-            let mut textures = store.borrow_mut();
-            
-            // Remove tiles that are too far from current zoom or too old
-            let keys_to_remove: Vec<String> = textures.iter()
-                .filter(|(key, _)| {
-                    let parts: Vec<&str> = key.split('/').collect();
-                    if parts.len() == 3 {
-                        if let Ok(zoom) = parts[0].parse::<i32>() {
-                            // Remove tiles not at current zoom level only
-                            zoom != current_zoom
-                        } else {
-                            true // Remove malformed keys
-                        }
-                    } else {
-                        true // Remove malformed keys
-                    }
-                })
-                .map(|(key, _)| key.clone())
-                .collect();
-            
-            for key in keys_to_remove {
-                textures.remove(&key);
-            }
-            
-            // If still too many tiles, remove oldest ones
-            if textures.len() > max_cache_size {
-                let mut keys: Vec<String> = textures.keys().cloned().collect();
-                keys.truncate(max_cache_size);
-                
-                let to_remove: Vec<String> = textures.keys()
-                    .filter(|k| !keys.contains(k))
-                    .cloned()
+        let max_cache_size = 20;
+
+        if let Some(ref gl_state) = self.gl_state {
+            let context = &gl_state.context;
+
+            TILE_TEXTURES.with(|store| {
+                let mut textures = store.borrow_mut();
+
+                let keys_to_remove: Vec<String> = textures.iter()
+                    .filter(|(key, _)| {
+                        let parts: Vec<&str> = key.split('/').collect();
+                        if parts.len() == 3 {
+                            if let Ok(zoom) = parts[0].parse::<i32>() {
+                                zoom != current_zoom
+                            } else { true }
+                        } else { true }
+                    })
+                    .map(|(key, _)| key.clone())
                     .collect();
-                
-                for key in to_remove {
-                    textures.remove(&key);
+
+                for key in keys_to_remove {
+                    if let Some(texture) = textures.remove(&key) {
+                        context.delete_texture(Some(&texture));
+                    }
                 }
-            }
+
+                if textures.len() > max_cache_size {
+                    let mut keys: Vec<String> = textures.keys().cloned().collect();
+                    keys.truncate(max_cache_size);
+                    let to_remove: Vec<String> = textures.keys()
+                        .filter(|k| !keys.contains(k))
+                        .cloned()
+                        .collect();
+                    for key in to_remove {
+                        if let Some(texture) = textures.remove(&key) {
+                            context.delete_texture(Some(&texture));
+                        }
+                    }
+                }
         });
+        }
         
         // Clean up requested set to prevent memory bloat
         if self.requested.len() > 50 {
@@ -610,6 +621,13 @@ impl RustyleafMap {
         // Create shader programs
         let programs = self.create_shader_programs(&context)?;
 
+        // Get u_origin uniform location for polygon shader
+        let polygon_u_origin = context.get_uniform_location(&programs.polygon_program, "u_origin");
+        let polygon_u_world_scale = context.get_uniform_location(&programs.polygon_program, "u_world_scale");
+
+        let line_u_origin = context.get_uniform_location(&programs.line_program, "u_origin");
+        let line_u_world_scale = context.get_uniform_location(&programs.line_program, "u_world_scale");
+
         // Create VAOs and buffers with error handling
         let tile_vao = context.create_vertex_array().ok_or_else(|| JsValue::from_str("Failed to create tile VAO"))?;
         let point_vao = context.create_vertex_array().ok_or_else(|| JsValue::from_str("Failed to create point VAO"))?;
@@ -653,6 +671,10 @@ impl RustyleafMap {
             point_buffer,
             line_buffer,
             polygon_buffer,
+            polygon_u_origin,
+            polygon_u_world_scale,
+            line_u_origin,
+            line_u_world_scale,
         });
 
         Ok(())
@@ -738,11 +760,15 @@ impl RustyleafMap {
             r#"
             attribute vec2 a_position;
             attribute vec4 a_color;
-            uniform mat4 u_matrix;
             varying vec4 v_color;
+            uniform mat4 u_matrix;
+            uniform float u_world_scale;
+            uniform vec2 u_origin;
 
             void main() {
-                gl_Position = u_matrix * vec4(a_position, 0.0, 1.0);
+                vec2 pixel_pos = a_position * u_world_scale;
+                vec2 screen_pos = pixel_pos - u_origin;
+                gl_Position = u_matrix * vec4(screen_pos, 0.0, 1.0);
                 v_color = a_color;
             }
             "#,
@@ -783,11 +809,15 @@ impl RustyleafMap {
             r#"
             attribute vec2 a_position;
             attribute vec4 a_color;
-            uniform mat4 u_matrix;
             varying vec4 v_color;
+            uniform mat4 u_matrix;
+            uniform float u_world_scale;
+            uniform vec2 u_origin;
 
             void main() {
-                gl_Position = u_matrix * vec4(a_position, 0.0, 1.0);
+                vec2 pixel_pos = a_position * u_world_scale;
+                vec2 screen_pos = pixel_pos - u_origin;
+                gl_Position = u_matrix * vec4(screen_pos, 0.0, 1.0);
                 v_color = a_color;
             }
             "#,
@@ -901,9 +931,6 @@ impl RustyleafMap {
 
         // Set viewport
         context.viewport(0, 0, self.width as i32, self.height as i32);
-
-        // Update spatial index for hit-testing
-        self.update_spatial_index();
 
         // Render tiles, points, lines, polygons, and GeoJSON
         self.render_tiles(&context)?;
@@ -1162,6 +1189,14 @@ impl RustyleafMap {
                     context.enable_vertex_attrib_array(1);
                     context.vertex_attrib_pointer_with_i32(1, 4, WebGl2RenderingContext::FLOAT, false, stride, 2 * 4);
 
+                    // Set u_origin and u_world_scale for line shader (screen coords, so identity transform)
+                    if let Some(ref loc) = gl_state.line_u_origin {
+                        context.uniform2f(Some(loc), 0.0, 0.0);
+                    }
+                    if let Some(ref loc) = gl_state.line_u_world_scale {
+                        context.uniform1f(Some(loc), 1.0);
+                    }
+
                     // Draw lines as line segments
                     let total_vertices = vertex_data.len() / 6; // 6 floats per vertex
                     context.draw_arrays(WebGl2RenderingContext::LINES, 0, total_vertices as i32);
@@ -1265,6 +1300,26 @@ impl RustyleafMap {
         ]
     }
 
+    fn create_pixel_projection_matrix(&self) -> [f32; 16] {
+        // Projection matrix for world-pixel coordinates (Web Mercator pixel space)
+        // Subtracts the viewport origin so the vertex shader receives the same
+        // coords regardless of pan position
+        let w = self.width as f32;
+        let h = self.height as f32;
+        let zoom = self.zoom.round() as u32;
+        let center_pixel = self.lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
+        let origin_x = center_pixel.0 - (self.width as f64 / 2.0);
+        let origin_y = center_pixel.1 - (self.height as f64 / 2.0);
+        [
+            2.0 / w,       0.0,           0.0, 0.0,
+            0.0,           -2.0 / h,      0.0, 0.0,
+            0.0,            0.0,          -1.0, 0.0,
+            -(2.0 * origin_x as f32 / w + 1.0),
+            2.0 * origin_y as f32 / h + 1.0,
+            0.0, 1.0,
+        ]
+    }
+
     fn lat_lng_to_screen(&self, lat: f64, lng: f64) -> (f64, f64) {
         let zoom = self.zoom.round() as u32;
         let center_pixel = self.lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
@@ -1308,6 +1363,7 @@ impl RustyleafMap {
     // removed stale canvas 2D debug renderer
 
     fn load_visible_tiles(&mut self) {
+        self.cleanup_old_tiles();
         let zoom = self.zoom.round() as u32;
         let center_pixel = self.lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
 
@@ -1424,27 +1480,8 @@ impl RustyleafMap {
             }) as Box<dyn FnMut()>);
 
             image.set_onload(Some(onload_closure.as_ref().unchecked_ref()));
-            onload_closure.forget();
-
-            // Set up onerror handler
-            let onerror_closure = Closure::wrap(Box::new(move || {
-                web_sys::console::warn_1(&JsValue::from_str(&format!(
-                    "⚠️ Rustyleaf: Failed to load tile at zoom {}, x {}, y {}. URL: {}\n\
-                    This could be due to:\n\
-                    • Network connectivity issues\n\
-                    • Invalid tile service URL template\n\
-                    • Tile service rate limiting or unavailability\n\
-                    • CORS restrictions on the tile service\n\
-                    Consider checking your network connection and tile service URL.",
-                    tile_key_clone2.split('/').next().unwrap_or("unknown"),
-                    tile_key_clone2.split('/').nth(1).unwrap_or("unknown"),
-                    tile_key_clone2.split('/').nth(2).unwrap_or("unknown"),
-                    url_clone
-                )));
-            }) as Box<dyn FnMut()>);
-
-            image.set_onerror(Some(onerror_closure.as_ref().unchecked_ref()));
-            onerror_closure.forget();
+            image.set_onerror(Some(onload_closure.as_ref().unchecked_ref()));
+            self.tile_closures.push(onload_closure);
 
             // Start loading the image
             image.set_src(&url);
@@ -1466,6 +1503,15 @@ impl RustyleafMap {
 
         // Convert to pixel coordinates
         (x_tile * self.tile_size as f64, y_tile * self.tile_size as f64)
+    }
+
+    fn lat_lng_to_normalized(&self, lat: f64, lng: f64) -> (f64, f64) {
+        // Normalized Web Mercator coordinates in [0..1] range (zoom-independent)
+        let clamped_lat = lat.max(-85.05112878).min(85.05112878);
+        let x = (lng + 180.0) / 360.0;
+        let lat_rad = clamped_lat.to_radians();
+        let y = (1.0 - ((std::f64::consts::FRAC_PI_4 + lat_rad / 2.0).tan().ln() / std::f64::consts::PI)) / 2.0;
+        (x, y)
     }
 
     fn pixel_to_lat_lng(&self, x: f64, y: f64, zoom: u32) -> (f64, f64) {
@@ -2019,6 +2065,7 @@ impl RustyleafMap {
         }
 
         self.point_layers[layer_index].points = points;
+        self.spatial_index_dirty = true;
         Ok(())
     }
 
@@ -2079,6 +2126,7 @@ impl RustyleafMap {
         }
 
         self.line_layers[layer_index].lines = lines;
+        self.spatial_index_dirty = true;
         Ok(())
     }
 
@@ -2144,6 +2192,7 @@ impl RustyleafMap {
         }
 
         self.polygon_layers[layer_index].polygons = polygons;
+        self.spatial_index_dirty = true;
         Ok(())
     }
 
@@ -2156,8 +2205,10 @@ impl RustyleafMap {
             cached_points: Vec::new(),
             cached_lines: Vec::new(),
             cached_polygon_triangles: Vec::new(),
-            polygon_vertex_buffer: None,
-            polygon_vertex_count: 0,
+            polygon_vertex_buffer: RefCell::new(None),
+            polygon_vertex_count: Cell::new(0),
+            line_vertex_buffer: RefCell::new(None),
+            line_vertex_count: Cell::new(0),
         };
         self.geojson_layers.push(geojson_layer);
     }
@@ -2172,6 +2223,7 @@ impl RustyleafMap {
         let features = self.parse_geojson_string(geojson_str)?;
         self.geojson_layers[layer_index].features = features;
         self.rebuild_geojson_cache(layer_index)?;
+        self.spatial_index_dirty = true;
 
         Ok(())
     }
@@ -2213,14 +2265,12 @@ impl RustyleafMap {
                     web_sys::console::log_1(&"Failed to fetch GeoJSON: Status error".into());
                 }
             }
-        }) as Box<dyn Fn()>);
+        }) as Box<dyn FnMut()>);
 
         // Set event handlers
         xhr.set_onload(Some(onload.as_ref().unchecked_ref()));
         xhr.set_onerror(Some(onload.as_ref().unchecked_ref()));
-
-        // Forget the closure to keep it alive
-        onload.forget();
+        self.tile_closures.push(onload);
 
         // Send the request
         xhr.send().map_err(|e| JsValue::from_str(&format!("Failed to send request: {:?}", e)))?;
@@ -2239,6 +2289,7 @@ impl RustyleafMap {
         self.geojson_layers[layer_index].features.extend(chunk_features);
         // Rebuild cache for streaming too (could be optimized by incremental append)
         self.rebuild_geojson_cache(layer_index)?;
+        self.spatial_index_dirty = true;
 
         Ok(())
     }
@@ -2253,8 +2304,11 @@ impl RustyleafMap {
         self.geojson_layers[layer_index].cached_points.clear();
         self.geojson_layers[layer_index].cached_lines.clear();
         self.geojson_layers[layer_index].cached_polygon_triangles.clear();
-        self.geojson_layers[layer_index].polygon_vertex_buffer = None;
-        self.geojson_layers[layer_index].polygon_vertex_count = 0;
+        self.geojson_layers[layer_index].polygon_vertex_buffer = RefCell::new(None);
+        self.geojson_layers[layer_index].polygon_vertex_count = Cell::new(0);
+        self.geojson_layers[layer_index].line_vertex_buffer = RefCell::new(None);
+        self.geojson_layers[layer_index].line_vertex_count = Cell::new(0);
+        self.spatial_index_dirty = true;
         Ok(())
     }
 
@@ -2387,6 +2441,9 @@ impl RustyleafMap {
                 }
             } else {
                 // Mouse click (no drag) - perform hit-testing
+                if self.spatial_index_dirty {
+                    self.rebuild_spatial_index();
+                }
                 if let Some(hit_info) = self.hit_test(canvas_x, canvas_y) {
                     self.trigger_feature_click(hit_info);
                 } else {
@@ -2457,10 +2514,24 @@ impl RustyleafMap {
                 && geojson_layer.cached_lines.is_empty()
                 && geojson_layer.cached_polygon_triangles.is_empty()) {
                 if !geojson_layer.cached_polygon_triangles.is_empty() {
-                    self.render_geojson_polygon_triangles(context, &geojson_layer.cached_polygon_triangles, geojson_layer.style.polygon_color)?;
+                    // Try GPU buffer fast path first when available
+                    let has_gpu_buffer = self.geojson_layers.iter()
+                        .any(|l| l.visible && l.polygon_vertex_buffer.borrow().is_some());
+                    if has_gpu_buffer {
+                        self.render_geojson_polygons(context, &[])?;
+                    } else {
+                        self.render_geojson_polygon_triangles(context, &geojson_layer.cached_polygon_triangles, geojson_layer.style.polygon_color)?;
+                    }
                 }
                 if !geojson_layer.cached_lines.is_empty() {
-                    self.render_geojson_lines(context, &geojson_layer.cached_lines)?;
+                    // Try GPU buffer fast path first when available
+                    let has_line_gpu_buffer = self.geojson_layers.iter()
+                        .any(|l| l.visible && l.line_vertex_buffer.borrow().is_some());
+                    if has_line_gpu_buffer {
+                        self.render_geojson_lines(context, &[])?;
+                    } else {
+                        self.render_geojson_lines(context, &geojson_layer.cached_lines)?;
+                    }
                 }
                 if !geojson_layer.cached_points.is_empty() {
                     self.render_geojson_points(context, &geojson_layer.cached_points)?;
@@ -2652,22 +2723,55 @@ impl RustyleafMap {
             context.use_program(Some(&gl_state.programs.line_program));
             context.bind_vertex_array(Some(&gl_state.line_vao));
 
-            // Collect all line segment data
+            // Render from cached GPU buffer if available
+            if let Some(buffer) = self.geojson_layers.iter().find(|l| l.visible && l.line_vertex_buffer.borrow().is_some()).and_then(|l| l.line_vertex_buffer.borrow().clone()) {
+                context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(&buffer));
+                let stride = 6 * 4; // pos(2) + color(4)
+                context.enable_vertex_attrib_array(0);
+                context.vertex_attrib_pointer_with_i32(0, 2, WebGl2RenderingContext::FLOAT, false, stride, 0);
+                context.enable_vertex_attrib_array(1);
+                context.vertex_attrib_pointer_with_i32(1, 4, WebGl2RenderingContext::FLOAT, false, stride, 2 * 4);
+
+                let projection_matrix = self.create_projection_matrix();
+                let u_matrix_loc = context.get_uniform_location(&gl_state.programs.line_program, "u_matrix");
+                if let Some(loc) = u_matrix_loc.as_ref() {
+                    context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
+                }
+
+                if let Some(ref loc) = gl_state.line_u_origin {
+                    let zoom = self.zoom.round() as u32;
+                    let center_pixel = self.lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
+                    let origin_x = center_pixel.0 - (self.width as f64 / 2.0);
+                    let origin_y = center_pixel.1 - (self.height as f64 / 2.0);
+                    context.uniform2f(Some(loc), origin_x as f32, origin_y as f32);
+                }
+                if let Some(ref loc) = gl_state.line_u_world_scale {
+                    let zoom = self.zoom.round() as u32;
+                    let world_scale = self.tile_size as f32 * (1u32 << zoom) as f32;
+                    context.uniform1f(Some(loc), world_scale);
+                }
+
+                if let Some(layer) = self.geojson_layers.iter().find(|l| l.visible && l.line_vertex_buffer.borrow().is_some()) {
+                    let total_vertices = layer.line_vertex_count.get() as i32;
+                    if total_vertices > 0 { context.draw_arrays(WebGl2RenderingContext::LINES, 0, total_vertices); return Ok(()); }
+                }
+            }
+
+            // Collect all line segment data using normalized [0..1] world coords
             let mut vertex_data = Vec::new();
 
             for line in lines {
-                // Convert line points to screen coordinates and create segments
                 for i in 0..line.points.len().saturating_sub(1) {
                     let start = line.points[i];
                     let end = line.points[i + 1];
                     
-                    let start_screen = self.lat_lng_to_screen(start[0], start[1]);
-                    let end_screen = self.lat_lng_to_screen(end[0], end[1]);
+                    let (sx, sy) = self.lat_lng_to_normalized(start[0], start[1]);
+                    let (ex, ey) = self.lat_lng_to_normalized(end[0], end[1]);
                     
                     vertex_data.extend_from_slice(&[
-                        start_screen.0 as f32, start_screen.1 as f32,
+                        sx as f32, sy as f32,
                         line.color[0], line.color[1], line.color[2], line.color[3],
-                        end_screen.0 as f32, end_screen.1 as f32,
+                        ex as f32, ey as f32,
                         line.color[0], line.color[1], line.color[2], line.color[3],
                     ]);
                 }
@@ -2702,6 +2806,20 @@ impl RustyleafMap {
                     context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
                 }
 
+                // Set u_origin and u_world_scale for pixel-coord subtraction in vertex shader
+                if let Some(ref loc) = gl_state.line_u_origin {
+                    let zoom = self.zoom.round() as u32;
+                    let center_pixel = self.lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
+                    let origin_x = center_pixel.0 - (self.width as f64 / 2.0);
+                    let origin_y = center_pixel.1 - (self.height as f64 / 2.0);
+                    context.uniform2f(Some(loc), origin_x as f32, origin_y as f32);
+                }
+                if let Some(ref loc) = gl_state.line_u_world_scale {
+                    let zoom = self.zoom.round() as u32;
+                    let world_scale = self.tile_size as f32 * (1u32 << zoom) as f32;
+                    context.uniform1f(Some(loc), world_scale);
+                }
+
                 let total_vertices = vertex_data.len() / 6;
                 context.draw_arrays(WebGl2RenderingContext::LINES, 0, total_vertices as i32);
             }
@@ -2718,7 +2836,7 @@ impl RustyleafMap {
             context.bind_vertex_array(Some(&gl_state.polygon_vao));
 
             // Render from cached GPU buffer if available
-            if let Some(buffer) = self.geojson_layers.iter().find(|l| l.visible && !l.cached_polygon_triangles.is_empty()).and_then(|l| l.polygon_vertex_buffer.clone()) {
+            if let Some(buffer) = self.geojson_layers.iter().find(|l| l.visible && !l.cached_polygon_triangles.is_empty()).and_then(|l| l.polygon_vertex_buffer.borrow().clone()) {
                 context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(&buffer));
                 let stride = 6 * 4; // pos(2) + color(4)
                 context.enable_vertex_attrib_array(0);
@@ -2732,9 +2850,24 @@ impl RustyleafMap {
                     context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
                 }
 
+                // Set u_origin for pixel-coord subtraction in vertex shader
+                if let Some(ref loc) = gl_state.polygon_u_origin {
+                    let zoom = self.zoom.round() as u32;
+                    let center_pixel = self.lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
+                    let origin_x = center_pixel.0 - (self.width as f64 / 2.0);
+                    let origin_y = center_pixel.1 - (self.height as f64 / 2.0);
+                    context.uniform2f(Some(loc), origin_x as f32, origin_y as f32);
+                }
+                // Set u_world_scale for normalized-to-pixel conversion
+                if let Some(ref loc) = gl_state.polygon_u_world_scale {
+                    let zoom = self.zoom.round() as u32;
+                    let world_scale = self.tile_size as f32 * (1u32 << zoom) as f32;
+                    context.uniform1f(Some(loc), world_scale);
+                }
+
                 // Find count from the same layer
-                if let Some(layer) = self.geojson_layers.iter().find(|l| l.visible && l.polygon_vertex_buffer.is_some()) {
-                    let total_vertices = layer.polygon_vertex_count as i32;
+                if let Some(layer) = self.geojson_layers.iter().find(|l| l.visible && l.polygon_vertex_buffer.borrow().is_some()) {
+                    let total_vertices = layer.polygon_vertex_count.get() as i32;
                     if total_vertices > 0 { context.draw_arrays(WebGl2RenderingContext::TRIANGLES, 0, total_vertices); return Ok(()); }
                 }
             }
@@ -2821,6 +2954,16 @@ impl RustyleafMap {
                     context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
                 }
 
+                // Set u_origin for pixel-coord subtraction in vertex shader
+                // Slow path: vertices are already in screen coords, use identity
+                if let Some(ref loc) = gl_state.polygon_u_origin {
+                    context.uniform2f(Some(loc), 0.0, 0.0);
+                }
+                // Set u_world_scale: screen coords don't need scaling
+                if let Some(ref loc) = gl_state.polygon_u_world_scale {
+                    context.uniform1f(Some(loc), 1.0);
+                }
+
                 let total_vertices = vertex_data.len() / 6;
                 web_sys::console::log_2(&"Drawing triangles:".into(), &total_vertices.into());
                 context.draw_arrays(WebGl2RenderingContext::TRIANGLES, 0, total_vertices as i32);
@@ -2875,6 +3018,16 @@ impl RustyleafMap {
                 let u_matrix_loc = context.get_uniform_location(&gl_state.programs.polygon_program, "u_matrix");
                 if let Some(loc) = u_matrix_loc.as_ref() {
                     context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
+                }
+
+                // Set u_origin for pixel-coord subtraction in vertex shader
+                // Slow path: vertices are already in screen coords, use identity
+                if let Some(ref loc) = gl_state.polygon_u_origin {
+                    context.uniform2f(Some(loc), 0.0, 0.0);
+                }
+                // Set u_world_scale: screen coords don't need scaling
+                if let Some(ref loc) = gl_state.polygon_u_world_scale {
+                    context.uniform1f(Some(loc), 1.0);
                 }
 
                 let total_vertices = vertex_data.len() / 6;
@@ -3293,20 +3446,21 @@ impl RustyleafMap {
     }
 
     // Spatial indexing and hit-testing methods
-    fn update_spatial_index(&mut self) {
-        // Create new index and replace the old one
+    fn rebuild_spatial_index(&mut self) {
+        if !self.spatial_index_dirty {
+            return;
+        }
+
         let mut new_index = RTree::new();
         let mut feature_id = 0;
+        let tolerance = 0.001; // degrees — ~111m at equator
 
         // Index point features
         for (layer_idx, layer) in self.point_layers.iter().enumerate() {
             for (point_idx, point) in layer.points.iter().enumerate() {
-                let screen_pos = self.lat_lng_to_screen(point.lat, point.lng);
-                let tolerance = 3.0; // 3px tolerance as specified
-                
                 let bounds = AABB::from_corners(
-                    [screen_pos.0 - tolerance, screen_pos.1 - tolerance],
-                    [screen_pos.0 + tolerance, screen_pos.1 + tolerance]
+                    [point.lng - tolerance, point.lat - tolerance],
+                    [point.lng + tolerance, point.lat + tolerance]
                 );
 
                 let mut meta = serde_json::json!({});
@@ -3333,16 +3487,11 @@ impl RustyleafMap {
                 for i in 0..line.points.len().saturating_sub(1) {
                     let start = line.points[i];
                     let end = line.points[i + 1];
-                    
-                    let start_screen = self.lat_lng_to_screen(start[0], start[1]);
-                    let end_screen = self.lat_lng_to_screen(end[0], end[1]);
-                    
-                    // Create bounds that encompass both points with tolerance
-                    let tolerance = 3.0;
-                    let min_x = start_screen.0.min(end_screen.0) - tolerance;
-                    let max_x = start_screen.0.max(end_screen.0) + tolerance;
-                    let min_y = start_screen.1.min(end_screen.1) - tolerance;
-                    let max_y = start_screen.1.max(end_screen.1) + tolerance;
+
+                    let min_x = start[1].min(end[1]) - tolerance;
+                    let max_x = start[1].max(end[1]) + tolerance;
+                    let min_y = start[0].min(end[0]) - tolerance;
+                    let max_y = start[0].max(end[0]) + tolerance;
 
                     let bounds = AABB::from_corners([min_x, min_y], [max_x, max_y]);
 
@@ -3365,26 +3514,58 @@ impl RustyleafMap {
             }
         }
 
-        // Replace the old index with the new one
-        SPATIAL_INDEX.with(|index| {
-            *index.borrow_mut() = new_index;
-        });
+        // Index polygon features (centroid-based hits for now)
+        for (layer_idx, layer) in self.polygon_layers.iter().enumerate() {
+            for (poly_idx, poly) in layer.polygons.iter().enumerate() {
+                if let Some(ring) = poly.rings.first() {
+                    if ring.len() >= 3 {
+                        let (sum_lat, sum_lng) = ring.iter()
+                            .fold((0.0, 0.0), |(sy, sx), p| (sy + p[0], sx + p[1]));
+                        let n = ring.len() as f64;
+                        let (lat, lng) = (sum_lat / n, sum_lng / n);
+                        let bounds = AABB::from_corners(
+                            [lng - tolerance, lat - tolerance],
+                            [lng + tolerance, lat + tolerance]
+                        );
+                        let mut meta = serde_json::json!({});
+                        meta["layer_type"] = "polygon".into();
+                        meta["layer_index"] = layer_idx.into();
+                        meta["feature_index"] = poly_idx.into();
+                        meta["original_meta"] = poly.meta.clone();
+                        new_index.insert(SpatialFeature { id: feature_id, bounds, meta });
+                        feature_id += 1;
+                    }
+                }
+            }
+        }
+
+        self.spatial_index = new_index;
+        self.spatial_index_dirty = false;
     }
 
     fn hit_test(&self, x: f64, y: f64) -> Option<serde_json::Value> {
-        let search_radius = 3.0; // 3px tolerance
-        
-        let results: Vec<SpatialFeature> = SPATIAL_INDEX.with(|index| {
-            let search_bounds = AABB::from_corners(
-                [x - search_radius, y - search_radius],
-                [x + search_radius, y + search_radius]
-            );
-            index.borrow().locate_in_envelope(&search_bounds).cloned().collect()
-        });
+        let tolerance = 0.001; // degrees
+        let point_array = Array::new();
+        point_array.push(&JsValue::from_f64(x));
+        point_array.push(&JsValue::from_f64(y));
+        let latlng = self.unproject(&point_array.into());
+        if latlng.length() != 2 {
+            return None;
+        }
+        let lat = latlng.get(0).as_f64().unwrap_or(0.0);
+        let lng = latlng.get(1).as_f64().unwrap_or(0.0);
 
-        // Return the first matching feature (could be enhanced for priority/depth)
+        let search_bounds = AABB::from_corners(
+            [lng - tolerance, lat - tolerance],
+            [lng + tolerance, lat + tolerance]
+        );
+
+        let results: Vec<SpatialFeature> = self.spatial_index
+            .locate_in_envelope(&search_bounds)
+            .cloned()
+            .collect();
+
         for feature in results {
-            // Additional precise hit-testing could be done here
             return Some(feature.meta.clone());
         }
 
@@ -3537,9 +3718,9 @@ impl RustyleafMap {
             let context = &gl_state.context;
             let mut vertex_data: Vec<f32> = Vec::new();
             for &[lat, lng] in &self.geojson_layers[layer_index].cached_polygon_triangles {
-                let screen_pos = self.lat_lng_to_screen(lat, lng);
-                vertex_data.push(screen_pos.0 as f32);
-                vertex_data.push(screen_pos.1 as f32);
+                let (nx, ny) = self.lat_lng_to_normalized(lat, lng);
+                vertex_data.push(nx as f32);
+                vertex_data.push(ny as f32);
                 vertex_data.push(style.polygon_color[0]);
                 vertex_data.push(style.polygon_color[1]);
                 vertex_data.push(style.polygon_color[2]);
@@ -3553,12 +3734,44 @@ impl RustyleafMap {
                     let array = Float32Array::new_with_length(vertex_data.len() as u32);
                     for (i, v) in vertex_data.iter().enumerate() { array.set_index(i as u32, *v); }
                     context.buffer_data_with_array_buffer_view(WebGl2RenderingContext::ARRAY_BUFFER, &array, WebGl2RenderingContext::STATIC_DRAW);
-                    self.geojson_layers[layer_index].polygon_vertex_buffer = buffer;
-                    self.geojson_layers[layer_index].polygon_vertex_count = vertex_data.len() / 6;
+                    *self.geojson_layers[layer_index].polygon_vertex_buffer.borrow_mut() = buffer;
+                    self.geojson_layers[layer_index].polygon_vertex_count.set(vertex_data.len() / 6);
                 }
             } else {
-                self.geojson_layers[layer_index].polygon_vertex_buffer = None;
-                self.geojson_layers[layer_index].polygon_vertex_count = 0;
+                *self.geojson_layers[layer_index].polygon_vertex_buffer.borrow_mut() = None;
+                self.geojson_layers[layer_index].polygon_vertex_count.set(0);
+            }
+
+            // Upload line segments to GPU buffer for reuse across frames (normalized [0..1] world coords)
+            let mut line_vertex_data: Vec<f32> = Vec::new();
+            for line in &self.geojson_layers[layer_index].cached_lines {
+                for i in 0..line.points.len().saturating_sub(1) {
+                    let start = line.points[i];
+                    let end = line.points[i + 1];
+                    let (sx, sy) = self.lat_lng_to_normalized(start[0], start[1]);
+                    let (ex, ey) = self.lat_lng_to_normalized(end[0], end[1]);
+                    line_vertex_data.extend_from_slice(&[
+                        sx as f32, sy as f32,
+                        line.color[0], line.color[1], line.color[2], line.color[3],
+                        ex as f32, ey as f32,
+                        line.color[0], line.color[1], line.color[2], line.color[3],
+                    ]);
+                }
+            }
+
+            if !line_vertex_data.is_empty() {
+                let buffer = context.create_buffer();
+                if let Some(buf) = buffer.as_ref() {
+                    context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(buf));
+                    let array = Float32Array::new_with_length(line_vertex_data.len() as u32);
+                    for (i, v) in line_vertex_data.iter().enumerate() { array.set_index(i as u32, *v); }
+                    context.buffer_data_with_array_buffer_view(WebGl2RenderingContext::ARRAY_BUFFER, &array, WebGl2RenderingContext::STATIC_DRAW);
+                    *self.geojson_layers[layer_index].line_vertex_buffer.borrow_mut() = buffer;
+                    self.geojson_layers[layer_index].line_vertex_count.set(line_vertex_data.len() / 6);
+                }
+            } else {
+                *self.geojson_layers[layer_index].line_vertex_buffer.borrow_mut() = None;
+                self.geojson_layers[layer_index].line_vertex_count.set(0);
             }
         }
 

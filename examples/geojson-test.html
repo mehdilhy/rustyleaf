@@ -11,12 +11,12 @@
 </head>
 <body>
     <div class="info">
-        <h3>GeoJSONLayer Test - Paris Arrondissements</h3>
+        <h3>GeoJSONLayer Test - French Departmental Arrondissements</h3>
         <p><strong>Real Data:</strong></p>
         <ul>
             <li>File: arrondissements.geojson (5.5MB)</li>
             <li>Processing: Rust-based loading</li>
-            <li>Features: Paris administrative districts</li>
+            <li>Features: French department administrative districts</li>
         </ul>
         <p><strong>Status:</strong> <span id="status">Loading...</span></p>
     </div>
@@ -218,32 +218,22 @@
             .then(() => {
                 console.log('GeoJSON loaded and processed successfully');
                 document.getElementById('status').textContent = 'GeoJSON loaded successfully!';
+
+                const bounds = geojsonLayer.getBounds();
+                const featureCount = geojsonLayer.getFeatureCount();
+
+                if (bounds && featureCount > 0) {
+                    const [[swLat, swLng], [neLat, neLng]] = bounds;
+                    console.log('GeoJSON bounds:', bounds);
+                    document.getElementById('status').textContent =
+                        `Loaded ${featureCount} features from French departmental arrondissements`;
+                    console.log(`Loaded ${featureCount} features from French departmental arrondissements`);
+                }
             })
             .catch(error => {
                 console.error('Failed to load GeoJSON:', error);
                 document.getElementById('status').textContent = 'Error loading GeoJSON file';
             });
-
-        // Also load the sample data for comparison
-        // geojsonLayer.loadData(sampleGeoJSON);
-
-        // Calculate and display bounds after loading
-        setTimeout(() => {
-            const bounds = geojsonLayer.getBounds();
-            const featureCount = geojsonLayer.getFeatureCount();
-
-            if (bounds && featureCount > 0) {
-                const [[swLat, swLng], [neLat, neLng]] = bounds;
-                console.log('GeoJSON bounds:', bounds);
-                document.getElementById('status').textContent =
-                    `Loaded ${featureCount} features from Paris arrondissements`;
-                console.log('GeoJSONLayer test initialized successfully');
-                console.log(`Loaded ${featureCount} features from Paris arrondissements`);
-            } else {
-                document.getElementById('status').textContent = 'No features loaded yet...';
-                console.log('Waiting for GeoJSON data to load...');
-            }
-        }, 2000); // Wait 2 seconds for the async loading to complete
 
         // Test style changes
         setTimeout(() => {

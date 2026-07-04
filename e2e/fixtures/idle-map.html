@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Rustyleaf — Idle CPU Test</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #111; display: flex; justify-content: center; align-items: center; height: 100vh; }
+  #map { width: 800px; height: 600px; }
+  #status { position: absolute; top: 10px; left: 10px; color: #0f0; font: 12px monospace; }
+</style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="status"></div>
+  <script type="module">
+    import { Map, PointLayer } from "../../src/rustyleaf-api.js";
+
+    try {
+      const map = new Map(document.getElementById('map'), { center: [48.8566, 2.3522], zoom: 12 });
+      window.__map = map;
+
+      const layer = new PointLayer();
+      layer.add([
+        { lat: 48.8584, lng: 2.2945, size: 10, color: '#ff0000' },
+        { lat: 48.8606, lng: 2.3376, size: 8, color: '#ff0000' },
+      ]);
+      layer.addTo(map);
+
+      let frames = 0;
+      function checkReady() {
+        frames++;
+        if (frames >= 20) {
+          window.__rustyleafReady = true;
+          document.getElementById('status').textContent = 'READY';
+        } else {
+          requestAnimationFrame(checkReady);
+        }
+      }
+      requestAnimationFrame(checkReady);
+    } catch (err) {
+      document.getElementById('status').textContent = 'ERROR: ' + err.message;
+    }
+  </script>
+</body>
+</html>

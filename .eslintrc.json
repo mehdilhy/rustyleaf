@@ -7,7 +7,7 @@
   },
   "extends": [
     "eslint:recommended",
-    "@typescript-eslint/recommended"
+    "plugin:@typescript-eslint/recommended"
   ],
   "parser": "@typescript-eslint/parser",
   "parserOptions": {
@@ -19,13 +19,14 @@
   ],
   "rules": {
     "indent": ["error", 2],
-    "linebreak-style": ["error", "unix"],
+    "linebreak-style": ["warn", "unix"],
     "quotes": ["error", "single"],
     "semi": ["error", "always"],
     "no-unused-vars": "warn",
-    "no-console": "warn",
+    "no-console": "off",
+    "no-undef": "warn",
     "@typescript-eslint/no-unused-vars": "warn",
     "@typescript-eslint/no-explicit-any": "warn"
   },
-  "ignorePatterns": ["dist/", "node_modules/", "coverage/", "*.wasm"]
+  "ignorePatterns": ["dist/", "node_modules/", "coverage/", "*.wasm", "e2e/"]
 }

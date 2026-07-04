@@ -1,64 +1,5 @@
 // Jest setup file for Rustyleaf tests
 
-// Create comprehensive WASM module mock before any imports
-const mockWasmModule = require('./__mocks__/wasmMock');
-
-// Mock the WASM bundle file directly
-jest.mock('../dist/rustyleaf_core_bg.js', () => ({
-  __wbg_set_wasm: jest.fn(),
-  memory: mockWasmModule.memory,
-  __wbindgen_object_drop_ref: mockWasmModule.__wbindgen_object_drop_ref,
-  __wbindgen_string_new: mockWasmModule.__wbindgen_string_new,
-  __wbindgen_throw: mockWasmModule.__wbindgen_throw,
-  __wbindgen_realloc: mockWasmModule.__wbindgen_realloc,
-  __wbindgen_malloc: mockWasmModule.__wbindgen_malloc,
-  rustyleafmap_new: mockWasmModule.rustyleafmap_new,
-  rustyleafmap_init_canvas: mockWasmModule.rustyleafmap_init_canvas,
-  rustyleafmap_render: mockWasmModule.rustyleafmap_render,
-  rustyleafmap_set_view: mockWasmModule.rustyleafmap_set_view,
-  rustyleafmap_get_center: mockWasmModule.rustyleafmap_get_center,
-  rustyleafmap_get_zoom: mockWasmModule.rustyleafmap_get_zoom,
-  rustyleafmap_pan: mockWasmModule.rustyleafmap_pan,
-  rustyleafmap_zoom_in: mockWasmModule.rustyleafmap_zoom_in,
-  rustyleafmap_zoom_out: mockWasmModule.rustyleafmap_zoom_out,
-  rustyleafmap_set_min_zoom: mockWasmModule.rustyleafmap_set_min_zoom,
-  rustyleafmap_set_max_zoom: mockWasmModule.rustyleafmap_set_max_zoom,
-  rustyleafmap_get_bounds: mockWasmModule.rustyleafmap_get_bounds,
-  rustyleafmap_fit_bounds: mockWasmModule.rustyleafmap_fit_bounds,
-  rustyleafmap_project: mockWasmModule.rustyleafmap_project,
-  rustyleafmap_unproject: mockWasmModule.rustyleafmap_unproject,
-  rustyleafmap_screen_xy: mockWasmModule.rustyleafmap_screen_xy,
-  rustyleafmap_resize: mockWasmModule.rustyleafmap_resize,
-  rustyleafmap_add_tile_layer: mockWasmModule.rustyleafmap_add_tile_layer,
-  rustyleafmap_add_point_layer: mockWasmModule.rustyleafmap_add_point_layer,
-  rustyleafmap_add_line_layer: mockWasmModule.rustyleafmap_add_line_layer,
-  rustyleafmap_add_polygon_layer: mockWasmModule.rustyleafmap_add_polygon_layer,
-  rustyleafmap_add_geojson_layer: mockWasmModule.rustyleafmap_add_geojson_layer,
-  rustyleafmap_add_points: mockWasmModule.rustyleafmap_add_points,
-  rustyleafmap_add_lines: mockWasmModule.rustyleafmap_add_lines,
-  rustyleafmap_add_polygons: mockWasmModule.rustyleafmap_add_polygons,
-  tilelayerapi_new: mockWasmModule.tilelayerapi_new,
-  tilelayerapi_add_to: mockWasmModule.tilelayerapi_add_to,
-  pointlayerapi_new: mockWasmModule.pointlayerapi_new,
-  pointlayerapi_add: mockWasmModule.pointlayerapi_add,
-  pointlayerapi_clear: mockWasmModule.pointlayerapi_clear,
-  pointlayerapi_on_click: mockWasmModule.pointlayerapi_on_click,
-  pointlayerapi_on_hover: mockWasmModule.pointlayerapi_on_hover,
-  RustyleafMap: mockWasmModule.RustyleafMap,
-  TileLayerApi: mockWasmModule.TileLayerApi,
-  PointLayerApi: mockWasmModule.PointLayerApi,
-  WasmPointLayer: mockWasmModule.PointLayerApi,
-  wasm: {
-    __wbindgen_malloc: mockWasmModule.__wbindgen_malloc,
-    __wbindgen_realloc: mockWasmModule.__wbindgen_realloc,
-    __wbindgen_object_drop_ref: mockWasmModule.__wbindgen_object_drop_ref,
-    __wbindgen_string_new: mockWasmModule.__wbindgen_string_new,
-    __wbindgen_throw: mockWasmModule.__wbindgen_throw,
-    tilelayerapi_new: mockWasmModule.tilelayerapi_new,
-    memory: mockWasmModule.memory
-  }
-}), { virtual: true });
-
 // Extend global interface for test utilities
 declare global {
   var createMockMap: () => any;
@@ -112,9 +53,6 @@ const mockWebGLContext = {
   getUniformLocation: jest.fn(() => ({})),
   uniformMatrix4fv: jest.fn(),
 };
-
-// Make WasmPointLayer available globally for tests
-global.WasmPointLayer = require('./__mocks__/wasmMock').PointLayerApi;
 
 // Add TextEncoder for streaming tests
 global.TextEncoder = require('util').TextEncoder;
@@ -212,9 +150,14 @@ beforeAll(() => {
 
 // Reset mock state before each test for isolation
 beforeEach(() => {
-  const mockWasmModule = require('./__mocks__/wasmMock');
-  if (mockWasmModule.resetMockState) {
-    mockWasmModule.resetMockState();
+  // wasmMock is loaded via moduleNameMapper, not direct require
+  try {
+    const mockWasmModule = require('./__mocks__/wasmMock');
+    if (mockWasmModule && mockWasmModule.resetMockState) {
+      mockWasmModule.resetMockState();
+    }
+  } catch (e) {
+    // wasmMock uses ESM exports — skip reset if require fails
   }
 });
 

@@ -613,7 +613,7 @@ describe('GeoJSONLayer', () => {
       
       expect(() => {
         geojsonLayer.addTo(mockMap as any);
-      }).toThrow("Cannot read properties of undefined (reading 'add_geojson_layer')");
+      }).toThrow('Cannot read properties of undefined (reading \'add_geojson_layer\')');
     });
   });
 
@@ -801,7 +801,7 @@ describe('GeoJSONLayer', () => {
           type: 'MultiPolygon',
           coordinates: [[
             [[-74.0060, 40.7128], [-73.9851, 40.7589],
-             [-74.0445, 40.6892], [-74.0060, 40.7128]]
+              [-74.0445, 40.6892], [-74.0060, 40.7128]]
           ]]
         }
       ];

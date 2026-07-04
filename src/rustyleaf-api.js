@@ -14,14 +14,14 @@ async function __ensureRustyleafWasmReady() {
       try {
         if (WebAssembly.instantiateStreaming) {
           const resp = await fetch(wasmUrl);
-          const { instance } = await WebAssembly.instantiateStreaming(resp, { "./rustyleaf_core_bg.js": __rustyleaf_wasm_bg });
+          const { instance } = await WebAssembly.instantiateStreaming(resp, { './rustyleaf_core_bg.js': __rustyleaf_wasm_bg });
           __rustyleaf_wasm_bg.__wbg_set_wasm(instance.exports);
           if (instance.exports && typeof instance.exports.__wbindgen_start === 'function') {
             instance.exports.__wbindgen_start();
           }
         } else {
           const bytes = await fetch(wasmUrl).then(r => r.arrayBuffer());
-          const { instance } = await WebAssembly.instantiate(bytes, { "./rustyleaf_core_bg.js": __rustyleaf_wasm_bg });
+          const { instance } = await WebAssembly.instantiate(bytes, { './rustyleaf_core_bg.js': __rustyleaf_wasm_bg });
           __rustyleaf_wasm_bg.__wbg_set_wasm(instance.exports);
           if (instance.exports && typeof instance.exports.__wbindgen_start === 'function') {
             instance.exports.__wbindgen_start();
@@ -1348,20 +1348,20 @@ class GeoJSONLayer {
     
     const extractCoordinates = (geometry) => {
       switch (geometry.type) {
-        case 'Point':
-          return [geometry.coordinates];
-        case 'MultiPoint':
-          return geometry.coordinates;
-        case 'LineString':
-          return geometry.coordinates;
-        case 'MultiLineString':
-          return geometry.coordinates.flat();
-        case 'Polygon':
-          return geometry.coordinates.flat();
-        case 'MultiPolygon':
-          return geometry.coordinates.flat().flat();
-        default:
-          return [];
+      case 'Point':
+        return [geometry.coordinates];
+      case 'MultiPoint':
+        return geometry.coordinates;
+      case 'LineString':
+        return geometry.coordinates;
+      case 'MultiLineString':
+        return geometry.coordinates.flat();
+      case 'Polygon':
+        return geometry.coordinates.flat();
+      case 'MultiPolygon':
+        return geometry.coordinates.flat().flat();
+      default:
+        return [];
       }
     };
 

@@ -40,3 +40,9 @@ examples/**/main.js
 
 #claude
 .claude/
+
+# E2E test artifacts (baselines ARE committed)
+e2e/artifacts/
+e2e/report/
+e2e/results.json
+e2e/node_modules/

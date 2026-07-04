@@ -73,11 +73,11 @@ describe('PointLayer', () => {
       
       expect(() => {
         pointLayer.add(null as any);
-      }).toThrow("Cannot read properties of null (reading 'map')");
+      }).toThrow('Cannot read properties of null (reading \'map\')');
       
       expect(() => {
         pointLayer.add(undefined as any);
-      }).toThrow("Cannot read properties of undefined (reading 'map')");
+      }).toThrow('Cannot read properties of undefined (reading \'map\')');
     });
   });
 
@@ -202,7 +202,7 @@ describe('PointLayer', () => {
       
       expect(() => {
         pointLayer.addTo(mockMap as any);
-      }).toThrow("Cannot read properties of undefined (reading 'add_point_layer')");
+      }).toThrow('Cannot read properties of undefined (reading \'add_point_layer\')');
     });
   });
 

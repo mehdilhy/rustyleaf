@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Rustyleaf — Multi-Instance Isolation</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #111; display: flex; height: 100vh; }
+  .half { width: 50%; height: 100vh; }
+  #mapA { border-right: 2px solid #333; }
+  #status { position: absolute; top: 10px; left: 10px; color: #0f0; font: 12px monospace; }
+</style>
+</head>
+<body>
+  <div id="mapA" class="half"></div>
+  <div id="mapB" class="half"></div>
+  <div id="status"></div>
+  <script type="module">
+    import { Map, PointLayer, GeoJSONLayer } from "../../src/rustyleaf-api.js";
+
+    window.__results = {};
+
+    try {
+      const mapA = new Map(document.getElementById('mapA'), { center: [48.8566, 2.3522], zoom: 12 });
+      const mapB = new Map(document.getElementById('mapB'), { center: [20.0, 0.0], zoom: 2 });
+
+      window.__mapA = mapA;
+      window.__mapB = mapB;
+
+      // Add data to map A only
+      const layerA = new PointLayer();
+      layerA.add([
+        { lat: 48.8584, lng: 2.2945, size: 10, color: '#ff0000' },
+        { lat: 48.8606, lng: 2.3376, size: 8, color: '#ff0000' },
+      ]);
+      layerA.addTo(mapA);
+
+      const geojsonA = new GeoJSONLayer(null, { pointColor: '#00ff00', pointSize: 6 });
+      geojsonA.addTo(mapA);
+      geojsonA.loadData({
+        type: "Feature",
+        geometry: { type: "Point", coordinates: [2.3499, 48.8530] },
+        properties: { name: "Notre-Dame" }
+      });
+
+      // Map B intentionally left empty — test that map A's data doesn't leak
+
+      let frames = 0;
+      function checkReady() {
+        frames++;
+        if (frames >= 20) {
+          window.__rustyleafReady = true;
+          document.getElementById('status').textContent = 'READY';
+        } else {
+          requestAnimationFrame(checkReady);
+        }
+      }
+      requestAnimationFrame(checkReady);
+    } catch (err) {
+      document.getElementById('status').textContent = 'ERROR: ' + err.message;
+    }
+  </script>
+</body>
+</html>

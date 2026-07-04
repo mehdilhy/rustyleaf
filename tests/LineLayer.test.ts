@@ -251,7 +251,7 @@ describe('LineLayer', () => {
       
       expect(() => {
         lineLayer.addTo(mockMap as any);
-      }).toThrow("Cannot read properties of undefined (reading 'add_line_layer')");
+      }).toThrow('Cannot read properties of undefined (reading \'add_line_layer\')');
     });
   });
 
