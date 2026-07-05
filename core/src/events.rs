@@ -3,16 +3,16 @@ use js_sys::{Array, Function};
 use crate::error::RustyleafError;
 
 pub struct EventSystem {
-    pub move_callbacks: Vec<Box<Function>>,
-    pub zoom_callbacks: Vec<Box<Function>>,
-    pub click_callbacks: Vec<Box<Function>>,
-    pub hover_callbacks: Vec<Box<Function>>,
-    pub mousedown_callbacks: Vec<Box<Function>>,
-    pub mouseup_callbacks: Vec<Box<Function>>,
-    pub contextmenu_callbacks: Vec<Box<Function>>,
-    pub keydown_callbacks: Vec<Box<Function>>,
-    pub keyup_callbacks: Vec<Box<Function>>,
-    pub dragend_callbacks: Vec<Box<Function>>,
+    pub move_callbacks: Vec<Function>,
+    pub zoom_callbacks: Vec<Function>,
+    pub click_callbacks: Vec<Function>,
+    pub hover_callbacks: Vec<Function>,
+    pub mousedown_callbacks: Vec<Function>,
+    pub mouseup_callbacks: Vec<Function>,
+    pub contextmenu_callbacks: Vec<Function>,
+    pub keydown_callbacks: Vec<Function>,
+    pub keyup_callbacks: Vec<Function>,
+    pub dragend_callbacks: Vec<Function>,
 }
 
 impl EventSystem {
@@ -32,141 +32,88 @@ impl EventSystem {
     }
 
     pub fn on_move(&mut self, callback: &Function) {
-        self.move_callbacks.push(Box::new(callback.clone()));
+        self.move_callbacks.push(callback.clone());
     }
 
     pub fn on_zoom(&mut self, callback: &Function) {
-        self.zoom_callbacks.push(Box::new(callback.clone()));
+        self.zoom_callbacks.push(callback.clone());
     }
 
     pub fn on_click(&mut self, callback: &Function) {
-        self.click_callbacks.push(Box::new(callback.clone()));
+        self.click_callbacks.push(callback.clone());
     }
 
     pub fn on_hover(&mut self, callback: &Function) {
-        self.hover_callbacks.push(Box::new(callback.clone()));
+        self.hover_callbacks.push(callback.clone());
     }
 
     pub fn on_mousedown(&mut self, callback: &Function) {
-        self.mousedown_callbacks.push(Box::new(callback.clone()));
+        self.mousedown_callbacks.push(callback.clone());
     }
 
     pub fn on_mouseup(&mut self, callback: &Function) {
-        self.mouseup_callbacks.push(Box::new(callback.clone()));
+        self.mouseup_callbacks.push(callback.clone());
     }
 
     pub fn on_contextmenu(&mut self, callback: &Function) {
-        self.contextmenu_callbacks.push(Box::new(callback.clone()));
+        self.contextmenu_callbacks.push(callback.clone());
     }
 
     pub fn on_keydown(&mut self, callback: &Function) {
-        self.keydown_callbacks.push(Box::new(callback.clone()));
+        self.keydown_callbacks.push(callback.clone());
     }
 
     pub fn on_keyup(&mut self, callback: &Function) {
-        self.keyup_callbacks.push(Box::new(callback.clone()));
+        self.keyup_callbacks.push(callback.clone());
     }
 
     pub fn on_dragend(&mut self, callback: &Function) {
-        self.dragend_callbacks.push(Box::new(callback.clone()));
+        self.dragend_callbacks.push(callback.clone());
     }
 
     pub fn off_move(&mut self, callback: &Function) {
-        self.move_callbacks.retain(|cb| cb.as_ref() != callback);
+        self.move_callbacks.retain(|cb| cb != callback);
     }
 
     pub fn off_zoom(&mut self, callback: &Function) {
-        self.zoom_callbacks.retain(|cb| cb.as_ref() != callback);
+        self.zoom_callbacks.retain(|cb| cb != callback);
     }
 
     pub fn off_click(&mut self, callback: &Function) {
-        self.click_callbacks.retain(|cb| cb.as_ref() != callback);
+        self.click_callbacks.retain(|cb| cb != callback);
     }
 
     pub fn off_hover(&mut self, callback: &Function) {
-        self.hover_callbacks.retain(|cb| cb.as_ref() != callback);
+        self.hover_callbacks.retain(|cb| cb != callback);
     }
 
     pub fn off_mousedown(&mut self, callback: &Function) {
-        self.mousedown_callbacks.retain(|cb| cb.as_ref() != callback);
+        self.mousedown_callbacks.retain(|cb| cb != callback);
     }
 
     pub fn off_mouseup(&mut self, callback: &Function) {
-        self.mouseup_callbacks.retain(|cb| cb.as_ref() != callback);
+        self.mouseup_callbacks.retain(|cb| cb != callback);
     }
 
     pub fn off_contextmenu(&mut self, callback: &Function) {
-        self.contextmenu_callbacks.retain(|cb| cb.as_ref() != callback);
+        self.contextmenu_callbacks.retain(|cb| cb != callback);
     }
 
     pub fn off_keydown(&mut self, callback: &Function) {
-        self.keydown_callbacks.retain(|cb| cb.as_ref() != callback);
+        self.keydown_callbacks.retain(|cb| cb != callback);
     }
 
     pub fn off_keyup(&mut self, callback: &Function) {
-        self.keyup_callbacks.retain(|cb| cb.as_ref() != callback);
+        self.keyup_callbacks.retain(|cb| cb != callback);
     }
 
     pub fn off_dragend(&mut self, callback: &Function) {
-        self.dragend_callbacks.retain(|cb| cb.as_ref() != callback);
+        self.dragend_callbacks.retain(|cb| cb != callback);
     }
 }
 
-pub fn trigger_move_event(callbacks: &[Box<Function>], event_obj: &JsValue) {
-    for callback in callbacks {
-        let _ = callback.call1(&JsValue::null(), event_obj);
-    }
-}
-
-pub fn trigger_zoom_event(callbacks: &[Box<Function>], event_obj: &JsValue) {
-    for callback in callbacks {
-        let _ = callback.call1(&JsValue::null(), event_obj);
-    }
-}
-
-pub fn trigger_click_event(callbacks: &[Box<Function>], event_obj: &JsValue) {
-    for callback in callbacks {
-        let _ = callback.call1(&JsValue::null(), event_obj);
-    }
-}
-
-pub fn trigger_hover_event(callbacks: &[Box<Function>], event_obj: &JsValue) {
-    for callback in callbacks {
-        let _ = callback.call1(&JsValue::null(), event_obj);
-    }
-}
-
-pub fn trigger_mousedown_event(callbacks: &[Box<Function>], event_obj: &JsValue) {
-    for callback in callbacks {
-        let _ = callback.call1(&JsValue::null(), event_obj);
-    }
-}
-
-pub fn trigger_mouseup_event(callbacks: &[Box<Function>], event_obj: &JsValue) {
-    for callback in callbacks {
-        let _ = callback.call1(&JsValue::null(), event_obj);
-    }
-}
-
-pub fn trigger_contextmenu_event(callbacks: &[Box<Function>], event_obj: &JsValue) {
-    for callback in callbacks {
-        let _ = callback.call1(&JsValue::null(), event_obj);
-    }
-}
-
-pub fn trigger_keydown_event(callbacks: &[Box<Function>], event_obj: &JsValue) {
-    for callback in callbacks {
-        let _ = callback.call1(&JsValue::null(), event_obj);
-    }
-}
-
-pub fn trigger_keyup_event(callbacks: &[Box<Function>], event_obj: &JsValue) {
-    for callback in callbacks {
-        let _ = callback.call1(&JsValue::null(), event_obj);
-    }
-}
-
-pub fn trigger_dragend_event(callbacks: &[Box<Function>], event_obj: &JsValue) {
+/// Invoke every registered callback with the given event object.
+pub fn trigger_event(callbacks: &[Function], event_obj: &JsValue) {
     for callback in callbacks {
         let _ = callback.call1(&JsValue::null(), event_obj);
     }
@@ -211,22 +158,6 @@ pub fn create_click_event(lat: f64, lng: f64, container_point: &Array) -> Result
 
     js_sys::Reflect::set(&obj, &JsValue::from_str("layerPoint"), container_point)
         .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set click layerPoint: {:?}", e)))?;
-
-    Ok(obj.into())
-}
-
-pub fn create_hover_event(lat: f64, lng: f64) -> Result<JsValue, JsValue> {
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(&obj, &JsValue::from_str("type"), &JsValue::from_str("hover"))
-        .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set hover type: {:?}", e)))?;
-    js_sys::Reflect::set(&obj, &JsValue::from_str("target"), &JsValue::null())
-        .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set hover target: {:?}", e)))?;
-
-    let latlng = Array::new();
-    latlng.push(&JsValue::from_f64(lat));
-    latlng.push(&JsValue::from_f64(lng));
-    js_sys::Reflect::set(&obj, &JsValue::from_str("latlng"), &latlng)
-        .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set hover latlng: {:?}", e)))?;
 
     Ok(obj.into())
 }

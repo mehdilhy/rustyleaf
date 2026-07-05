@@ -19,6 +19,12 @@ pub fn render_polygons(
     context.use_program(Some(gl_state.programs.polygon_program.inner()));
     context.bind_vertex_array(Some(gl_state.polygon_vao.inner()));
 
+    let projection_matrix = super::screen_projection_matrix(viewport);
+    let u_matrix = context.get_uniform_location(gl_state.programs.polygon_program.inner(), "u_matrix");
+    if let Some(loc) = u_matrix.as_ref() {
+        context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
+    }
+
     for layer in polygon_layers {
         if !layer.visible {
             continue;
@@ -53,10 +59,8 @@ pub fn render_polygons(
         }
 
         if !vertex_data.is_empty() {
-            let vertices = Float32Array::new_with_length(vertex_data.len() as u32);
-            for (i, &val) in vertex_data.iter().enumerate() {
-                vertices.set_index(i as u32, val);
-            }
+            // Bulk copy — element-wise set_index is prohibitively slow for large layers
+            let vertices = Float32Array::from(&vertex_data[..]);
 
             context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(gl_state.polygon_buffer.inner()));
             context.buffer_data_with_array_buffer_view(

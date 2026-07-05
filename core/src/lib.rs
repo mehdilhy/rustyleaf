@@ -1,5 +1,4 @@
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use web_sys::{
     window, HtmlCanvasElement,
@@ -91,18 +90,6 @@ impl OwnedProgram {
 }
 
 
-// Animation frame helpers
-fn request_animation_frame(closure: &js_sys::Function) -> Result<i32, JsValue> {
-    let window = window().ok_or_else(|| RustyleafError::DomError("Window not available".into()))?;
-    window.request_animation_frame(closure)
-        .map_err(|_| RustyleafError::ResourceError("Failed to request animation frame".into()).into())
-}
-
-fn cancel_animation_frame(handle: i32) -> Result<(), JsValue> {
-    let window = window().ok_or_else(|| RustyleafError::DomError("Window not available".into()))?;
-    let _ = window.cancel_animation_frame(handle);
-    Ok(())
-}
 use std::cell::{RefCell, Cell};
 use std::rc::Rc;
 use js_sys::{Array, Float32Array};
@@ -126,7 +113,7 @@ use crate::tiles::{TileCoord, TileLayer, TileLoader};
 use crate::spatial::{SpatialFeature, rebuild_spatial_index, hit_test as spatial_hit_test};
 use crate::input::MouseState;
 use crate::input::momentum::{apply_drag, apply_momentum, start_momentum_animation};
-use crate::events::{EventSystem, trigger_move_event, trigger_zoom_event, trigger_click_event, trigger_hover_event, trigger_mousedown_event, trigger_mouseup_event, trigger_contextmenu_event, trigger_keydown_event, trigger_keyup_event, trigger_dragend_event, create_map_event, create_click_event, create_hover_event};
+use crate::events::{EventSystem, trigger_event, create_map_event, create_click_event};
 use crate::layers::point::{PointFeature, PointLayer};
 use crate::layers::line::{LineFeature, LineLayer};
 use crate::layers::polygon::{PolygonFeature, PolygonLayer};
@@ -154,10 +141,9 @@ pub(crate) struct WebGlState {
     pub(crate) polygon_u_world_scale: Option<WebGlUniformLocation>,
     pub(crate) line_u_origin: Option<WebGlUniformLocation>,
     pub(crate) line_u_world_scale: Option<WebGlUniformLocation>,
+    pub(crate) point_u_origin: Option<WebGlUniformLocation>,
+    pub(crate) point_u_world_scale: Option<WebGlUniformLocation>,
 }
-
-// Event callback types
-type EventCallback = Box<dyn FnMut(JsValue)>;
 
 // MouseState moved to crate::input
 
@@ -244,7 +230,7 @@ impl WebGlSupportInfo {
                 // Check for required extensions
                 let required_extensions = ["OES_texture_float"];
                 for ext in required_extensions.iter() {
-                    if gl2.get_extension(*ext).is_ok() {
+                    if gl2.get_extension(ext).is_ok() {
                         info.extensions.push(ext.to_string());
                     }
                 }
@@ -292,9 +278,6 @@ pub struct RustyleafMap {
     drag_accumulated_x: f64,
     drag_accumulated_y: f64,
     has_momentum: bool,
-    animation_frame: Option<i32>,
-    // Performance monitoring
-    frame_count: u32,
     last_frame_time: f64,
     events: EventSystem,
 }
@@ -331,8 +314,6 @@ impl RustyleafMap {
             drag_accumulated_x: 0.0,
             drag_accumulated_y: 0.0,
             has_momentum: false,
-            animation_frame: None,
-            frame_count: 0,
             last_frame_time: 0.0,
             events: EventSystem::new(),
         }
@@ -346,14 +327,6 @@ impl RustyleafMap {
             center_lng: self.center_lng,
             zoom: self.zoom,
             tile_size: self.tile_size,
-        }
-    }
-
-    // Tile cache management — delegates to TileLoader
-    fn cleanup_old_tiles(&mut self) {
-        if let Some(ref gl_state) = self.gl_state {
-            self.tile_loader
-                .cleanup_old_tiles(&gl_state.context, &self.viewport());
         }
     }
 
@@ -395,23 +368,6 @@ impl RustyleafMap {
         // With the new drag system, this is mostly handled by the render loop
     }
 
-    fn apply_drag(&mut self, delta_x: f64, delta_y: f64) {
-        apply_drag(
-            delta_x, delta_y,
-            &mut self.drag_velocity,
-            &mut self.drag_accumulated_x, &mut self.drag_accumulated_y,
-            &mut self.last_drag_time,
-            0.7,
-            2000.0,
-        );
-    }
-    
-    fn meters_per_pixel(&self, zoom: u32) -> f64 {
-        let circumference = 40075016.686; // Earth's circumference in meters
-        let height = 1u32 << zoom;
-        circumference / (height as f64 * self.tile_size as f64)
-    }
-    
     fn apply_momentum(&mut self) {
         apply_momentum(
             &mut self.center_lat, &mut self.center_lng,
@@ -430,17 +386,20 @@ impl RustyleafMap {
     }
 
     fn cleanup_gl_resources(&mut self) {
-        // Delete tile textures (still raw, not RAII-wrapped)
-        let mut textures = self.tile_loader.textures.borrow_mut();
-        if let Some(ref gl_state) = self.gl_state {
-            for (_key, texture) in textures.drain() {
-                gl_state.context.delete_texture(Some(&texture));
-            }
-        }
+        // Tile textures are OwnedTexture — clearing the map triggers Drop → delete_texture
+        self.tile_loader.textures.borrow_mut().clear();
+        self.tile_loader.tiles.clear();
+        self.tile_loader.requested.clear();
+        self.tile_loader.closures.clear();
         // Clear GeoJSON layer GPU buffers (triggers OwnedBuffer::Drop → delete_buffer)
         for layer in &self.geojson_layers {
             layer.polygon_vertex_buffer.borrow_mut().take();
             layer.line_vertex_buffer.borrow_mut().take();
+        }
+        // Drop per-layer point buffers and mark dirty so they re-upload on restore
+        for layer in &self.point_layers {
+            layer.vertex_buffer.borrow_mut().take();
+            layer.gpu_dirty.set(true);
         }
         // Dropping gl_state triggers OwnedVAO, OwnedBuffer, OwnedProgram Drop impls
         self.gl_state = None;
@@ -452,7 +411,22 @@ impl RustyleafMap {
         self.cleanup_gl_resources();
     }
 
-  
+    #[wasm_bindgen]
+    pub fn handle_context_lost(&mut self) {
+        self.cleanup_gl_resources();
+    }
+
+    #[wasm_bindgen]
+    pub fn handle_context_restored(&mut self) {
+        if let Some(ref _gl_state) = self.gl_state {
+            for layer_idx in 0..self.geojson_layers.len() {
+                let _ = self.rebuild_geojson_cache(layer_idx);
+            }
+            self.spatial_index_dirty = true;
+        }
+    }
+
+   
     pub fn init_canvas(&mut self, canvas_id: &str) -> Result<(), JsValue> {
         // Check WebGL compatibility first
         let webgl_info = WebGlSupportInfo::check_webgl_support()?;
@@ -512,6 +486,9 @@ impl RustyleafMap {
         let line_u_origin = context.get_uniform_location(programs.line_program.inner(), "u_origin");
         let line_u_world_scale = context.get_uniform_location(programs.line_program.inner(), "u_world_scale");
 
+        let point_u_origin = context.get_uniform_location(programs.point_program.inner(), "u_origin");
+        let point_u_world_scale = context.get_uniform_location(programs.point_program.inner(), "u_world_scale");
+
         // Create VAOs and buffers with error handling
         let tile_vao = context.create_vertex_array().ok_or_else(|| RustyleafError::VaoCreation("Failed to create tile VAO".into()))?;
         let point_vao = context.create_vertex_array().ok_or_else(|| RustyleafError::VaoCreation("Failed to create point VAO".into()))?;
@@ -559,6 +536,8 @@ impl RustyleafMap {
             polygon_u_world_scale,
             line_u_origin,
             line_u_world_scale,
+            point_u_origin,
+            point_u_world_scale,
         });
 
         Ok(())
@@ -669,39 +648,6 @@ impl RustyleafMap {
         } else {
             Ok(())
         }
-    }
-
-    fn create_projection_matrix(&self) -> [f32; 16] {
-        // Orthographic projection that converts pixel coordinates into NDC
-        // Matches the tile program's matrix so all layers share the same space
-        let w = self.width as f32;
-        let h = self.height as f32;
-        [
-            2.0 / w, 0.0,      0.0, 0.0,
-            0.0,     -2.0 / h, 0.0, 0.0,
-            0.0,      0.0,     -1.0, 0.0,
-            -1.0,     1.0,      0.0, 1.0,
-        ]
-    }
-
-    fn create_pixel_projection_matrix(&self) -> [f32; 16] {
-        // Projection matrix for world-pixel coordinates (Web Mercator pixel space)
-        // Subtracts the viewport origin so the vertex shader receives the same
-        // coords regardless of pan position
-        let w = self.width as f32;
-        let h = self.height as f32;
-        let zoom = self.zoom.round() as u32;
-        let center_pixel = self.viewport().lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
-        let origin_x = center_pixel.0 - (self.width as f64 / 2.0);
-        let origin_y = center_pixel.1 - (self.height as f64 / 2.0);
-        [
-            2.0 / w,       0.0,           0.0, 0.0,
-            0.0,           -2.0 / h,      0.0, 0.0,
-            0.0,            0.0,          -1.0, 0.0,
-            -(2.0 * origin_x as f32 / w + 1.0),
-            2.0 * origin_y as f32 / h + 1.0,
-            0.0, 1.0,
-        ]
     }
 
     #[wasm_bindgen]
@@ -837,13 +783,13 @@ impl RustyleafMap {
     // Event trigger methods
     fn trigger_move_event(&self) {
         if let Ok(event_obj) = create_map_event("move", &self.get_center(), self.zoom, &self.get_bounds()) {
-            trigger_move_event(&self.events.move_callbacks, &event_obj);
+            trigger_event(&self.events.move_callbacks, &event_obj);
         }
     }
 
     fn trigger_zoom_event(&self) {
         if let Ok(event_obj) = create_map_event("zoom", &self.get_center(), self.zoom, &self.get_bounds()) {
-            trigger_zoom_event(&self.events.zoom_callbacks, &event_obj);
+            trigger_event(&self.events.zoom_callbacks, &event_obj);
         }
     }
 
@@ -853,13 +799,7 @@ impl RustyleafMap {
         latlng.push(&JsValue::from_f64(lng));
         let point = self.project(&JsValue::from(latlng));
         if let Ok(event_obj) = create_click_event(lat, lng, &point) {
-            trigger_click_event(&self.events.click_callbacks, &event_obj);
-        }
-    }
-
-    fn trigger_hover_event(&self, lat: f64, lng: f64, _original_event: Option<&web_sys::MouseEvent>) {
-        if let Ok(event_obj) = create_hover_event(lat, lng) {
-            trigger_hover_event(&self.events.hover_callbacks, &event_obj);
+            trigger_event(&self.events.click_callbacks, &event_obj);
         }
     }
 
@@ -869,7 +809,7 @@ impl RustyleafMap {
         latlng.push(&JsValue::from_f64(lng));
         let point = self.project(&JsValue::from(latlng));
         if let Ok(event_obj) = create_click_event(lat, lng, &point) {
-            trigger_mousedown_event(&self.events.mousedown_callbacks, &event_obj);
+            trigger_event(&self.events.mousedown_callbacks, &event_obj);
         }
     }
 
@@ -879,7 +819,7 @@ impl RustyleafMap {
         latlng.push(&JsValue::from_f64(lng));
         let point = self.project(&JsValue::from(latlng));
         if let Ok(event_obj) = create_click_event(lat, lng, &point) {
-            trigger_mouseup_event(&self.events.mouseup_callbacks, &event_obj);
+            trigger_event(&self.events.mouseup_callbacks, &event_obj);
         }
     }
 
@@ -889,13 +829,13 @@ impl RustyleafMap {
         latlng.push(&JsValue::from_f64(lng));
         let point = self.project(&JsValue::from(latlng));
         if let Ok(event_obj) = create_click_event(lat, lng, &point) {
-            trigger_contextmenu_event(&self.events.contextmenu_callbacks, &event_obj);
+            trigger_event(&self.events.contextmenu_callbacks, &event_obj);
         }
     }
 
     fn trigger_dragend_event(&self) {
         if let Ok(event_obj) = create_map_event("dragend", &self.get_center(), self.zoom, &self.get_bounds()) {
-            trigger_dragend_event(&self.events.dragend_callbacks, &event_obj);
+            trigger_event(&self.events.dragend_callbacks, &event_obj);
         }
     }
 
@@ -916,7 +856,7 @@ impl RustyleafMap {
 
         // Clamp coordinates to valid Web Mercator ranges
         // Latitude: -85.05112878 to 85.05112878 degrees (to avoid singularity at poles)
-        let clamped_lat = new_lat.max(-85.05112878).min(85.05112878);
+        let clamped_lat = new_lat.clamp(-85.05112878, 85.05112878);
         // Longitude: -180 to 180 degrees (wrap around)
         let mut clamped_lng = new_lng;
         while clamped_lng > 180.0 {
@@ -1009,22 +949,22 @@ impl RustyleafMap {
         }
         
         // Validate all elements are numbers and within valid coordinate ranges
-        let sw_lat = bounds_array.get(0).as_f64().ok_or_else(|| RustyleafError::InvalidCoordinate { lat: 0.0, lng: 0.0 })?;
-        let sw_lng = bounds_array.get(1).as_f64().ok_or_else(|| RustyleafError::InvalidCoordinate { lat: 0.0, lng: 0.0 })?;
-        let ne_lat = bounds_array.get(2).as_f64().ok_or_else(|| RustyleafError::InvalidCoordinate { lat: 0.0, lng: 0.0 })?;
-        let ne_lng = bounds_array.get(3).as_f64().ok_or_else(|| RustyleafError::InvalidCoordinate { lat: 0.0, lng: 0.0 })?;
+        let sw_lat = bounds_array.get(0).as_f64().ok_or(RustyleafError::InvalidCoordinate { lat: 0.0, lng: 0.0 })?;
+        let sw_lng = bounds_array.get(1).as_f64().ok_or(RustyleafError::InvalidCoordinate { lat: 0.0, lng: 0.0 })?;
+        let ne_lat = bounds_array.get(2).as_f64().ok_or(RustyleafError::InvalidCoordinate { lat: 0.0, lng: 0.0 })?;
+        let ne_lng = bounds_array.get(3).as_f64().ok_or(RustyleafError::InvalidCoordinate { lat: 0.0, lng: 0.0 })?;
         
         // Validate coordinate ranges
-        if !(sw_lat >= -90.0 && sw_lat <= 90.0) {
+        if !(-90.0..=90.0).contains(&sw_lat) {
             return Err(RustyleafError::InvalidCoordinate { lat: sw_lat, lng: sw_lng }.into());
         }
-        if !(sw_lng >= -180.0 && sw_lng <= 180.0) {
+        if !(-180.0..=180.0).contains(&sw_lng) {
             return Err(RustyleafError::InvalidCoordinate { lat: sw_lat, lng: sw_lng }.into());
         }
-        if !(ne_lat >= -90.0 && ne_lat <= 90.0) {
+        if !(-90.0..=90.0).contains(&ne_lat) {
             return Err(RustyleafError::InvalidCoordinate { lat: ne_lat, lng: ne_lng }.into());
         }
-        if !(ne_lng >= -180.0 && ne_lng <= 180.0) {
+        if !(-180.0..=180.0).contains(&ne_lng) {
             return Err(RustyleafError::InvalidCoordinate { lat: ne_lat, lng: ne_lng }.into());
         }
         
@@ -1148,11 +1088,7 @@ impl RustyleafMap {
 
     #[wasm_bindgen]
     pub fn add_point_layer(&mut self) {
-        let point_layer = PointLayer {
-            points: Vec::new(),
-            visible: true,
-        };
-        self.point_layers.push(point_layer);
+        self.point_layers.push(PointLayer::new());
     }
 
     #[wasm_bindgen]
@@ -1172,23 +1108,35 @@ impl RustyleafMap {
                 .as_f64().unwrap_or(0.0);
             let size = js_sys::Reflect::get(&point_obj, &JsValue::from_str("size"))?
                 .as_f64().unwrap_or(5.0) as f32;
-            let meta = js_sys::Reflect::get(&point_obj, &JsValue::from_str("meta"))?
-                .as_string().unwrap_or_else(|| "{}".to_string());
+            let color_str = js_sys::Reflect::get(&point_obj, &JsValue::from_str("color"))?
+                .as_string().unwrap_or_else(|| "#0080ff".to_string());
+            let color = parse_color(&color_str);
 
-            let meta_json: serde_json::Value = serde_json::from_str(&meta)
-                .unwrap_or(serde_json::json!({}));
+            // meta may be a JSON string or a plain JS object
+            let meta_val = js_sys::Reflect::get(&point_obj, &JsValue::from_str("meta"))?;
+            let meta_json: serde_json::Value = if meta_val.is_undefined() || meta_val.is_null() {
+                serde_json::json!({})
+            } else if let Some(s) = meta_val.as_string() {
+                serde_json::from_str(&s).unwrap_or(serde_json::json!({}))
+            } else {
+                js_sys::JSON::stringify(&meta_val).ok()
+                    .and_then(|js| js.as_string())
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or(serde_json::json!({}))
+            };
 
             let point = PointFeature {
                 lat,
                 lng,
                 size,
-                color: [0.0, 0.5, 1.0, 1.0], // Default blue color
+                color,
                 meta: meta_json,
             };
             points.push(point);
         }
 
         self.point_layers[layer_index].points = points;
+        self.point_layers[layer_index].gpu_dirty.set(true);
         self.spatial_index_dirty = true;
         Ok(())
     }
@@ -1353,56 +1301,6 @@ impl RustyleafMap {
     }
 
     #[wasm_bindgen]
-    pub fn load_geojson_from_url(&mut self, layer_index: usize, url: &str) -> Result<(), JsValue> {
-        if layer_index >= self.geojson_layers.len() {
-            return Err(RustyleafError::LayerOutOfBounds { index: layer_index, len: self.geojson_layers.len() }.into());
-        }
-
-        // Simple synchronous fetch using XMLHttpRequest for now
-        let xhr = web_sys::XmlHttpRequest::new()
-            .map_err(|e| RustyleafError::RequestError(format!("Failed to create XMLHttpRequest: {:?}", e)))?;
-
-        // Configure the request
-        xhr.open("GET", url).map_err(|e| RustyleafError::RequestError(format!("Failed to open request: {:?}", e)))?;
-        xhr.set_response_type(web_sys::XmlHttpRequestResponseType::Text);
-
-        // Create closure for onload event - we'll just log the success and let JS handle the actual loading
-        let xhr_clone = xhr.clone();
-        let onload = Closure::wrap(Box::new(move || {
-            if xhr_clone.ready_state() == 4 {
-                if let Ok(status) = xhr_clone.status() {
-                    if status == 200 {
-                        if let Some(geojson_str) = xhr_clone.response_text().ok().flatten() {
-                            web_sys::console::log_1(&format!("Successfully fetched GeoJSON from URL: {} chars", geojson_str.len()).into());
-
-                            // Store the fetched data in a global variable for JavaScript to access
-                            if let Some(window) = web_sys::window() {
-                                let _ = js_sys::Reflect::set(&window, &JsValue::from_str("rustyleafGeoJSONData"), &JsValue::from_str(&geojson_str));
-                                // Notify JavaScript that data is ready using a timeout
-                                web_sys::console::log_1(&"GeoJSON data stored in global variable, JS can now process it".into());
-                            }
-                        }
-                    } else {
-                        web_sys::console::log_1(&format!("Failed to fetch GeoJSON: HTTP {}", status).into());
-                    }
-                } else {
-                    web_sys::console::log_1(&"Failed to fetch GeoJSON: Status error".into());
-                }
-            }
-        }) as Box<dyn FnMut()>);
-
-        // Set event handlers
-        xhr.set_onload(Some(onload.as_ref().unchecked_ref()));
-        xhr.set_onerror(Some(onload.as_ref().unchecked_ref()));
-        self.tile_loader.closures.push(onload);
-
-        // Send the request
-        xhr.send().map_err(|e| RustyleafError::RequestError(format!("Failed to send request: {:?}", e)))?;
-
-        Ok(())
-    }
-
-    #[wasm_bindgen]
     pub fn load_geojson_chunk(&mut self, layer_index: usize, chunk_str: &str, is_final: bool) -> Result<(), JsValue> {
         if layer_index >= self.geojson_layers.len() {
             return Err(RustyleafError::LayerOutOfBounds { index: layer_index, len: self.geojson_layers.len() }.into());
@@ -1523,7 +1421,6 @@ impl RustyleafMap {
                 &mut self.drag_accumulated_x, &mut self.drag_accumulated_y,
                 &mut self.last_drag_time,
                 0.7,
-                2000.0,
             );
 
             // Apply drag immediately for smooth response using precise pixel-based panning
@@ -1630,63 +1527,6 @@ impl RustyleafMap {
         }
     }
 
-    fn render_geojson_points(&self, context: &WebGl2RenderingContext, points: &[PointFeature]) -> Result<(), JsValue> {
-        if let Some(ref gl_state) = self.gl_state {
-            let ctx = render::geojson::GeoJsonRenderCtx {
-                context,
-                gl_state,
-                geojson_layers: &self.geojson_layers,
-                viewport: &self.viewport(),
-            };
-            render::geojson::render_geojson_points(&ctx, points)
-        } else {
-            Ok(())
-        }
-    }
-
-    fn render_geojson_lines(&self, context: &WebGl2RenderingContext, lines: &[LineFeature]) -> Result<(), JsValue> {
-        if let Some(ref gl_state) = self.gl_state {
-            let ctx = render::geojson::GeoJsonRenderCtx {
-                context,
-                gl_state,
-                geojson_layers: &self.geojson_layers,
-                viewport: &self.viewport(),
-            };
-            render::geojson::render_geojson_lines(&ctx, lines)
-        } else {
-            Ok(())
-        }
-    }
-
-    fn render_geojson_polygons(&self, context: &WebGl2RenderingContext, polygons: &[PolygonFeature]) -> Result<(), JsValue> {
-        if let Some(ref gl_state) = self.gl_state {
-            let ctx = render::geojson::GeoJsonRenderCtx {
-                context,
-                gl_state,
-                geojson_layers: &self.geojson_layers,
-                viewport: &self.viewport(),
-            };
-            render::geojson::render_geojson_polygons(&ctx, polygons)
-        } else {
-            Ok(())
-        }
-    }
-
-    fn render_geojson_polygon_triangles(&self, context: &WebGl2RenderingContext, triangles: &[[f64; 2]], color: [f32; 4]) -> Result<(), JsValue> {
-        if let Some(ref gl_state) = self.gl_state {
-            let ctx = render::geojson::GeoJsonRenderCtx {
-                context,
-                gl_state,
-                geojson_layers: &self.geojson_layers,
-                viewport: &self.viewport(),
-            };
-            render::geojson::render_geojson_polygon_triangles(&ctx, triangles, color)
-        } else {
-            Ok(())
-        }
-    }
-
-    // GeoJSON processing methods
     fn parse_geojson_string(&self, geojson_str: &str) -> Result<Vec<GeoJSONFeature>, JsValue> {
         web_sys::console::log_2(&"Parsing GeoJSON string length:".into(), &geojson_str.len().into());
 
@@ -1915,92 +1755,6 @@ impl RustyleafMap {
     }
 
     // Simple ear clipping triangulation for convex/concave polygons
-    fn triangulate_polygon(&self, points: &[[f64; 2]]) -> Vec<[f64; 2]> {
-        if points.len() < 3 {
-            return Vec::new();
-        }
-
-        let mut triangles = Vec::new();
-        let mut vertices: Vec<[f64; 2]> = points.to_vec();
-
-        // Simple ear clipping for basic polygons
-        while vertices.len() >= 3 {
-            let mut ear_found = false;
-            
-            for i in 0..vertices.len() {
-                let prev = vertices[(i + vertices.len() - 1) % vertices.len()];
-                let curr = vertices[i];
-                let next = vertices[(i + 1) % vertices.len()];
-
-                // Check if this is an "ear" (convex vertex)
-                if self.is_convex_vertex(&prev, &curr, &next) && 
-                   !self.has_point_in_triangle(&vertices, &prev, &curr, &next) {
-                    // Add triangle
-                    triangles.push(prev);
-                    triangles.push(curr);
-                    triangles.push(next);
-                    
-                    // Remove the ear vertex
-                    vertices.remove(i);
-                    ear_found = true;
-                    break;
-                }
-            }
-
-            // If no ear found, break to avoid infinite loop
-            if !ear_found {
-                break;
-            }
-        }
-
-        triangles
-    }
-
-    fn is_convex_vertex(&self, prev: &[f64; 2], curr: &[f64; 2], next: &[f64; 2]) -> bool {
-        // Calculate cross product to determine convexity
-        let dx1 = curr[0] - prev[0];
-        let dy1 = curr[1] - prev[1];
-        let dx2 = next[0] - curr[0];
-        let dy2 = next[1] - curr[1];
-        
-        // Cross product (in 2D, this gives the z-component)
-        let cross = dx1 * dy2 - dy1 * dx2;
-        cross > 0.0  // Counter-clockwise (convex)
-    }
-
-    fn has_point_in_triangle(&self, vertices: &[[f64; 2]], a: &[f64; 2], b: &[f64; 2], c: &[f64; 2]) -> bool {
-        for vertex in vertices {
-            if vertex == a || vertex == b || vertex == c {
-                continue;
-            }
-            
-            if self.point_in_triangle(vertex, a, b, c) {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn point_in_triangle(&self, p: &[f64; 2], a: &[f64; 2], b: &[f64; 2], c: &[f64; 2]) -> bool {
-        // Barycentric coordinate method
-        let v0 = [c[0] - a[0], c[1] - a[1]];
-        let v1 = [b[0] - a[0], b[1] - a[1]];
-        let v2 = [p[0] - a[0], p[1] - a[1]];
-
-        let dot00 = v0[0] * v0[0] + v0[1] * v0[1];
-        let dot01 = v0[0] * v1[0] + v0[1] * v1[1];
-        let dot02 = v0[0] * v2[0] + v0[1] * v2[1];
-        let dot11 = v1[0] * v1[0] + v1[1] * v1[1];
-        let dot12 = v1[0] * v2[0] + v1[1] * v2[1];
-
-        let inv_denom = 1.0 / (dot00 * dot11 - dot01 * dot01);
-        let u = (dot11 * dot02 - dot01 * dot12) * inv_denom;
-        let v = (dot00 * dot12 - dot01 * dot02) * inv_denom;
-
-        (u >= 0.0) && (v >= 0.0) && (u + v < 1.0)
-    }
-
-    // Streaming GeoJSON parser for large files
     fn parse_geojson_chunk(&self, chunk_str: &str, is_final: bool) -> Result<Vec<GeoJSONFeature>, JsValue> {
         // For streaming, we'll try to parse valid JSON chunks or individual features
         let mut features = Vec::new();
@@ -2266,7 +2020,7 @@ impl RustyleafMap {
         Ok(())
     }
 
-    fn triangulate_polygon_with_holes_lyon(&self, rings: &Vec<Vec<[f64; 2]>>) -> Vec<[f64; 2]> {
+    fn triangulate_polygon_with_holes_lyon(&self, rings: &[Vec<[f64; 2]>]) -> Vec<[f64; 2]> {
         if rings.is_empty() || rings[0].len() < 3 { return Vec::new(); }
 
         let mut path_builder = Path::builder();
@@ -2308,27 +2062,17 @@ impl RustyleafMap {
         out
     }
 
-    fn cull_triangles_to_view(&self, triangles: &[[f64; 2]]) -> Vec<[f64; 2]> {
-        if let Some(ref gl_state) = self.gl_state {
-            let ctx = render::geojson::GeoJsonRenderCtx {
-                context: &gl_state.context,
-                gl_state,
-                geojson_layers: &self.geojson_layers,
-                viewport: &self.viewport(),
-            };
-            render::geojson::cull_triangles_to_view(&ctx, triangles)
-        } else {
-            Vec::new()
-        }
-    }
 }
 
 // Separate TileLayer API class
 #[wasm_bindgen]
 pub struct TileLayerApi {
     url_template: String,
+    #[allow(dead_code)] // forwarded once per-layer subdomain/zoom options are wired through add_to
     subdomains: Vec<String>,
+    #[allow(dead_code)]
     max_zoom: u32,
+    #[allow(dead_code)]
     min_zoom: u32,
 }
 
@@ -2354,7 +2098,14 @@ impl TileLayerApi {
 #[wasm_bindgen]
 pub struct PointLayerApi {
     points: Vec<PointFeature>,
+    #[allow(dead_code)] // toggled by future setVisible API
     visible: bool,
+}
+
+impl Default for PointLayerApi {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[wasm_bindgen]

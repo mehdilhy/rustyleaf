@@ -210,10 +210,8 @@ pub fn render_geojson_points(ctx: &GeoJsonRenderCtx, points: &[PointFeature]) ->
     }
 
     if !vertex_data.is_empty() {
-        let vertices = Float32Array::new_with_length(vertex_data.len() as u32);
-        for (i, &val) in vertex_data.iter().enumerate() {
-            vertices.set_index(i as u32, val);
-        }
+        // Bulk copy — element-wise set_index is prohibitively slow for large layers
+        let vertices = Float32Array::from(&vertex_data[..]);
 
         context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(gl_state.point_buffer.inner()));
         context.buffer_data_with_array_buffer_view(
@@ -234,6 +232,14 @@ pub fn render_geojson_points(ctx: &GeoJsonRenderCtx, points: &[PointFeature]) ->
         let u_matrix_loc = context.get_uniform_location(gl_state.programs.point_program.inner(), "u_matrix");
         if let Some(loc) = u_matrix_loc.as_ref() {
             context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
+        }
+        // This path uploads pre-projected screen coords, so neutralize the
+        // world→screen transform the point shader now applies (a_position * 1 - 0).
+        if let Some(loc) = gl_state.point_u_origin.as_ref() {
+            context.uniform2f(Some(loc), 0.0, 0.0);
+        }
+        if let Some(loc) = gl_state.point_u_world_scale.as_ref() {
+            context.uniform1f(Some(loc), 1.0);
         }
 
         context.draw_arrays(WebGl2RenderingContext::POINTS, 0, points.len() as i32);
@@ -302,10 +308,8 @@ pub fn render_geojson_lines(ctx: &GeoJsonRenderCtx, lines: &[LineFeature]) -> Re
     }
 
     if !vertex_data.is_empty() {
-        let vertices = Float32Array::new_with_length(vertex_data.len() as u32);
-        for (i, &val) in vertex_data.iter().enumerate() {
-            vertices.set_index(i as u32, val);
-        }
+        // Bulk copy — element-wise set_index is prohibitively slow for large layers
+        let vertices = Float32Array::from(&vertex_data[..]);
 
         context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(gl_state.line_buffer.inner()));
         context.buffer_data_with_array_buffer_view(
@@ -436,10 +440,8 @@ pub fn render_geojson_polygons(ctx: &GeoJsonRenderCtx, polygons: &[PolygonFeatur
     }
 
     if !vertex_data.is_empty() {
-        let vertices = Float32Array::new_with_length(vertex_data.len() as u32);
-        for (i, &val) in vertex_data.iter().enumerate() {
-            vertices.set_index(i as u32, val);
-        }
+        // Bulk copy — element-wise set_index is prohibitively slow for large layers
+        let vertices = Float32Array::from(&vertex_data[..]);
 
         context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(gl_state.polygon_buffer.inner()));
         context.buffer_data_with_array_buffer_view(
@@ -498,10 +500,8 @@ pub fn render_geojson_polygon_triangles(ctx: &GeoJsonRenderCtx, triangles: &[[f6
     }
 
     if !vertex_data.is_empty() {
-        let vertices = Float32Array::new_with_length(vertex_data.len() as u32);
-        for (i, &val) in vertex_data.iter().enumerate() {
-            vertices.set_index(i as u32, val);
-        }
+        // Bulk copy — element-wise set_index is prohibitively slow for large layers
+        let vertices = Float32Array::from(&vertex_data[..]);
 
         context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(gl_state.polygon_buffer.inner()));
         context.buffer_data_with_array_buffer_view(

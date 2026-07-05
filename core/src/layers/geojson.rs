@@ -21,6 +21,7 @@ pub struct GeoJSONLayer {
 pub struct GeoJSONFeature {
     pub(crate) geometry: GeoJSONGeometry,
     pub(crate) properties: serde_json::Value,
+    #[allow(dead_code)] // GeoJSON feature id, kept for future feature lookup API
     pub(crate) id: Option<String>,
 }
 

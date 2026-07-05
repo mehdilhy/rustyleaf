@@ -1,10 +1,13 @@
 // Jest setup file for Rustyleaf tests
 
 // Extend global interface for test utilities
+// eslint-disable-next-line no-var -- `var` is required syntax in ambient declarations
 declare global {
+  /* eslint-disable no-var */
   var createMockMap: () => any;
   var createMockTileLayer: () => any;
   var createMockPointLayer: () => any;
+  /* eslint-enable no-var */
 }
 
 // Mock WebGL context for tests

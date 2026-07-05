@@ -4,7 +4,6 @@ pub fn apply_drag(
     drag_accumulated_x: &mut f64, drag_accumulated_y: &mut f64,
     last_drag_time: &mut f64,
     smoothing_factor: f64,
-    _max_velocity: f64,
 ) {
     let current_time = js_sys::Date::now();
     let time_delta = (current_time - *last_drag_time) / 1000.0;
@@ -58,7 +57,7 @@ pub fn apply_momentum(
     };
     *last_drag_time = current_time;
 
-    let delta_time = delta_time.min(1.0 / 30.0).max(1.0 / 120.0);
+    let delta_time = delta_time.clamp(1.0 / 120.0, 1.0 / 30.0);
 
     *drag_accumulated_x = drag_velocity.0 * delta_time;
     *drag_accumulated_y = drag_velocity.1 * delta_time;

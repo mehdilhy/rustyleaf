@@ -57,7 +57,7 @@ pub fn render_tiles(
 
                 if let Some(texture) = tile_loader.textures.borrow().get(&key) {
                     context.active_texture(WebGl2RenderingContext::TEXTURE0);
-                    context.bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(texture));
+                    context.bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(texture.inner()));
 
                     let vertices = Float32Array::new_with_length(16);
 

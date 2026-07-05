@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rustyleaf Demo — Rust + WASM + WebGL2 map engine</title>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; font-family: system-ui, -apple-system, sans-serif; }
+    #map { width: 100%; height: 100%; }
+    .panel {
+      position: absolute; top: 12px; left: 12px; z-index: 20;
+      background: rgba(255, 255, 255, 0.95); border-radius: 8px;
+      box-shadow: 0 2px 12px rgba(0, 0, 0, 0.25); padding: 14px 16px; max-width: 300px;
+    }
+    .panel h1 { margin: 0 0 4px; font-size: 16px; }
+    .panel p { margin: 4px 0; font-size: 12.5px; color: #444; }
+    .panel a { color: #2a6fdb; }
+    .buttons { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+    .buttons button {
+      border: 1px solid #ccc; background: #fff; border-radius: 6px;
+      padding: 5px 10px; font-size: 12.5px; cursor: pointer;
+    }
+    .buttons button:hover { background: #f0f4ff; }
+    .buttons button.active { background: #2a6fdb; color: #fff; border-color: #2a6fdb; }
+    .stats {
+      position: absolute; bottom: 24px; left: 12px; z-index: 20;
+      background: rgba(0, 0, 0, 0.75); color: #7CFC00; border-radius: 6px;
+      padding: 8px 12px; font: 13px/1.5 ui-monospace, monospace;
+    }
+    .err {
+      position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+      background: #fff; z-index: 30; text-align: center; padding: 24px;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div class="panel">
+    <h1>🍂 Rustyleaf</h1>
+    <p>Leaflet-style API, rendered by a <strong>Rust → WASM → WebGL2</strong> core.
+       Pan, zoom, and click the points.</p>
+    <p>Points on screen: <strong id="count">0</strong></p>
+    <div class="buttons">
+      <button data-n="10000">10k</button>
+      <button data-n="100000" class="active">100k</button>
+      <button data-n="500000">500k</button>
+      <button data-n="1000000">1M</button>
+    </div>
+    <p style="margin-top:10px"><a href="https://github.com/mehdilhy/rustyleaf">GitHub</a> ·
+       <a href="https://www.npmjs.com/package/rustyleaf">npm</a> · pre-alpha v0.0.1</p>
+  </div>
+
+  <div class="stats"><span id="fps">–</span> fps · <span id="frame">–</span> ms/frame</div>
+  <div class="err" id="err"><div><h2>WebGL2 not available</h2><p>Rustyleaf requires a browser with WebGL2 enabled.</p></div></div>
+
+  <script type="module">
+    import { Map, TileLayer, PointLayer } from '../dist/rustyleaf.bundle.js';
+
+    let map;
+    try {
+      map = new Map('map', { center: [48.8566, 2.3522], zoom: 11 });
+    } catch (e) {
+      document.getElementById('err').style.display = 'flex';
+      throw e;
+    }
+
+    new TileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+    }).addTo(map);
+
+    // ---- point cloud ----
+    const palette = ['#e0393e', '#2a6fdb', '#21a179', '#f4a300', '#8452d8'];
+    let layer = null;
+
+    function generate(n) {
+      // Cluster around Paris with wide scatter so zooming stays interesting
+      const pts = new Array(n);
+      for (let i = 0; i < n; i++) {
+        const r = Math.random() ** 2 * 1.6;
+        const a = Math.random() * Math.PI * 2;
+        pts[i] = {
+          lat: 48.8566 + Math.sin(a) * r * 0.6,
+          lng: 2.3522 + Math.cos(a) * r,
+          size: 3 + Math.random() * 3,
+          color: palette[i % palette.length],
+          meta: { id: i }
+        };
+      }
+      return pts;
+    }
+
+    function setCount(n) {
+      const pts = generate(n);
+      if (!layer) {
+        layer = new PointLayer();
+        layer.add(pts);
+        layer.addTo(map); // creates WASM point layer 0
+        layer.on('click', (f) => console.log('clicked feature', f));
+      } else {
+        // No layer.setData() in the public API yet (see ROADMAP) — replace the
+        // WASM layer's points directly so switching sizes doesn't stack layers.
+        layer.points = pts;
+        map.wasmMap.add_points(0, pts);
+      }
+      document.getElementById('count').textContent = n.toLocaleString();
+    }
+
+    document.querySelectorAll('.buttons button').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.buttons button').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        setCount(Number(btn.dataset.n));
+      });
+    });
+
+    setCount(100000);
+
+    // Exposed for debugging / e2e checks
+    window.__map = map;
+    window.__setCount = setCount;
+    window.__getLayer = () => layer;
+
+    // ---- FPS meter ----
+    const fpsEl = document.getElementById('fps');
+    const frameEl = document.getElementById('frame');
+    let frames = 0, last = performance.now(), lastFrame = last;
+    let worst = 0;
+    function tick(now) {
+      frames++;
+      worst = Math.max(worst, now - lastFrame);
+      lastFrame = now;
+      if (now - last >= 1000) {
+        fpsEl.textContent = String(frames);
+        frameEl.textContent = worst.toFixed(1);
+        frames = 0; worst = 0; last = now;
+      }
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  </script>
+</body>
+</html>

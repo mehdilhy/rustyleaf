@@ -12,7 +12,7 @@ pub struct Viewport {
 
 impl Viewport {
     pub fn lat_lng_to_pixel(&self, lat: f64, lng: f64, zoom: u32) -> (f64, f64) {
-        let clamped_lat = lat.max(-85.05112878).min(85.05112878);
+        let clamped_lat = lat.clamp(-85.05112878, 85.05112878);
 
         let n = (1u32 << zoom) as f64;
 
@@ -25,7 +25,7 @@ impl Viewport {
     }
 
     pub fn lat_lng_to_normalized(&self, lat: f64, lng: f64) -> (f64, f64) {
-        let clamped_lat = lat.max(-85.05112878).min(85.05112878);
+        let clamped_lat = lat.clamp(-85.05112878, 85.05112878);
         let x = (lng + 180.0) / 360.0;
         let lat_rad = clamped_lat.to_radians();
         let y = (1.0 - ((std::f64::consts::FRAC_PI_4 + lat_rad / 2.0).tan().ln() / std::f64::consts::PI)) / 2.0;

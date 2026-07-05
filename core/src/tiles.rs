@@ -8,6 +8,7 @@ use wasm_bindgen::JsCast;
 
 use crate::projection::Viewport;
 use crate::error::RustyleafError;
+use crate::OwnedTexture;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TileCoord {
@@ -18,6 +19,7 @@ pub struct TileCoord {
 
 #[derive(Clone)]
 pub struct Tile {
+    #[allow(dead_code)] // tiles are keyed by string today; coord kept for typed cache keys
     pub coord: TileCoord,
     pub texture: Option<WebGlTexture>,
     pub loading: bool,
@@ -27,15 +29,18 @@ pub struct Tile {
 pub struct TileLayer {
     pub url_template: String,
     pub subdomains: Vec<String>,
+    #[allow(dead_code)] // not yet enforced during tile loading
     pub max_zoom: u32,
+    #[allow(dead_code)] // not yet enforced during tile loading
     pub min_zoom: u32,
 }
 
 pub struct TileLoader {
-    pub textures: Rc<RefCell<HashMap<String, WebGlTexture>>>,
+    pub textures: Rc<RefCell<HashMap<String, OwnedTexture>>>,
     pub tiles: HashMap<String, Tile>,
     pub requested: HashSet<String>,
-    pub closures: Vec<Closure<dyn FnMut()>>,
+    // Keyed by tile key so completed loads can be released in cleanup_old_tiles.
+    pub closures: HashMap<String, Closure<dyn FnMut()>>,
 }
 
 impl TileLoader {
@@ -44,20 +49,21 @@ impl TileLoader {
             textures: Rc::new(RefCell::new(HashMap::new())),
             tiles: HashMap::new(),
             requested: HashSet::new(),
-            closures: Vec::new(),
+            closures: HashMap::new(),
         }
     }
 
-    pub fn cleanup_old_tiles(
-        &mut self,
-        context: &WebGl2RenderingContext,
-        viewport: &Viewport,
-    ) {
+    pub fn cleanup_old_tiles(&mut self, viewport: &Viewport) {
         let current_zoom = viewport.zoom.round() as u32;
         let visible_keys = visible_tile_keys(viewport, current_zoom);
         let max_cache_size = (visible_keys.len() * 3).max(20);
 
         let mut textures = self.textures.borrow_mut();
+
+        // Release onload closures for tiles whose load has definitively completed
+        // (texture exists). In-flight loads keep their closure alive. Must run
+        // before eviction below so completed-then-evicted tiles are covered.
+        self.closures.retain(|key, _| !textures.contains_key(key));
 
         let keys_to_remove: Vec<String> = textures
             .iter()
@@ -76,10 +82,9 @@ impl TileLoader {
             .map(|(key, _)| key.clone())
             .collect();
 
+        // OwnedTexture::Drop deletes the GL texture when removed from the map.
         for key in keys_to_remove {
-            if let Some(texture) = textures.remove(&key) {
-                context.delete_texture(Some(&texture));
-            }
+            textures.remove(&key);
         }
 
         if textures.len() > max_cache_size {
@@ -91,9 +96,7 @@ impl TileLoader {
                 .cloned()
                 .collect();
             for key in to_remove {
-                if let Some(texture) = textures.remove(&key) {
-                    context.delete_texture(Some(&texture));
-                }
+                textures.remove(&key);
             }
         }
 
@@ -120,7 +123,7 @@ impl TileLoader {
         context: &WebGl2RenderingContext,
         tile_size: u32,
     ) {
-        self.cleanup_old_tiles(context, viewport);
+        self.cleanup_old_tiles(viewport);
         let zoom = viewport.zoom.round() as u32;
         let center_pixel =
             viewport.lat_lng_to_pixel(viewport.center_lat, viewport.center_lng, zoom);
@@ -248,16 +251,16 @@ impl TileLoader {
                 &img_clone,
             );
 
-            if let Ok(_) = result {
+            if result.is_ok() {
                 tile_textures
                     .borrow_mut()
-                    .insert(tile_key_clone.clone(), texture);
+                    .insert(tile_key_clone.clone(), OwnedTexture::new(&context_clone, texture));
             }
         }) as Box<dyn FnMut()>);
 
         image.set_onload(Some(onload_closure.as_ref().unchecked_ref()));
         image.set_onerror(Some(onload_closure.as_ref().unchecked_ref()));
-        self.closures.push(onload_closure);
+        self.closures.insert(tile_key, onload_closure);
 
         image.set_src(&url);
     }

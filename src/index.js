@@ -16,8 +16,10 @@ console.warn('⚠️ Rustyleaf v0.0.1-experimental - NOT FOR PRODUCTION USE');
 console.warn('This is an early-stage experimental library with known issues.');
 console.warn('See documentation for limitations and suitability.');
 
-// Import WASM bindings to include them in the bundle
-import '../dist/rustyleaf_core.js';
+// WASM initialization happens in rustyleaf-api.js (single fetch + instantiate,
+// resolved relative to the bundle URL). Do NOT also import dist/rustyleaf_core.js
+// here: that creates a second, racing WASM instance whose memory is disjoint
+// from the one the API talks to (layers silently vanish).
 
 // Main entry point for webpack bundling to UMD output
 export * from './rustyleaf-api.js';

@@ -131,11 +131,6 @@ export class RustyleafMap {
     this.ptr = rustyleafmap_new(width, height);
   }
 
-  // Add clear_geojson_layer method
-  clear_geojson_layer(layerIndex) {
-    rustyleafmap_clear_geojson_layer(this.ptr, layerIndex);
-  }
-
   init_canvas(canvasId) {
     return rustyleafmap_init_canvas(this.ptr, canvasId);
   }
@@ -430,7 +425,6 @@ export default {
   rustyleafmap_on_wheel,
   rustyleafmap_handle_contextmenu,
   rustyleafmap_resize,
-  rustyleafmap_screen_xy,
   rustyleafmap_add_tile_layer,
   rustyleafmap_add_point_layer,
   rustyleafmap_add_line_layer,

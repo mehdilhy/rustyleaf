@@ -5,12 +5,16 @@
   "main": "dist/rustyleaf.bundle.js",
   "module": "dist/rustyleaf.js",
   "exports": {
-    ".": "./dist/rustyleaf.bundle.js",
-    "./dist/*": "./dist/*"
+    ".": {
+      "types": "./types/rustyleaf.d.ts",
+      "default": "./dist/rustyleaf.bundle.js"
+    },
+    "./package.json": "./package.json"
   },
-  "types": "dist/rustyleaf.d.ts",
+  "types": "types/rustyleaf.d.ts",
   "files": [
     "dist/",
+    "types/",
     "README.md",
     "LICENSE"
   ],
@@ -19,6 +23,7 @@
     "dev": "npm run build:wasm && webpack --mode development --watch",
     "build:wasm": "cd core && wasm-pack build --target bundler --release --out-dir ../dist",
     "prepublishOnly": "npm run build",
+    "prepack": "node -e \"require('fs').writeFileSync('dist/.npmignore','# keep: stops npm from applying wasm-pack generated dist/.gitignore\\n')\"",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
@@ -27,13 +32,13 @@
     "test:e2e:soak": "npm run build:wasm && playwright test --config e2e/playwright.config.ts e2e/tests/memory-soak.spec.ts",
     "test:e2e:fps": "npm run build:wasm && playwright test --config e2e/playwright.config.ts e2e/tests/00-fps-benchmark.spec.ts",
     "test:e2e:update": "npm run build:wasm && playwright test --config e2e/playwright.config.ts --update-snapshots",
-    "postinstall": "npx playwright install chromium",
+    "setup:e2e": "playwright install chromium",
     "lint": "eslint . --ext .ts,.js",
     "lint:fix": "eslint . --ext .ts,.js --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "typecheck": "tsc --noEmit",
-    "bench": "node benchmarks/run.js"
+    "bench": "node -e \"console.log('Run: npm run build && node e2e/serve.mjs, then open http://localhost:3333/benchmark/')\""
   },
   "keywords": [
     "map",

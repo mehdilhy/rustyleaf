@@ -5,32 +5,52 @@
 import { RustyleafMap, TileLayerApi, PointLayerApi } from '../dist/rustyleaf_core_bg.js';
 import * as __rustyleaf_wasm_bg from '../dist/rustyleaf_core_bg.js';
 
+// True when the WASM instance is already wired into the bg glue module.
+// Webpack (asyncWebAssembly) instantiates the wasm before this module evaluates,
+// so the manual fetch below is only needed when loading these sources as plain ESM.
+function __rustyleafWasmAlreadyInitialized() {
+  try {
+    const probe = new RustyleafMap(1, 1);
+    if (typeof probe.free === 'function') probe.free();
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 // Ensure WASM is initialized before any usage
 let __rustyleaf_wasm_ready_promise;
 async function __ensureRustyleafWasmReady() {
   if (!__rustyleaf_wasm_ready_promise) {
     __rustyleaf_wasm_ready_promise = (async () => {
-      const wasmUrl = new URL('../dist/rustyleaf_core_bg.wasm', import.meta.url);
-      try {
-        if (WebAssembly.instantiateStreaming) {
-          const resp = await fetch(wasmUrl);
-          const { instance } = await WebAssembly.instantiateStreaming(resp, { './rustyleaf_core_bg.js': __rustyleaf_wasm_bg });
-          __rustyleaf_wasm_bg.__wbg_set_wasm(instance.exports);
-          if (instance.exports && typeof instance.exports.__wbindgen_start === 'function') {
-            instance.exports.__wbindgen_start();
-          }
-        } else {
-          const bytes = await fetch(wasmUrl).then(r => r.arrayBuffer());
-          const { instance } = await WebAssembly.instantiate(bytes, { './rustyleaf_core_bg.js': __rustyleaf_wasm_bg });
-          __rustyleaf_wasm_bg.__wbg_set_wasm(instance.exports);
-          if (instance.exports && typeof instance.exports.__wbindgen_start === 'function') {
-            instance.exports.__wbindgen_start();
-          }
-        }
-      } catch (e) {
-        console.error('Failed to initialize Rustyleaf WASM:', e);
-        throw e;
+      if (__rustyleafWasmAlreadyInitialized()) {
+        return;
       }
+      // Fetch and instantiate the wasm. The `new URL(..., import.meta.url)`
+      // literal lets bundlers (webpack asset/resource, Vite) track and emit the
+      // .wasm file as an asset resolved relative to the deployed bundle.
+      const wasmUrl = new URL('../dist/rustyleaf_core_bg.wasm', import.meta.url);
+      let lastError = null;
+      try {
+        const resp = await fetch(wasmUrl);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status} fetching ${wasmUrl}`);
+        let instance;
+        if (WebAssembly.instantiateStreaming) {
+          ({ instance } = await WebAssembly.instantiateStreaming(resp, { './rustyleaf_core_bg.js': __rustyleaf_wasm_bg }));
+        } else {
+          const bytes = await resp.arrayBuffer();
+          ({ instance } = await WebAssembly.instantiate(bytes, { './rustyleaf_core_bg.js': __rustyleaf_wasm_bg }));
+        }
+        __rustyleaf_wasm_bg.__wbg_set_wasm(instance.exports);
+        if (instance.exports && typeof instance.exports.__wbindgen_start === 'function') {
+          instance.exports.__wbindgen_start();
+        }
+        return;
+      } catch (e) {
+        lastError = e;
+      }
+      console.error('Failed to initialize Rustyleaf WASM:', lastError);
+      throw lastError;
     })();
   }
   return __rustyleaf_wasm_ready_promise;
@@ -112,6 +132,27 @@ class Map {
     // Replace container content with canvas
     this.containerElement.innerHTML = '';
     this.containerElement.appendChild(this.canvas);
+
+    // Context loss recovery
+    this.canvas.addEventListener('webglcontextlost', (event) => {
+      event.preventDefault();
+      console.warn('Rustyleaf: WebGL context lost. Attempting recovery...');
+      if (this.wasmMap && this.wasmMap.handle_context_lost) {
+        this.wasmMap.handle_context_lost();
+      }
+      this._needsRestore = true;
+      this._stopRenderLoop();
+    });
+
+    this.canvas.addEventListener('webglcontextrestored', () => {
+      console.log('Rustyleaf: WebGL context restored. Reinitializing...');
+      if (this.wasmMap && this.wasmMap.handle_context_restored) {
+        this.wasmMap.init_canvas(this.canvas.id);
+        this.wasmMap.handle_context_restored();
+      }
+      this._needsRestore = false;
+      this._startRenderLoop();
+    });
 
     // Check WebGL compatibility before initializing
     const webglSupport = checkWebGLSupport();
@@ -420,12 +461,20 @@ class Map {
   }
 
   _startRenderLoop() {
+    if (this._needsRestore) return;
     const render = () => {
-      if (this._destroyed) return;
+      if (this._destroyed || this._needsRestore) return;
       this.wasmMap.render(this.canvas.id);
       this._rafId = requestAnimationFrame(render);
     };
     render();
+  }
+
+  _stopRenderLoop() {
+    if (this._rafId !== undefined) {
+      cancelAnimationFrame(this._rafId);
+      this._rafId = undefined;
+    }
   }
 
   // Release the WebGL context, GPU resources, and event listeners.
@@ -472,6 +521,24 @@ class TileLayer {
 
   addTo(map) {
     this.wasmTileLayer.add_to(map.wasmMap);
+    if (this.options.attribution && map.containerElement) {
+      let attrib = map.containerElement.querySelector('.rustyleaf-attribution');
+      if (!attrib) {
+        attrib = document.createElement('div');
+        attrib.className = 'rustyleaf-attribution';
+        attrib.style.cssText = 'position:absolute;bottom:0;right:0;z-index:10;background:rgba(255,255,255,0.8);font:11px/1.4 sans-serif;padding:0 5px;';
+        if (window.getComputedStyle(map.containerElement).position === 'static') {
+          map.containerElement.style.position = 'relative';
+        }
+        map.containerElement.appendChild(attrib);
+      }
+      const parts = attrib.innerHTML ? attrib.innerHTML.split(' | ') : [];
+      if (!parts.includes(this.options.attribution)) {
+        parts.push(this.options.attribution);
+        attrib.innerHTML = parts.join(' | ');
+      }
+      this._attributionElement = attrib;
+    }
     return this;
   }
   
@@ -505,14 +572,15 @@ class PointLayer {
     }));
     
     this.wasmPointLayer.add(pointsData);
-    this.points.push(...points);
+    // Avoid spread — it overflows the call stack for very large arrays (1M+ points)
+    for (const p of points) this.points.push(p);
     return this;
   }
   
   clear() {
     this.points = [];
     // Reset WASM layer
-    this.wasmPointLayer = new WasmPointLayer();
+    this.wasmPointLayer = new PointLayerApi();
     return this;
   }
   
@@ -555,7 +623,7 @@ class LineLayer {
       meta: line.meta || null
     }));
     
-    this.lines.push(...linesData);
+    for (const l of linesData) this.lines.push(l);
     return this;
   }
   
@@ -990,7 +1058,7 @@ class PolygonLayer {
       meta: polygon.meta || null
     }));
     
-    this.polygons.push(...polygonsData);
+    for (const pg of polygonsData) this.polygons.push(pg);
     return this;
   }
   
@@ -1216,7 +1284,7 @@ class GeoJSONLayer {
     let processed = 0;
     
     // Look for complete JSON objects (ending with })
-    while (true) {
+    for (;;) {
       const endIndex = this.findCompleteJsonEnd(buffer);
       if (endIndex === -1) break;
       
@@ -1427,12 +1495,6 @@ class GeoJSONLayer {
     ];
   }
 
-  // Get features in current view
-  getFeaturesInBounds(bounds) {
-    // Implementation for spatial filtering
-    return [];
-  }
-
   // Clear layer data
   clear() {
     this.geojson = null;
@@ -1507,110 +1569,64 @@ class GeoJSONLayer {
     });
   }
 
-  // Load GeoJSON from URL using Rust-based processing
-  loadFromUrl(url, options = {}) {
+  // Load GeoJSON from a URL, then parse/triangulate it in the WASM core
+  async loadFromUrl(url, options = {}) {
     const {
       progressCallback = null,
       completeCallback = null,
-      errorCallback = null
+      errorCallback = null,
+      signal = null
     } = options;
 
-    return new Promise((resolve, reject) => {
-      try {
-        // Use Rust-based URL loading
-        this.map.wasmMap.load_geojson_from_url(this.layerIndex, url);
+    try {
+      const response = await fetch(url, signal ? { signal } : undefined);
+      if (!response.ok) {
+        throw new Error(`Failed to fetch GeoJSON: HTTP ${response.status} ${response.statusText}`);
+      }
 
-        // Poll for the data to be available with timeout
-        const startTime = Date.now();
-        const TIMEOUT_MS = 30000; // 30 second timeout
-        const state = { done: false };
-
-        const checkForData = () => {
-          // Check for timeout
-          if (Date.now() - startTime > TIMEOUT_MS) {
-            // Clean up potential memory leak on timeout
-            delete window.rustyleafGeoJSONData;
-            if (!state.done) {
-              reject(new Error('GeoJSON loading timed out after 30 seconds'));
-            }
-            return;
-          }
-
-          if (window.rustyleafGeoJSONData) {
-            try {
-              if (state.done) return;
-              state.done = true;
-              // Get the data length before cleanup
-              const dataLength = window.rustyleafGeoJSONData.length;
-
-              // Load the actual GeoJSON data into the layer using Rust processing
-              this.loadData(window.rustyleafGeoJSONData);
-
-              // Clean up the global variable immediately after use
-              delete window.rustyleafGeoJSONData;
-
-              if (completeCallback) {
-                completeCallback({
-                  totalFeatures: this.getFeatureCount(),
-                  totalBytes: dataLength
-                });
-              }
-
-              resolve(this);
-            } catch (error) {
-              if (errorCallback) {
-                errorCallback({
-                  error: error,
-                  message: 'Failed to process loaded GeoJSON data'
-                });
-              }
-              reject(error);
-            }
-          } else {
-            // Check again in 100ms
-            setTimeout(checkForData, 100);
-          }
-        };
-
-        // Start checking for data after a short delay
-        setTimeout(checkForData, 100);
-
-        // Start a JS fetch fallback in parallel (works when WASM XHR is blocked)
-        fetch(url)
-          .then(resp => {
-            if (!resp.ok) throw new Error(`HTTP error! status: ${resp.status}`);
-            return resp.text();
-          })
-          .then(text => {
-            if (state.done) return; // Rust path already completed
-            state.done = true;
-            this.loadData(text);
-            if (completeCallback) {
-              completeCallback({
-                totalFeatures: this.getFeatureCount(),
-                totalBytes: text.length
-              });
-            }
-            resolve(this);
-          })
-          .catch(err => {
-            // Silently ignore if Rust path succeeds; surface only if both fail via timeout
-            if (errorCallback) {
-              // Provide progress-style error without rejecting immediately
-              errorCallback({ error: err, message: 'Fetch fallback failed (will rely on WASM XHR)' });
-            }
-          });
-
-      } catch (error) {
-        if (errorCallback) {
-          errorCallback({
-            error: error,
-            message: 'Failed to load GeoJSON from URL'
+      const contentLength = Number(response.headers.get('content-length')) || 0;
+      let text;
+      if (progressCallback && response.body) {
+        const reader = response.body.getReader();
+        const chunks = [];
+        let loaded = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          loaded += value.length;
+          progressCallback({
+            loaded,
+            total: contentLength,
+            percentage: contentLength ? Math.round((loaded / contentLength) * 100) : 0
           });
         }
-        reject(error);
+        const buffer = new Uint8Array(loaded);
+        let offset = 0;
+        for (const chunk of chunks) {
+          buffer.set(chunk, offset);
+          offset += chunk.length;
+        }
+        text = new TextDecoder().decode(buffer);
+      } else {
+        text = await response.text();
       }
-    });
+
+      this.loadData(text);
+
+      if (completeCallback) {
+        completeCallback({
+          totalFeatures: this.getFeatureCount(),
+          totalBytes: text.length
+        });
+      }
+      return this;
+    } catch (error) {
+      if (errorCallback) {
+        errorCallback({ error, message: 'Failed to load GeoJSON from URL' });
+      }
+      throw error;
+    }
   }
 
   // Add individual GeoJSON feature

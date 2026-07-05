@@ -6,6 +6,7 @@ use crate::projection::Viewport;
 
 #[derive(Clone, Debug)]
 pub(crate) struct SpatialFeature {
+    #[allow(dead_code)] // reserved for stable feature identity across index rebuilds
     pub(crate) id: u32,
     pub(crate) bounds: AABB<[f64; 2]>,
     pub(crate) meta: serde_json::Value,
@@ -143,9 +144,8 @@ pub fn hit_test(
         [lng + tolerance, lat + tolerance]
     );
 
-    for feature in index.locate_in_envelope(&search_bounds) {
-        return Some(feature.meta.clone());
-    }
-
-    None
+    index
+        .locate_in_envelope(&search_bounds)
+        .next()
+        .map(|feature| feature.meta.clone())
 }

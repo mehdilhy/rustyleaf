@@ -4,14 +4,101 @@
 
 const wasm = require('./wasmMock.js');
 
+// ---------- WebGL detection (mirrors src/rustyleaf-api.js checkWebGLSupport) ----------
+
+function checkWebGLSupport() {
+  try {
+    const canvas = document.createElement('canvas');
+    const gl = canvas.getContext('webgl2', { preserveDrawingBuffer: true }) || canvas.getContext('webgl', { preserveDrawingBuffer: true }) || canvas.getContext('experimental-webgl', { preserveDrawingBuffer: true });
+
+    if (!gl) {
+      return {
+        supported: false,
+        level: 'none',
+        webgl2: false,
+        webgl1: false,
+        renderer: 'unknown',
+        maxTextureSize: 0,
+        extensions: [],
+        error: 'WebGL not available'
+      };
+    }
+
+    const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+    const isWebGL2 = !!canvas.getContext('webgl2', { preserveDrawingBuffer: true });
+
+    return {
+      supported: true,
+      level: isWebGL2 ? 'full' : 'limited',
+      webgl2: isWebGL2,
+      webgl1: !isWebGL2,
+      renderer: debugInfo ? gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) : 'unknown',
+      maxTextureSize: gl.getParameter(gl.MAX_TEXTURE_SIZE),
+      extensions: gl.getSupportedExtensions() || [],
+      error: null
+    };
+  } catch (error) {
+    return {
+      supported: false,
+      level: 'unknown',
+      webgl2: false,
+      webgl1: false,
+      renderer: 'unknown',
+      maxTextureSize: 0,
+      extensions: [],
+      error: error.message
+    };
+  }
+}
+
+function validateLatLng(latlng) {
+  if (!Array.isArray(latlng) || latlng.length !== 2 ||
+      typeof latlng[0] !== 'number' || typeof latlng[1] !== 'number' ||
+      !isFinite(latlng[0]) || !isFinite(latlng[1])) {
+    throw new Error('Invalid center coordinates: expected [lat, lng] numbers');
+  }
+}
+
 // ---------- Map ----------
 
 class Map {
   constructor(container, options = {}) {
-    this._container = container;
+    // Resolve container (id string or element), like the real API
+    if (typeof container === 'string') {
+      this.containerElement = document.getElementById(container);
+    } else {
+      this.containerElement = container;
+    }
+    if (!this.containerElement || typeof this.containerElement.appendChild !== 'function') {
+      throw new Error('Invalid container: expected element or element id');
+    }
+
+    if (options.center !== undefined) validateLatLng(options.center);
+    if (options.zoom !== undefined && (typeof options.zoom !== 'number' || !isFinite(options.zoom))) {
+      throw new Error('Invalid zoom level: expected number');
+    }
+
+    // WebGL support gate, mirroring the real constructor
+    this.webglSupport = checkWebGLSupport();
+    if (!this.webglSupport.supported) {
+      throw new Error('WebGL not supported');
+    }
+    if (this.webglSupport.level === 'limited') {
+      console.warn('Rustyleaf: WebGL2 not available, falling back to WebGL1. Some features may be limited.');
+    }
+
+    this._container = this.containerElement;
     this._options = options;
-    this._canvas = typeof document !== 'undefined' ? document.createElement('canvas') : null;
-    this._canvasId = 'rustyleaf-map-canvas';
+    const rect = this.containerElement.getBoundingClientRect();
+    this.width = Math.round(rect.width) || 800;
+    this.height = Math.round(rect.height) || 600;
+    this.canvas = document.createElement('canvas');
+    this.canvas.id = 'rustyleaf-map-canvas';
+    this.canvas.width = this.width;
+    this.canvas.height = this.height;
+    this.containerElement.appendChild(this.canvas);
+    this._canvas = this.canvas;
+    this._canvasId = this.canvas.id;
     this._pointLayers = [];
     this._lineLayers = [];
     this._polygonLayers = [];
@@ -25,7 +112,12 @@ class Map {
     this.wasmMap.set_view(this._center[0], this._center[1], this._zoom);
   }
 
-  setView(latlng, zoom) { this._center = latlng; this._zoom = zoom; this.wasmMap.set_view(latlng[0], latlng[1], zoom); return this; }
+  setView(latlng, zoom) {
+    validateLatLng(latlng);
+    this._center = latlng; this._zoom = zoom;
+    this.wasmMap.set_view(latlng[0], latlng[1], zoom);
+    return this;
+  }
   getCenter() { return this._center; }
   getZoom() { return this._zoom; }
   zoomIn() { this._zoom = Math.min(18, this._zoom + 1); this.wasmMap.zoom_in(); return this; }
@@ -35,10 +127,32 @@ class Map {
   fitBounds(bounds) { return this; }
   setMinZoom(minZoom) { this.wasmMap.set_min_zoom(minZoom); return this; }
   setMaxZoom(maxZoom) { this.wasmMap.set_max_zoom(maxZoom); return this; }
-  project(latlng) { return { x: 0, y: 0 }; }
-  unproject(point) { return [48.85, 2.35]; }
-  getWebGLSupport() { return { supported: true, level: 'full', webgl2: true }; }
+  project(latlng) {
+    // Web Mercator world-pixel projection at the current zoom
+    const scale = 256 * Math.pow(2, this._zoom);
+    const clampedLat = Math.max(-85.05112878, Math.min(85.05112878, latlng[0]));
+    const x = (latlng[1] + 180) / 360 * scale;
+    const latRad = clampedLat * Math.PI / 180;
+    const y = (1 - Math.log(Math.tan(Math.PI / 4 + latRad / 2)) / Math.PI) / 2 * scale;
+    return { x: x, y: y };
+  }
+  unproject(point) {
+    const scale = 256 * Math.pow(2, this._zoom);
+    const lng = point.x / scale * 360 - 180;
+    const n = Math.PI * (1 - 2 * point.y / scale);
+    const lat = 180 / Math.PI * Math.atan(Math.sinh(n));
+    return [lat, lng];
+  }
+  getWebGLSupport() { return this.webglSupport; }
   resize(w, h) { if (this.wasmMap) this.wasmMap.resize(w, h); }
+  _handleResize() {
+    const rect = this.containerElement.getBoundingClientRect();
+    this.width = Math.round(rect.width) || this.width;
+    this.height = Math.round(rect.height) || this.height;
+    this.canvas.width = this.width;
+    this.canvas.height = this.height;
+    this.resize(this.width, this.height);
+  }
   remove() { return this; }
   destroy() { return this.remove(); }
 
@@ -59,9 +173,7 @@ class Map {
   }
 }
 
-Map.checkWebGLSupport = function() {
-  return { supported: true, level: 'full', webgl2: true };
-};
+Map.checkWebGLSupport = checkWebGLSupport;
 
 // ---------- TileLayer ----------
 
@@ -80,7 +192,9 @@ class TileLayer {
 class PointLayer {
   constructor(options) {
     this._options = options || {};
-    this.wasmPointLayer = new wasm.PointLayerApi();
+    // Tests can override the WASM constructor via global.WasmPointLayer
+    var Ctor = (typeof global !== 'undefined' && global.WasmPointLayer) ? global.WasmPointLayer : wasm.PointLayerApi;
+    this.wasmPointLayer = new Ctor();
     this.points = [];
   }
   add(points) {
@@ -94,7 +208,8 @@ class PointLayer {
         meta: p.meta || null
       };
     });
-    try { this.wasmPointLayer.add(pointsData); } catch (e) {}
+    // Errors from the WASM layer propagate to the caller, like the real API
+    this.wasmPointLayer.add(pointsData);
     self.points.push.apply(self.points, points);
     return this;
   }
@@ -747,5 +862,6 @@ class Popup {
 
 module.exports = {
   Map: Map, TileLayer: TileLayer, PointLayer: PointLayer, LineLayer: LineLayer,
-  PolygonLayer: PolygonLayer, GeoJSONLayer: GeoJSONLayer, Popup: Popup
+  PolygonLayer: PolygonLayer, GeoJSONLayer: GeoJSONLayer, Popup: Popup,
+  checkWebGLSupport: checkWebGLSupport
 };

@@ -28,15 +28,25 @@ void main() {
 }
 "#;
 
+// a_position holds zoom-independent normalized Web-Mercator coords in [0,1],
+// uploaded to the GPU once. The shader converts them to screen pixels every
+// frame using u_world_scale (tile_size * 2^zoom) and u_origin (viewport top-left
+// in world pixels), so panning/zooming touches no vertex data on the CPU.
+// The GeoJSON point path reuses this program with u_world_scale=1 / u_origin=0
+// and uploads screen-space coords directly.
 pub(crate) const POINT_VERTEX_SHADER: &str = r#"
 attribute vec2 a_position;
 attribute float a_size;
 attribute vec4 a_color;
 uniform mat4 u_matrix;
+uniform float u_world_scale;
+uniform vec2 u_origin;
 varying vec4 v_color;
 
 void main() {
-    gl_Position = u_matrix * vec4(a_position, 0.0, 1.0);
+    vec2 pixel_pos = a_position * u_world_scale;
+    vec2 screen_pos = pixel_pos - u_origin;
+    gl_Position = u_matrix * vec4(screen_pos, 0.0, 1.0);
     gl_PointSize = a_size;
     v_color = a_color;
 }
@@ -146,32 +156,6 @@ pub(crate) fn create_shader(
     }
 
     Ok(shader)
-}
-
-pub(crate) fn create_program(
-    context: &WebGl2RenderingContext,
-    vertex_shader: &WebGlShader,
-    fragment_shader: &WebGlShader,
-) -> Result<WebGlProgram, JsValue> {
-    let program = context
-        .create_program()
-        .ok_or_else(|| RustyleafError::ProgramCreation("Failed to create program".into()))?;
-    context.attach_shader(&program, vertex_shader);
-    context.attach_shader(&program, fragment_shader);
-    context.link_program(&program);
-
-    if !context
-        .get_program_parameter(&program, WebGl2RenderingContext::LINK_STATUS)
-        .as_bool()
-        .unwrap_or(false)
-    {
-        let info = context
-            .get_program_info_log(&program)
-            .unwrap_or_else(|| "Unknown error".to_string());
-        return Err(RustyleafError::ShaderLink(info).into());
-    }
-
-    Ok(program)
 }
 
 pub(crate) fn create_program_with_bindings(

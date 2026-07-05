@@ -34,8 +34,10 @@
             zoom: 8
         });
 
-        // Add tile layer
-        const tiles = new TileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png');
+        // Add tile layer (OSM tile usage policy requires attribution)
+        const tiles = new TileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        });
         tiles.addTo(map);
 
         // Create GeoJSONLayer - use more visible colors

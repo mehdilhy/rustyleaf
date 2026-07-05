@@ -127,9 +127,10 @@ describe('GeoJSONLayer', () => {
       const geojsonString = '{"type":"FeatureCollection","features":[]}';
       
       const result = geojsonLayer.loadData(geojsonString);
-      
+
       expect(result).toBe(geojsonLayer);
-      expect(geojsonLayer.geojson).toBe(geojsonString);
+      // String input is normalized to a parsed object (the string goes to WASM)
+      expect(geojsonLayer.geojson).toEqual(JSON.parse(geojsonString));
     });
 
     test('should replace existing GeoJSON data', () => {
@@ -582,10 +583,11 @@ describe('GeoJSONLayer', () => {
       };
       
       const result = geojsonLayer.addTo(mockMap as any);
-      
+
       expect(result).toBe(geojsonLayer);
       expect(geojsonLayer.map).toBe(mockMap);
-      expect(geojsonLayer.layerIndex).toBe(1);
+      // Indices are tracked per-map by the JS API (WASM add_geojson_layer returns void)
+      expect(geojsonLayer.layerIndex).toBe(0);
       expect(mockMap.wasmMap.add_geojson_layer).toHaveBeenCalled();
       expect(mockMap.wasmMap.load_geojson).not.toHaveBeenCalled();
     });
