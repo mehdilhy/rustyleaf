@@ -36,24 +36,46 @@ out of memory in the test environment). Numbers are hardware-specific — run th
 benchmark yourself. This measures point-rendering throughput only, not features
 or ecosystem, where Leaflet and MapLibre are far more mature.
 
+Point layers also cap total per-frame fragment work: zoomed far enough out
+that a layer's on-screen footprint collapses (e.g. panning a 1M-point dataset
+out to a world view), only a bounded, deterministically-shuffled sample of
+the *unmodified* vertex buffer is drawn — a fair subset, not a truncation —
+so overlapping blended points can't serialize the GPU into single digits of
+fps. At full-viewport coverage the budget exceeds the point count and every
+point draws.
+
+Raster tile layers wrap horizontally at the antimeridian (the world repeats,
+Leaflet-style) instead of showing empty gray past ±180°.
+
 ## What works today
 
-- XYZ raster tiles (OpenStreetMap-compatible URL templates, subdomain rotation, tile cache with eviction)
-- Point, line, and polygon layers with per-feature color/size/metadata
-- GeoJSON layer: load from object, string, URL, `File`, or streamed chunks; styling options; GPU-cached geometry
-- Pan, scroll-zoom, momentum ("kinetic") dragging
+- XYZ raster tiles (OpenStreetMap-compatible URL templates, subdomain rotation, tile cache with eviction), **WMS layers** (`WMSTileLayer`, per-tile EPSG:3857 bbox computed in the Rust core), and a programmable **`GridLayer`** (DOM tiles via `createTile`)
+- Point, line, and polygon layers with per-feature color/size/metadata; **line width is honored** (segments are expanded into screen-space quads on the GPU)
+- **Markers rendered on the GPU** — `Marker` with `Icon` / `DivIcon`, popups & tooltips, draggable flag, opacity/z-index, Leaflet-style events (`click`, `mouseover`, `mouseout`, `dragstart`/`drag`/`dragend`). Markers are drawn as GPU sprites inside the Rust/WASM core, not DOM overlays, so they scale like the rest of rustyleaf's layers.
+- GeoJSON layer: load from object, string, URL, `File`, or streamed chunks; styling options; GPU-cached geometry; Leaflet-style `filter` / `pointToLayer` / `onEachFeature` (with per-feature popups and click/hover handlers)
+- Pan, scroll-zoom, momentum ("kinetic") dragging, **box zoom** (shift-drag), **keyboard navigation** (arrows pan, +/- zoom), and **touch gestures** (one-finger pan with momentum, two-finger pinch zoom)
 - Click / hover hit-testing via an R-tree spatial index (rebuilt only when data changes)
-- Leaflet-style events: `move`, `zoom`, `click`, `hover`, `mousedown`, `mouseup`, `contextmenu`, `dragend`, `keydown`, `keyup`
-- HTML popups with auto-pan
+- Leaflet-style events: `move(start/end)`, `zoom(start/end)`, `click`/`hover` (with hit-tested `feature` payloads), `dragstart`/`drag`/`dragend`, `layeradd`/`layerremove`, `popupopen/close`, `tooltipopen/close`, `boxzoomend`, `resize`, `load`, `locationfound`/`locationerror`, plus raw `mousedown`/`mouseup`/`contextmenu`/`keydown`/`keyup`
+- HTML popups with auto-pan, plus lightweight **Tooltip** overlays (bound to markers/layers)
+- **Vector shapes** — `Circle` (geodesic radius in meters), `CircleMarker` (pixel radius, drawn as a GPU point), `Rectangle` (from bounds)
+- **Layer grouping** — `LayerGroup` (bulk add/remove) and `FeatureGroup` (union `getBounds`, events delegated to children); `map.addLayer/removeLayer/hasLayer`
+- **Ground overlays** — `ImageOverlay`, `VideoOverlay`, `SVGOverlay` pinned to bounds and repositioned every frame
+- **Plugin surface** — `Handler` base class with `map.addHandler(name, HandlerClass)`, plus `Util` helpers (`stamp`, `template`, `throttle`, `wrapNum`, ...)
+- **UI controls** — `Control` base with `ZoomControl` (zoom in/out buttons), `AttributionControl` (prefix + attributions), `ScaleControl` (metric/imperial scale bar), `LayersControl` (overlay checkboxes + base-layer radios), added via `map.addControl(...)` or `control.addTo(map)`
+- **Map navigation** — animated `flyTo`/`flyToBounds`, `setMaxBounds` (centers clamp on `setView`), `invalidateSize`, `locate()` geolocation with `locationfound`/`locationerror` events
 - TypeScript definitions matching the actual runtime API
 - RAII-managed WebGL resources (textures, buffers, VAOs, programs are freed deterministically; verified by GL leak-detection e2e tests)
 
 ## Known limitations (v0.0.1)
 
 - **WebGL2 required.** No Canvas2D or WebGL1 rendering fallback (detection exists; rendering does not).
-- Line width is stored but not applied (WebGL2 `lineWidth` is effectively 1.0; triangle-based thick lines are on the [roadmap](ROADMAP.md)).
-- No touch/mobile gesture support yet.
-- No plugin system, no marker icons, no vector tiles.
+- **Spherical Mercator only** — no custom CRS (EPSG:4326/3395, `SimpleCRS`).
+- Line width applies to `LineLayer`; GeoJSON-styled lines still render 1px.
+- No vector tiles. Touch support covers pan + pinch (no tap-hold or double-tap zoom yet).
+- Polygon *interiors* aren't hit-testable in GeoJSON layers yet — only their outline (triangulated fill geometry has no per-feature metadata attached). `PointLayer`/`LineLayer`/`PolygonLayer` (non-GeoJSON) hit-test normally.
+- Line/polygon vertex data is rebuilt on the CPU every frame (unlike points, which are GPU-resident); heavy combined scenes (thousands of lines/polygons alongside a large point layer) cost more than points alone. GPU-resident lines/polygons are on the [roadmap](ROADMAP.md).
+- Calling map methods synchronously inside a raw wasm event callback (`move`, `zoom`, `click`, ...) throws a re-entrancy error — defer with `queueMicrotask` (the built-in layers already do).
+- Layer `remove()` hides the layer (and `addTo` re-shows it); GPU memory is only freed on `map.destroy()`.
 - The streaming GeoJSON parser is regex-assisted and can misbehave on exotic input.
 - API is unstable until 0.1.0.
 
@@ -132,7 +154,12 @@ The full, accurate surface lives in [`types/rustyleaf.d.ts`](types/rustyleaf.d.t
 | `LineLayer` | Polylines | `add(lines)`, `clear`, `on(...)` |
 | `PolygonLayer` | Filled polygons | `add(polygons)`, `clear`, `on(...)` |
 | `GeoJSONLayer` | GeoJSON with streaming | `loadData`, `loadFromUrl`, `loadFile`, `setStyle`, `getBounds` |
+| `Marker` | GPU sprite markers | `setLatLng`, `setIcon`, `bindPopup`, `bindTooltip`, `on(...)` |
+| `Circle` / `CircleMarker` / `Rectangle` | Vector shapes | `setLatLng`/`setBounds`, `setRadius`, `getBounds`, `addTo` |
+| `LayerGroup` / `FeatureGroup` | Layer grouping | `addLayer`, `removeLayer`, `eachLayer`, `getBounds` |
+| `Control` (+ Zoom/Attribution/Scale/Layers) | UI controls | `addTo`, `setPosition`, `addOverlay`/`addBaseLayer` |
 | `Popup` | HTML popups | `setLatLng`, `setContent`, `openOn`, `close` |
+| `Tooltip` | Hover overlays | `setContent`, `setLatLng`, `openOn`, `close` |
 
 ## Development
 
@@ -146,16 +173,16 @@ cargo install wasm-pack
 npm install
 
 npm run build        # wasm-pack + webpack production build
-npm test             # Jest unit tests (251 tests)
+npm test             # Jest unit tests (405 tests)
 npm run lint         # ESLint
 npm run typecheck    # tsc --noEmit
 cargo clippy --manifest-path core/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
 
 npm run setup:e2e    # one-time: install Playwright Chromium
-npm run test:e2e     # visual regression, GL leak detection, memory soak, FPS
+npm run test:e2e     # visual regression, GL leak detection, memory soak, FPS, kitchen sink
 ```
 
-The e2e suite is the interesting part: screenshot-based visual regression, WebGL resource-leak detection, multi-instance isolation, idle-CPU checks, and a memory soak test all run in CI.
+The e2e suite is the interesting part: screenshot-based visual regression, WebGL resource-leak detection, multi-instance isolation, idle-CPU checks, a memory soak test, and a kitchen-sink stress test (`e2e/tests/kitchen-sink.spec.ts`) that puts every public feature — markers, shapes, groups, controls, overlays, WMS/grid tiles, GeoJSON with `onEachFeature`, keyboard/touch/box-zoom input, and a 1,000,000-point layer — on one map and asserts both correctness and fps under combined load, all run in CI.
 
 ## Contributing
 

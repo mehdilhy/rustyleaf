@@ -19,7 +19,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "npm run build:wasm && webpack --mode production",
+    "build": "npm run clean && npm run build:wasm && webpack --mode production",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
     "dev": "npm run build:wasm && webpack --mode development --watch",
     "build:wasm": "cd core && wasm-pack build --target bundler --release --out-dir ../dist",
     "prepublishOnly": "npm run build",
