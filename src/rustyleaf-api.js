@@ -120,9 +120,12 @@ class Map {
     this.width = rect.width;
     this.height = rect.height;
 
-    // Create canvas element
+    // Create canvas element. The id must be unique per instance: the WASM
+    // core looks the canvas up by id, so a shared id makes every map render
+    // into the first canvas in the document.
     this.canvas = document.createElement('canvas');
-    this.canvas.id = 'rustyleaf-map-canvas';
+    Map._instanceCounter = (Map._instanceCounter || 0) + 1;
+    this.canvas.id = `rustyleaf-map-canvas-${Map._instanceCounter}`;
     this.canvas.width = this.width;
     this.canvas.height = this.height;
     this.canvas.style.width = '100%';
@@ -214,11 +217,88 @@ class Map {
     // Set up event handlers
     this._setupEventHandlers();
 
+    // Derived Leaflet-style events (movestart/moveend, zoomstart/zoomend)
+    this._setupDerivedEvents();
+
     // Start render loop
     this._startRenderLoop();
 
     // Track GeoJSON layer indices locally since WASM add_geojson_layer doesn't return an index
     this._geojsonLayerCount = 0;
+
+    // DOM-overlay UI controls (zoom/attribution/scale/etc.)
+    this._controls = [];
+
+    // Layers currently attached to this map (drives layeradd/layerremove)
+    this._attachedLayers = new Set();
+
+    // Constructor options, kept for handlers/plugins (map.addHandler)
+    this.options = options;
+  }
+
+  // Leaflet-style plugin hook: instantiates HandlerClass(map), exposes it as
+  // map[name], and enables it when the constructor option of the same name
+  // is truthy.
+  addHandler(name, HandlerClass) {
+    const handler = new HandlerClass(this);
+    this[name] = handler;
+    if (this.options && this.options[name]) handler.enable();
+    return this;
+  }
+
+  // Synthesize movestart/moveend and zoomstart/zoomend around the core's
+  // continuous move/zoom streams: the first event in a burst fires *start,
+  // and *end fires once the stream has been quiet for 150ms.
+  _setupDerivedEvents() {
+    const burst = (startEvent, endEvent) => {
+      let active = false;
+      let timer = null;
+      return (e) => {
+        if (!active) {
+          active = true;
+          deferCallback(() => this._fireLocalEvent(startEvent, e));
+        }
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          active = false;
+          this._fireLocalEvent(endEvent, e);
+        }, 150);
+      };
+    };
+    this.wasmMap.on_move(burst('movestart', 'moveend'));
+    this.wasmMap.on_zoom(burst('zoomstart', 'zoomend'));
+  }
+
+  // ---- Leaflet-style layer management (fires layeradd/layerremove) ----
+
+  addLayer(layer) {
+    layer.addTo(this);
+    return this;
+  }
+
+  removeLayer(layer) {
+    layer.remove();
+    return this;
+  }
+
+  hasLayer(layer) {
+    return !!(this._attachedLayers && this._attachedLayers.has(layer));
+  }
+
+  // Called by layers from addTo/remove. Deduplicated, so re-showing an
+  // already-attached layer does not re-fire layeradd.
+  _notifyLayerAdd(layer) {
+    if (!this._attachedLayers) this._attachedLayers = new Set();
+    if (!this._attachedLayers.has(layer)) {
+      this._attachedLayers.add(layer);
+      this._fireLocalEvent('layeradd', { type: 'layeradd', layer });
+    }
+  }
+
+  _notifyLayerRemove(layer) {
+    if (this._attachedLayers && this._attachedLayers.delete(layer)) {
+      this._fireLocalEvent('layerremove', { type: 'layerremove', layer });
+    }
   }
 
   setView(latlng, zoom) {
@@ -236,6 +316,7 @@ class Map {
       throw new Error('Invalid zoom level: must be a number between 0 and 24');
     }
 
+    latlng = this._clampToMaxBounds(latlng);
     this.wasmMap.set_view(latlng[0], latlng[1], zoom);
     return this;
   }
@@ -296,7 +377,114 @@ class Map {
     this.wasmMap.fit_bounds(flatBounds);
     return this;
   }
-  
+
+  // Animated pan+zoom to a target view (Leaflet-style flyTo).
+  flyTo(latlng, options = {}) {
+    const duration = options.duration !== undefined ? options.duration : 400;
+    const from = this.getCenter();
+    const fromZoom = this.getZoom();
+    const targetZoom = options.zoom !== undefined ? options.zoom : fromZoom;
+    if (this._flyTimer) {
+      clearInterval(this._flyTimer);
+      this._flyTimer = null;
+    }
+    if (duration <= 0) return this.setView(latlng, targetZoom);
+    const start = Date.now();
+    this._flyTimer = setInterval(() => {
+      const t = Math.min(1, (Date.now() - start) / duration);
+      const ease = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+      this.setView(
+        [from[0] + (latlng[0] - from[0]) * ease, from[1] + (latlng[1] - from[1]) * ease],
+        fromZoom + (targetZoom - fromZoom) * ease
+      );
+      if (t >= 1) {
+        clearInterval(this._flyTimer);
+        this._flyTimer = null;
+      }
+    }, 16);
+    return this;
+  }
+
+  flyToBounds(bounds, options) {
+    this.fitBounds(bounds);
+    return this;
+  }
+
+  setMaxBounds(bounds) {
+    this._maxBounds = bounds || null;
+    if (this._maxBounds) this.setView(this.getCenter(), this.getZoom());
+    return this;
+  }
+
+  getMaxBounds() {
+    return this._maxBounds || null;
+  }
+
+  _clampToMaxBounds(latlng) {
+    if (!this._maxBounds) return latlng;
+    const sw = this._maxBounds[0], ne = this._maxBounds[1];
+    const minLat = Math.min(sw[0], ne[0]), maxLat = Math.max(sw[0], ne[0]);
+    const minLng = Math.min(sw[1], ne[1]), maxLng = Math.max(sw[1], ne[1]);
+    return [
+      Math.min(Math.max(latlng[0], minLat), maxLat),
+      Math.min(Math.max(latlng[1], minLng), maxLng)
+    ];
+  }
+
+  // Re-read the container size and resize the WASM viewport (Leaflet-style invalidateSize).
+  invalidateSize() {
+    this._handleResize();
+    return this;
+  }
+
+  // Browser geolocation. Fires 'locationfound' / 'locationerror' (registered via map.on).
+  locate(options = {}) {
+    const geo = (typeof navigator !== 'undefined' && navigator.geolocation) ? navigator.geolocation : null;
+    if (!geo) {
+      this._fireLocalEvent('locationerror', { code: 0, message: 'Geolocation is not available' });
+      return this;
+    }
+    const onSuccess = (pos) => {
+      const latlng = [pos.coords.latitude, pos.coords.longitude];
+      if (options.setView) {
+        const zoom = options.maxZoom !== undefined ? Math.min(this.getZoom(), options.maxZoom) : this.getZoom();
+        this.setView(latlng, zoom);
+      }
+      this._fireLocalEvent('locationfound', { latlng, accuracy: pos.coords.accuracy });
+    };
+    const onError = (err) => {
+      this._fireLocalEvent('locationerror', { code: err.code, message: err.message });
+    };
+    const geoOptions = {
+      enableHighAccuracy: !!options.enableHighAccuracy,
+      timeout: options.timeout !== undefined ? options.timeout : 10000,
+      maximumAge: options.maximumAge || 0
+    };
+    if (options.watch) this._locateWatchId = geo.watchPosition(onSuccess, onError, geoOptions);
+    else geo.getCurrentPosition(onSuccess, onError, geoOptions);
+    return this;
+  }
+
+  stopLocate() {
+    if (this._locateWatchId !== undefined && this._locateWatchId !== null) {
+      const geo = (typeof navigator !== 'undefined' && navigator.geolocation) ? navigator.geolocation : null;
+      if (geo) geo.clearWatch(this._locateWatchId);
+      this._locateWatchId = null;
+    }
+    return this;
+  }
+
+  _fireLocalEvent(event, data) {
+    const handlers = (this._localEvents && this._localEvents[event]) || [];
+    for (const handler of handlers) {
+      try {
+        handler(data);
+      } catch (e) {
+        console.error(`Rustyleaf: error in '${event}' handler:`, e);
+      }
+    }
+  }
+
   project(latlng) {
     const point = this.wasmMap.project(latlng);
     return [point[0], point[1]];
@@ -324,6 +512,10 @@ class Map {
     const wasmMethod = eventMap[event];
     if (wasmMethod) {
       this.wasmMap[wasmMethod](callback);
+    } else {
+      // JS-side events (e.g. 'locationfound', 'locationerror') not handled by the WASM core
+      this._localEvents = this._localEvents || {};
+      (this._localEvents[event] = this._localEvents[event] || []).push(callback);
     }
     return this;
   }
@@ -345,10 +537,12 @@ class Map {
     const wasmMethod = eventMap[event];
     if (wasmMethod) {
       this.wasmMap[wasmMethod](callback);
+    } else if (this._localEvents && this._localEvents[event]) {
+      this._localEvents[event] = this._localEvents[event].filter((cb) => cb !== callback);
     }
     return this;
   }
-  
+
   _setupEventHandlers() {
     let isDragging = false;
     let dragStartX, dragStartY;
@@ -368,6 +562,8 @@ class Map {
     // Add global mouse event listeners for better drag handling
     const handleGlobalMouseMove = (e) => {
       if (isDragging) {
+        if (!hasDragged) this._fireLocalEvent('dragstart', { type: 'dragstart' });
+        else this._fireLocalEvent('drag', { type: 'drag' });
         hasDragged = true;
         // Convert screen coordinates to canvas coordinates (accounting for scaling)
         const rect = this.canvas.getBoundingClientRect();
@@ -400,6 +596,11 @@ class Map {
     };
 
     this.canvas.addEventListener('mousedown', (e) => {
+      if (e.button === 0 && e.shiftKey) { // Shift-drag = box zoom
+        e.preventDefault();
+        this._startBoxZoom(e);
+        return;
+      }
       if (e.button === 0) { // Left mouse button only
         isDragging = true;
         hasDragged = false;
@@ -435,6 +636,21 @@ class Map {
       }
     });
 
+    // Hover hit-testing (throttled to one hit-test per frame)
+    let hoverPending = false;
+    this.canvas.addEventListener('mousemove', (e) => {
+      if (isDragging || hoverPending || !this.wasmMap.handle_mouse_hover) return;
+      hoverPending = true;
+      requestAnimationFrame(() => {
+        hoverPending = false;
+        if (isDragging || this._destroyed) return;
+        const rect = this.canvas.getBoundingClientRect();
+        const scaleX = this.canvas.width / rect.width;
+        const scaleY = this.canvas.height / rect.height;
+        this.wasmMap.handle_mouse_hover((e.clientX - rect.left) * scaleX, (e.clientY - rect.top) * scaleY);
+      });
+    });
+
     this.canvas.addEventListener('wheel', (e) => {
       e.preventDefault();
       this.wasmMap.on_wheel(e.deltaY, e.clientX, e.clientY);
@@ -449,6 +665,139 @@ class Map {
       this._handleResize();
     };
     window.addEventListener('resize', this._resizeHandler);
+
+    this._setupKeyboardHandlers();
+    this._setupTouchHandlers();
+  }
+
+  // Arrow keys pan, +/- zoom (canvas is focusable; click it first)
+  _setupKeyboardHandlers() {
+    this.canvas.tabIndex = 0;
+    this.canvas.style.outline = 'none';
+    const PAN_PX = 60;
+    this.canvas.addEventListener('keydown', (e) => {
+      switch (e.key) {
+      case 'ArrowUp': this.panBy(0, -PAN_PX); break;
+      case 'ArrowDown': this.panBy(0, PAN_PX); break;
+      case 'ArrowLeft': this.panBy(-PAN_PX, 0); break;
+      case 'ArrowRight': this.panBy(PAN_PX, 0); break;
+      case '+': case '=': this.zoomIn(); break;
+      case '-': case '_': this.zoomOut(); break;
+      default: return;
+      }
+      e.preventDefault();
+    });
+  }
+
+  // One-finger pan reuses the wasm mouse-drag pipeline (incl. momentum);
+  // two-finger pinch reuses the wheel-zoom pipeline anchored at the midpoint.
+  _setupTouchHandlers() {
+    let touchMode = null; // 'pan' | 'pinch'
+    let lastDist = 0;
+
+    const canvasPoint = (t) => {
+      const rect = this.canvas.getBoundingClientRect();
+      const scaleX = this.canvas.width / rect.width;
+      const scaleY = this.canvas.height / rect.height;
+      return [(t.clientX - rect.left) * scaleX, (t.clientY - rect.top) * scaleY];
+    };
+    const dist = (a, b) => Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+
+    this.canvas.addEventListener('touchstart', (e) => {
+      e.preventDefault();
+      if (e.touches.length === 1) {
+        touchMode = 'pan';
+        const [x, y] = canvasPoint(e.touches[0]);
+        this.wasmMap.handle_mouse_down(x, y);
+      } else if (e.touches.length === 2) {
+        if (touchMode === 'pan') {
+          const [x, y] = canvasPoint(e.touches[0]);
+          this.wasmMap.handle_mouse_up(x, y);
+        }
+        touchMode = 'pinch';
+        lastDist = dist(e.touches[0], e.touches[1]);
+      }
+    }, { passive: false });
+
+    this.canvas.addEventListener('touchmove', (e) => {
+      e.preventDefault();
+      if (touchMode === 'pan' && e.touches.length === 1) {
+        const [x, y] = canvasPoint(e.touches[0]);
+        this.wasmMap.on_mouse_move(x, y);
+      } else if (touchMode === 'pinch' && e.touches.length === 2) {
+        const d = dist(e.touches[0], e.touches[1]);
+        if (lastDist > 0 && d > 0) {
+          // Map the scale ratio onto the wheel-zoom pipeline: spread = zoom in
+          const deltaY = -(d / lastDist - 1) * 600;
+          const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+          const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+          this.wasmMap.on_wheel(deltaY, midX, midY);
+        }
+        lastDist = d;
+      }
+    }, { passive: false });
+
+    const endTouch = (e) => {
+      e.preventDefault();
+      if (touchMode === 'pan' && e.changedTouches.length > 0) {
+        const [x, y] = canvasPoint(e.changedTouches[0]);
+        this.wasmMap.handle_mouse_up(x, y);
+      }
+      if (e.touches.length === 0) touchMode = null;
+      else if (e.touches.length === 1) {
+        // dropped from pinch back to one finger — restart pan
+        touchMode = 'pan';
+        const [x, y] = canvasPoint(e.touches[0]);
+        this.wasmMap.handle_mouse_down(x, y);
+      }
+    };
+    this.canvas.addEventListener('touchend', endTouch, { passive: false });
+    this.canvas.addEventListener('touchcancel', endTouch, { passive: false });
+  }
+
+  // Shift-drag rectangle → fitBounds (Leaflet box zoom)
+  _startBoxZoom(e) {
+    const startX = e.clientX;
+    const startY = e.clientY;
+    if (window.getComputedStyle(this.containerElement).position === 'static') {
+      this.containerElement.style.position = 'relative';
+    }
+    const box = document.createElement('div');
+    box.className = 'rustyleaf-boxzoom';
+    Object.assign(box.style, {
+      position: 'absolute',
+      border: '2px dashed #3388ff',
+      background: 'rgba(51,136,255,0.15)',
+      zIndex: '999',
+      pointerEvents: 'none',
+    });
+    this.containerElement.appendChild(box);
+    const containerRect = this.containerElement.getBoundingClientRect();
+
+    const update = (ev) => {
+      box.style.left = (Math.min(startX, ev.clientX) - containerRect.left) + 'px';
+      box.style.top = (Math.min(startY, ev.clientY) - containerRect.top) + 'px';
+      box.style.width = Math.abs(ev.clientX - startX) + 'px';
+      box.style.height = Math.abs(ev.clientY - startY) + 'px';
+    };
+    const finish = (ev) => {
+      document.removeEventListener('mousemove', update);
+      document.removeEventListener('mouseup', finish);
+      box.remove();
+      if (Math.abs(ev.clientX - startX) < 10 || Math.abs(ev.clientY - startY) < 10) return;
+      const rect = this.canvas.getBoundingClientRect();
+      const scaleX = this.canvas.width / rect.width;
+      const scaleY = this.canvas.height / rect.height;
+      const c1 = this.unproject([(startX - rect.left) * scaleX, (startY - rect.top) * scaleY]);
+      const c2 = this.unproject([(ev.clientX - rect.left) * scaleX, (ev.clientY - rect.top) * scaleY]);
+      this.fitBounds([
+        [Math.min(c1[0], c2[0]), Math.min(c1[1], c2[1])],
+        [Math.max(c1[0], c2[0]), Math.max(c1[1], c2[1])],
+      ]);
+      this._fireLocalEvent('boxzoomend', { type: 'boxzoomend' });
+    };
+    document.addEventListener('mousemove', update);
+    document.addEventListener('mouseup', finish);
   }
 
   _handleResize() {
@@ -458,6 +807,7 @@ class Map {
     this.canvas.width = this.width;
     this.canvas.height = this.height;
     this.wasmMap.resize(this.width, this.height);
+    this._fireLocalEvent('resize', { type: 'resize', newSize: [this.width, this.height] });
   }
 
   _startRenderLoop() {
@@ -465,9 +815,14 @@ class Map {
     const render = () => {
       if (this._destroyed || this._needsRestore) return;
       this.wasmMap.render(this.canvas.id);
+      if (!this._loadFired) {
+        this._loadFired = true;
+        this._fireLocalEvent('load', { type: 'load', target: this });
+      }
       this._rafId = requestAnimationFrame(render);
     };
-    render();
+    // First frame via rAF so same-tick 'load' listeners are registered in time
+    this._rafId = requestAnimationFrame(render);
   }
 
   _stopRenderLoop() {
@@ -507,6 +862,21 @@ class Map {
   destroy() {
     return this.remove();
   }
+
+  // --- Control registry ---
+
+  addControl(control) {
+    if (!this._controls) this._controls = [];
+    this._controls.push(control);
+    return control.addTo(this);
+  }
+
+  removeControl(control) {
+    if (this._controls) {
+      this._controls = this._controls.filter((c) => c !== control);
+    }
+    return control.remove();
+  }
 }
 
 // Static method to check WebGL support before creating a map
@@ -539,11 +909,13 @@ class TileLayer {
       }
       this._attributionElement = attrib;
     }
+    this._map = map;
+    if (map._notifyLayerAdd) map._notifyLayerAdd(this);
     return this;
   }
-  
+
   remove() {
-    // Implementation for removing layer
+    if (this._map && this._map._notifyLayerRemove) this._map._notifyLayerRemove(this);
     return this;
   }
 }
@@ -594,18 +966,29 @@ class PointLayer {
   }
   
   addTo(map) {
-    const layerIndex = map.wasmMap.add_point_layer();
-    map.wasmMap.add_points(layerIndex, this.points);
+    if (this._map === map && this._layerIndex !== undefined) {
+      // Already on this map (possibly hidden by remove()) — just re-show it.
+      map.wasmMap.set_point_layer_visible(this._layerIndex, true);
+      if (map._notifyLayerAdd) map._notifyLayerAdd(this);
+      return this;
+    }
+    this._map = map;
+    this._layerIndex = map.wasmMap.add_point_layer();
+    map.wasmMap.add_points(this._layerIndex, this.points);
+    if (map._notifyLayerAdd) map._notifyLayerAdd(this);
     return this;
   }
-  
+
   remove() {
-    // Implementation for removing layer
+    if (this._map && this._layerIndex !== undefined) {
+      this._map.wasmMap.set_point_layer_visible(this._layerIndex, false);
+      if (this._map._notifyLayerRemove) this._map._notifyLayerRemove(this);
+    }
     return this;
   }
 }
 
-// LineLayer with Leaflet-style API  
+// LineLayer with Leaflet-style API
 class LineLayer {
   constructor() {
     this.lines = [];
@@ -644,14 +1027,23 @@ class LineLayer {
   }
   
   addTo(map) {
-    const layerIndex = map.wasmMap.add_line_layer();
-    map.wasmMap.add_lines(layerIndex, this.lines);
+    if (this.map === map && this._layerIndex !== undefined) {
+      map.wasmMap.set_line_layer_visible(this._layerIndex, true);
+      if (map._notifyLayerAdd) map._notifyLayerAdd(this);
+      return this;
+    }
     this.map = map;
+    this._layerIndex = map.wasmMap.add_line_layer();
+    map.wasmMap.add_lines(this._layerIndex, this.lines);
+    if (map._notifyLayerAdd) map._notifyLayerAdd(this);
     return this;
   }
-  
+
   remove() {
-    // Implementation for removing layer
+    if (this.map && this._layerIndex !== undefined) {
+      this.map.wasmMap.set_line_layer_visible(this._layerIndex, false);
+      if (this.map._notifyLayerRemove) this.map._notifyLayerRemove(this);
+    }
     return this;
   }
 }
@@ -722,9 +1114,11 @@ class Popup {
     this.map = map;
     this._initLayout();
     this._updateContent();
-    this._updatePosition();
-    this._handleAutoPan();
 
+    // Append before measuring position: _updatePosition/_handleAutoPan use
+    // getBoundingClientRect(), which reads all-zero on a detached element —
+    // that previously made autopan miscalculate on every open (and crash,
+    // see below) instead of only when the popup would go off-screen.
     try {
       map.containerElement.appendChild(this.element);
       this.isOpen = true;
@@ -732,18 +1126,22 @@ class Popup {
       console.warn('Popup: Failed to append popup to map container:', error);
       return this;
     }
-    
+
+    this._updatePosition();
+    this._handleAutoPan();
+
     // Add close button if enabled
     if (this.options.closeButton) {
       this._addCloseButton();
     }
-    
+
     // Add event listeners
     this._addEventListeners();
-    
+
+    if (map._fireLocalEvent) map._fireLocalEvent('popupopen', { type: 'popupopen', popup: this });
     return this;
   }
-  
+
   close() {
     if (!this.isOpen) {
       return this;
@@ -755,6 +1153,7 @@ class Popup {
     
     this._removeEventListeners();
     this.isOpen = false;
+    if (this.map && this.map._fireLocalEvent) this.map._fireLocalEvent('popupclose', { type: 'popupclose', popup: this });
     this.map = null;
     
     return this;
@@ -938,9 +1337,9 @@ class Popup {
       
       const newCenterScreen = [centerScreen[0] + deltaX, centerScreen[1] + deltaY];
       const newCenter = this.map.unproject(newCenterScreen);
-      
-      // Animate the pan
-      this.map.panTo(newCenter, { animate: true, duration: 0.25 });
+
+      // Animate the pan (Map has no panTo — flyTo at the current zoom does the same thing)
+      this.map.flyTo(newCenter, { duration: 250 });
     }
   }
   
@@ -1079,19 +1478,439 @@ class PolygonLayer {
   }
   
   addTo(map) {
-    const layerIndex = map.wasmMap.add_polygon_layer();
-    map.wasmMap.add_polygons(layerIndex, this.polygons);
+    if (this.map === map && this._layerIndex !== undefined) {
+      map.wasmMap.set_polygon_layer_visible(this._layerIndex, true);
+      if (map._notifyLayerAdd) map._notifyLayerAdd(this);
+      return this;
+    }
     this.map = map;
+    this._layerIndex = map.wasmMap.add_polygon_layer();
+    map.wasmMap.add_polygons(this._layerIndex, this.polygons);
+    if (map._notifyLayerAdd) map._notifyLayerAdd(this);
     return this;
   }
-  
+
   remove() {
-    // Implementation for removing layer
+    if (this.map && this._layerIndex !== undefined) {
+      this.map.wasmMap.set_polygon_layer_visible(this._layerIndex, false);
+      if (this.map._notifyLayerRemove) this.map._notifyLayerRemove(this);
+    }
     return this;
   }
 }
 
-// GeoJSONLayer with Leaflet-style API  
+// ---------- Vector shapes (Circle / CircleMarker / Rectangle) ----------
+
+const METERS_PER_DEG_LAT = 111320;
+
+// Base for shapes rendered through an internal point/polygon layer.
+class Shape {
+  constructor(options = {}) {
+    this.options = options;
+    this._layer = null;
+    this._pendingEvents = [];
+  }
+
+  on(event, callback) {
+    if (this._layer) this._layer.on(event, callback);
+    else this._pendingEvents.push([event, callback]);
+    return this;
+  }
+
+  remove() {
+    if (this._layer) this._layer.remove();
+    return this;
+  }
+
+  _attach(layer, map) {
+    this._layer = layer;
+    this._attachedMap = map;
+    layer.addTo(map);
+    for (const [event, callback] of this._pendingEvents) layer.on(event, callback);
+    this._pendingEvents = [];
+  }
+
+  // Re-adding to the same map re-shows the existing layer instead of
+  // duplicating the GPU data. Returns true when handled.
+  _reattached(map) {
+    if (this._layer && this._attachedMap === map) {
+      this._layer.addTo(map);
+      return true;
+    }
+    return false;
+  }
+
+  // Rebuild the underlying layer after a geometry change (setRadius,
+  // setBounds, setLatLng). The old wasm layer is hidden and a fresh one is
+  // uploaded; cheap for single shapes.
+  redraw() {
+    if (this._layer && this._attachedMap) {
+      const map = this._attachedMap;
+      this._layer.remove();
+      this._layer = null;
+      this._attachedMap = null;
+      this.addTo(map);
+    }
+    return this;
+  }
+}
+
+// Circle with a geodesic radius in meters, tessellated into a polygon ring.
+class Circle extends Shape {
+  constructor(latlng, options = {}) {
+    super(options);
+    this._latlng = [latlng[0], latlng[1]];
+    this._radius = options.radius !== undefined ? options.radius : 10;
+  }
+
+  getLatLng() { return [this._latlng[0], this._latlng[1]]; }
+  setLatLng(latlng) { this._latlng = [latlng[0], latlng[1]]; return this; }
+  getRadius() { return this._radius; }
+  setRadius(radius) { this._radius = radius; return this; }
+
+  _delta() {
+    const dLat = this._radius / METERS_PER_DEG_LAT;
+    const dLng = this._radius / (METERS_PER_DEG_LAT * Math.cos(this._latlng[0] * Math.PI / 180));
+    return [dLat, dLng];
+  }
+
+  _ring(segments = 64) {
+    const [lat, lng] = this._latlng;
+    const [dLat, dLng] = this._delta();
+    const ring = [];
+    for (let i = 0; i < segments; i++) {
+      const theta = (i / segments) * 2 * Math.PI;
+      ring.push({ lat: lat + dLat * Math.sin(theta), lng: lng + dLng * Math.cos(theta) });
+    }
+    return ring;
+  }
+
+  getBounds() {
+    const [lat, lng] = this._latlng;
+    const [dLat, dLng] = this._delta();
+    return [[lat - dLat, lng - dLng], [lat + dLat, lng + dLng]];
+  }
+
+  addTo(map) {
+    if (this._reattached(map)) return this;
+    const layer = new PolygonLayer();
+    layer.add([{
+      rings: [this._ring()],
+      color: this.options.fillColor || this.options.color || '#3388ff66',
+      meta: this.options.meta || null
+    }]);
+    this._attach(layer, map);
+    return this;
+  }
+}
+
+// Circle with a fixed screen radius in pixels, rendered as a GPU point.
+class CircleMarker extends Shape {
+  constructor(latlng, options = {}) {
+    super(options);
+    this._latlng = [latlng[0], latlng[1]];
+    this._radius = options.radius !== undefined ? options.radius : 10;
+  }
+
+  getLatLng() { return [this._latlng[0], this._latlng[1]]; }
+  setLatLng(latlng) { this._latlng = [latlng[0], latlng[1]]; return this; }
+  getRadius() { return this._radius; }
+  setRadius(radius) { this._radius = radius; return this; }
+
+  addTo(map) {
+    if (this._reattached(map)) return this;
+    const layer = new PointLayer();
+    layer.add([{
+      lat: this._latlng[0],
+      lng: this._latlng[1],
+      size: this._radius * 2,
+      color: this.options.fillColor || this.options.color || '#3388ff',
+      meta: this.options.meta || null
+    }]);
+    this._attach(layer, map);
+    return this;
+  }
+}
+
+// Axis-aligned rectangle from LatLngBounds, rendered as a polygon.
+class Rectangle extends Shape {
+  constructor(bounds, options = {}) {
+    super(options);
+    this.setBounds(bounds);
+  }
+
+  getBounds() {
+    return [[this._bounds[0][0], this._bounds[0][1]], [this._bounds[1][0], this._bounds[1][1]]];
+  }
+
+  setBounds(bounds) {
+    this._bounds = [[bounds[0][0], bounds[0][1]], [bounds[1][0], bounds[1][1]]];
+    return this;
+  }
+
+  addTo(map) {
+    if (this._reattached(map)) return this;
+    const [[south, west], [north, east]] = this._bounds;
+    const layer = new PolygonLayer();
+    layer.add([{
+      rings: [[
+        { lat: south, lng: west },
+        { lat: south, lng: east },
+        { lat: north, lng: east },
+        { lat: north, lng: west }
+      ]],
+      color: this.options.fillColor || this.options.color || '#3388ff66',
+      meta: this.options.meta || null
+    }]);
+    this._attach(layer, map);
+    return this;
+  }
+}
+
+// ---------- Layer grouping (LayerGroup / FeatureGroup) ----------
+
+class LayerGroup {
+  constructor(layers) {
+    this._layers = layers ? layers.slice() : [];
+    this._map = null;
+  }
+
+  getLayers() { return this._layers.slice(); }
+  hasLayer(layer) { return this._layers.indexOf(layer) !== -1; }
+
+  addLayer(layer) {
+    if (!this.hasLayer(layer)) {
+      this._layers.push(layer);
+      if (this._map) layer.addTo(this._map);
+    }
+    return this;
+  }
+
+  removeLayer(layer) {
+    if (this.hasLayer(layer)) {
+      this._layers = this._layers.filter((l) => l !== layer);
+      if (this._map) layer.remove();
+    }
+    return this;
+  }
+
+  clearLayers() {
+    if (this._map) {
+      for (const layer of this._layers) layer.remove();
+    }
+    this._layers = [];
+    return this;
+  }
+
+  eachLayer(fn, context) {
+    for (const layer of this._layers.slice()) fn.call(context, layer);
+    return this;
+  }
+
+  addTo(map) {
+    this._map = map;
+    for (const layer of this._layers) layer.addTo(map);
+    return this;
+  }
+
+  remove() {
+    for (const layer of this._layers) layer.remove();
+    this._map = null;
+    return this;
+  }
+}
+
+// LayerGroup with combined bounds and events delegated to every child.
+class FeatureGroup extends LayerGroup {
+  on(event, callback) {
+    for (const layer of this._layers) {
+      if (typeof layer.on === 'function') layer.on(event, callback);
+    }
+    return this;
+  }
+
+  getBounds() {
+    let out = null;
+    for (const layer of this._layers) {
+      if (typeof layer.getBounds !== 'function') continue;
+      const b = layer.getBounds();
+      if (!b) continue;
+      out = out
+        ? [
+          [Math.min(out[0][0], b[0][0]), Math.min(out[0][1], b[0][1])],
+          [Math.max(out[1][0], b[1][0]), Math.max(out[1][1], b[1][1])]
+        ]
+        : [[b[0][0], b[0][1]], [b[1][0], b[1][1]]];
+    }
+    return out;
+  }
+}
+
+// WASM event callbacks are dispatched synchronously while the Rust map is
+// mutably borrowed; calling back into the map from such a callback throws
+// ("recursive use of an object"). Defer re-entrant work to a microtask.
+function deferCallback(fn) {
+  if (typeof queueMicrotask === 'function') queueMicrotask(fn);
+  else setTimeout(fn, 0);
+}
+
+// ---------- Ground overlays (ImageOverlay / VideoOverlay / SVGOverlay) ----------
+
+// DOM element pinned to LatLngBounds, repositioned on move/zoom/resize via
+// the wasm screen_xy projection.
+class ImageOverlay {
+  constructor(url, bounds, options = {}) {
+    this._url = url;
+    this.options = options;
+    this._element = null;
+    this._map = null;
+    this._onViewChange = null;
+    this.setBounds(bounds);
+  }
+
+  getBounds() {
+    return [[this._bounds[0][0], this._bounds[0][1]], [this._bounds[1][0], this._bounds[1][1]]];
+  }
+
+  setBounds(bounds) {
+    this._bounds = [[bounds[0][0], bounds[0][1]], [bounds[1][0], bounds[1][1]]];
+    this._updatePosition();
+    return this;
+  }
+
+  setUrl(url) {
+    this._url = url;
+    if (this._element) this._element.setAttribute('src', url);
+    return this;
+  }
+
+  setOpacity(opacity) {
+    this.options.opacity = opacity;
+    if (this._element) this._element.style.opacity = String(opacity);
+    return this;
+  }
+
+  getElement() {
+    return this._element;
+  }
+
+  _createElement() {
+    const img = document.createElement('img');
+    img.className = 'rustyleaf-image-overlay';
+    img.setAttribute('src', this._url);
+    if (this.options.alt) img.alt = this.options.alt;
+    return img;
+  }
+
+  addTo(map) {
+    this._map = map;
+    if (!this._element) this._element = this._createElement();
+    const el = this._element;
+    Object.assign(el.style, {
+      position: 'absolute',
+      pointerEvents: this.options.interactive ? 'auto' : 'none',
+      zIndex: '400',
+    });
+    if (this.options.opacity !== undefined) el.style.opacity = String(this.options.opacity);
+    if (this.options.className) el.classList.add(this.options.className);
+    if (window.getComputedStyle(map.containerElement).position === 'static') {
+      map.containerElement.style.position = 'relative';
+    }
+    map.containerElement.appendChild(el);
+    this._updatePosition();
+    if (!this._onViewChange) {
+      this._onViewChange = () => deferCallback(() => this._updatePosition());
+      map.on('move', this._onViewChange);
+      map.on('zoom', this._onViewChange);
+      map.on('resize', this._onViewChange);
+    }
+    if (map._notifyLayerAdd) map._notifyLayerAdd(this);
+    return this;
+  }
+
+  _updatePosition() {
+    if (!this._map || !this._element) return;
+    const wasm = this._map.wasmMap;
+    if (!wasm || typeof wasm.screen_xy !== 'function') return;
+    const [[south, west], [north, east]] = this._bounds;
+    const nw = wasm.screen_xy(north, west);
+    const se = wasm.screen_xy(south, east);
+    if (!nw || !se) return;
+    // canvas px → CSS px (the canvas may be display-scaled)
+    const rect = this._map.canvas.getBoundingClientRect();
+    const rx = (rect.width && this._map.canvas.width) ? rect.width / this._map.canvas.width : 1;
+    const ry = (rect.height && this._map.canvas.height) ? rect.height / this._map.canvas.height : 1;
+    const px = (v) => Math.round(v * 100) / 100 + 'px';
+    this._element.style.left = px(nw[0] * rx);
+    this._element.style.top = px(nw[1] * ry);
+    this._element.style.width = px(Math.max(0, (se[0] - nw[0]) * rx));
+    this._element.style.height = px(Math.max(0, (se[1] - nw[1]) * ry));
+  }
+
+  remove() {
+    if (this._element && this._element.parentNode) {
+      this._element.parentNode.removeChild(this._element);
+    }
+    if (this._map) {
+      if (this._onViewChange) {
+        this._map.off('move', this._onViewChange);
+        this._map.off('zoom', this._onViewChange);
+        this._map.off('resize', this._onViewChange);
+        this._onViewChange = null;
+      }
+      if (this._map._notifyLayerRemove) this._map._notifyLayerRemove(this);
+    }
+    return this;
+  }
+
+  bringToFront() {
+    if (this._element && this._element.parentNode) this._element.parentNode.appendChild(this._element);
+    return this;
+  }
+
+  bringToBack() {
+    const parent = this._element && this._element.parentNode;
+    if (parent && parent.firstChild) parent.insertBefore(this._element, parent.firstChild);
+    return this;
+  }
+}
+
+class VideoOverlay extends ImageOverlay {
+  _createElement() {
+    const video = document.createElement('video');
+    video.className = 'rustyleaf-video-overlay';
+    video.src = this._url;
+    video.muted = this.options.muted !== false;
+    video.loop = this.options.loop !== false;
+    video.autoplay = this.options.autoplay !== false;
+    video.playsInline = true;
+    return video;
+  }
+
+  setUrl(url) {
+    this._url = url;
+    if (this._element) this._element.src = url;
+    return this;
+  }
+}
+
+class SVGOverlay extends ImageOverlay {
+  constructor(svgElement, bounds, options = {}) {
+    super('', bounds, options);
+    svgElement.classList.add('rustyleaf-svg-overlay');
+    this._element = svgElement;
+  }
+
+  _createElement() {
+    return this._element;
+  }
+
+  setUrl() {
+    return this;
+  }
+}
+
+// GeoJSONLayer with Leaflet-style API
 class GeoJSONLayer {
   constructor(geojson = null, options = {}) {
     this.geojson = geojson;
@@ -1106,6 +1925,128 @@ class GeoJSONLayer {
     this.map = null;
     this._pendingGeoJSONText = null;
     this._pendingTimer = null;
+    // Leaflet-style options state: filter / pointToLayer / onEachFeature
+    this._featureLayers = [];        // layers returned by pointToLayer
+    this._featureHandles = [];       // per-feature handles for onEachFeature
+    this._mountedFeatureLayerCount = 0;
+    this._optionsApplied = false;
+    this._clickDispatcherAttached = false;
+    this._openTooltip = null;
+    this._openTooltipFid = undefined;
+  }
+
+  // Apply filter / pointToLayer / onEachFeature before data reaches the wasm
+  // core. Point features consumed by pointToLayer are excluded from the wasm
+  // payload (the returned layers render them); onEachFeature features get an
+  // internal __rl_fid property so wasm hit-test events can be dispatched back
+  // to their handles. Streaming loads (loadUrlStreaming/loadFile/processChunk)
+  // bypass these options.
+  _applyFeatureOptions(geojson) {
+    const { filter, onEachFeature, pointToLayer } = this.options;
+    if (!filter && !onEachFeature && !pointToLayer) return geojson;
+    if (this._optionsApplied) return this._processedGeoJSON || geojson;
+
+    let features;
+    if (geojson && geojson.type === 'FeatureCollection') features = geojson.features || [];
+    else if (geojson && geojson.type === 'Feature') features = [geojson];
+    else if (geojson && geojson.type) features = [{ type: 'Feature', geometry: geojson, properties: {} }];
+    else features = [];
+
+    const kept = [];
+    for (const feature of features) {
+      if (filter && !filter(feature)) continue;
+      const geomType = feature.geometry && feature.geometry.type;
+      if (pointToLayer && (geomType === 'Point' || geomType === 'MultiPoint')) {
+        const coordsList = geomType === 'Point' ? [feature.geometry.coordinates] : feature.geometry.coordinates;
+        let firstLayer = null;
+        for (const c of coordsList) {
+          const layer = pointToLayer(feature, [c[1], c[0]]);
+          if (layer) {
+            this._featureLayers.push(layer);
+            if (!firstLayer) firstLayer = layer;
+          }
+        }
+        if (onEachFeature) onEachFeature(feature, firstLayer || this._makeFeatureHandle(feature));
+        continue;
+      }
+      if (onEachFeature) {
+        feature.properties = feature.properties || {};
+        feature.properties.__rl_fid = this._featureHandles.length;
+        const handle = this._makeFeatureHandle(feature);
+        this._featureHandles.push(handle);
+        onEachFeature(feature, handle);
+      }
+      kept.push(feature);
+    }
+
+    this._optionsApplied = true;
+    this._processedGeoJSON = { type: 'FeatureCollection', features: kept };
+    return this._processedGeoJSON;
+  }
+
+  _makeFeatureHandle(feature) {
+    return {
+      feature,
+      _events: {},
+      on(event, callback) {
+        (this._events[event] = this._events[event] || []).push(callback);
+        return this;
+      },
+      off(event, callback) {
+        if (this._events[event]) this._events[event] = this._events[event].filter((cb) => cb !== callback);
+        return this;
+      },
+      bindPopup(content) { this._popupContent = content; return this; },
+      bindTooltip(content) { this._tooltipContent = content; return this; },
+    };
+  }
+
+  // Add any not-yet-mounted pointToLayer layers and attach the feature-event
+  // dispatcher (wasm click/hover events carry e.feature from the hit-test).
+  _mountFeatureExtras(map) {
+    while (this._mountedFeatureLayerCount < this._featureLayers.length) {
+      this._featureLayers[this._mountedFeatureLayerCount++].addTo(map);
+    }
+    if (!this._clickDispatcherAttached && this._featureHandles.length > 0) {
+      this._clickDispatcherAttached = true;
+      map.on('click', (e) => deferCallback(() => this._dispatchFeatureEvent(e, 'click')));
+      map.on('hover', (e) => deferCallback(() => this._dispatchFeatureEvent(e, 'hover')));
+    }
+  }
+
+  _dispatchFeatureEvent(e, kind) {
+    // Hit-test meta from the wasm core is wrapped as
+    // { layer_type, layer_index, feature_index, original_meta }. Only react
+    // to hits on THIS layer (layer_index matches) — otherwise, with two+
+    // GeoJSONLayers on one map, feature ids collide and a click on layer A's
+    // feature 0 would also fire layer B's feature 0 handler.
+    const props = e && e.feature;
+    const isOwnHit = props && typeof props.layer_type === 'string' &&
+      props.layer_type.indexOf('geojson') === 0 && props.layer_index === this.layerIndex;
+    const fid = isOwnHit && props.original_meta ? props.original_meta.__rl_fid : undefined;
+    if (kind === 'hover' && this._openTooltip && fid !== this._openTooltipFid) {
+      this._openTooltip.close();
+      this._openTooltip = null;
+      this._openTooltipFid = undefined;
+    }
+    if (fid === undefined || fid === null) return;
+    const handle = this._featureHandles[fid];
+    if (!handle) return;
+    const event = Object.assign({}, e, { feature: handle.feature });
+    for (const cb of handle._events[kind] || []) {
+      try {
+        cb(event);
+      } catch (err) {
+        console.error(`Rustyleaf: error in feature '${kind}' handler:`, err);
+      }
+    }
+    if (kind === 'click' && handle._popupContent) {
+      new Popup().setLatLng(e.latlng).setContent(handle._popupContent).setSource(this).openOn(this.map);
+    }
+    if (kind === 'hover' && handle._tooltipContent && !this._openTooltip) {
+      this._openTooltip = new Tooltip({ content: handle._tooltipContent }).setLatLng(e.latlng).openOn(this.map);
+      this._openTooltipFid = fid;
+    }
   }
 
   // Load GeoJSON data
@@ -1138,6 +2079,19 @@ class GeoJSONLayer {
 
     this.geojson = jsonObject;
     this.dataLoaded = true; // Mark as loaded
+
+    // Apply filter / pointToLayer / onEachFeature before handing to WASM
+    if (jsonObject) {
+      const processed = this._applyFeatureOptions(jsonObject);
+      if (processed !== jsonObject) {
+        try {
+          jsonText = JSON.stringify(processed);
+        } catch (e) {
+          jsonText = null;
+        }
+      }
+      if (this.map) this._mountFeatureExtras(this.map);
+    }
 
     // If layer is already on map, trigger parsing immediately; otherwise defer
     if (jsonText) {
@@ -1385,13 +2339,18 @@ class GeoJSONLayer {
 
   // Add layer to map
   addTo(map) {
+    if (this.map === map && this.layerIndex !== undefined) {
+      // Already on this map (possibly hidden by remove()) — just re-show it.
+      map.wasmMap.set_geojson_layer_visible(this.layerIndex, true);
+      for (const layer of this._featureLayers) layer.addTo(map);
+      if (map._notifyLayerAdd) map._notifyLayerAdd(this);
+      return this;
+    }
     this.map = map;
-    // WASM method does not return index; track index on the Map instance
-    map.wasmMap.add_geojson_layer();
+    this.layerIndex = map.wasmMap.add_geojson_layer();
     if (typeof map._geojsonLayerCount !== 'number') {
       map._geojsonLayerCount = 0;
     }
-    this.layerIndex = map._geojsonLayerCount;
     map._geojsonLayerCount += 1;
 
     if (this._pendingGeoJSONText) {
@@ -1407,16 +2366,26 @@ class GeoJSONLayer {
         }
       }
     } else if (this.geojson) {
-      console.log('GeoJSONLayer: Adding to map with existing data');
-      const geojsonString = typeof this.geojson === 'string'
-        ? this.geojson
-        : JSON.stringify(this.geojson);
-      map.wasmMap.load_geojson(this.layerIndex, geojsonString);
+      let dataObject = this.geojson;
+      if (typeof dataObject === 'string') {
+        try {
+          dataObject = JSON.parse(dataObject);
+        } catch (e) {
+          dataObject = null;
+        }
+      }
+      if (dataObject) {
+        const processed = this._applyFeatureOptions(dataObject);
+        map.wasmMap.load_geojson(this.layerIndex, JSON.stringify(processed));
+      } else {
+        // Unparseable string — pass through and let the wasm parser report it
+        map.wasmMap.load_geojson(this.layerIndex, this.geojson);
+      }
       this.updateStyle();
-    } else {
-      console.log('GeoJSONLayer: Adding to map but no data yet');
     }
 
+    this._mountFeatureExtras(map);
+    if (map._notifyLayerAdd) map._notifyLayerAdd(this);
     return this;
   }
 
@@ -1430,12 +2399,13 @@ class GeoJSONLayer {
     return this;
   }
 
-  // Remove layer from map
+  // Hide the layer (the map reference is kept so addTo can re-show it)
   remove() {
-    if (this.map) {
-      // Implementation for removing layer
-      this.map = null;
+    if (this.map && this.layerIndex !== undefined) {
+      this.map.wasmMap.set_geojson_layer_visible(this.layerIndex, false);
+      if (this.map._notifyLayerRemove) this.map._notifyLayerRemove(this);
     }
+    for (const layer of this._featureLayers) layer.remove();
     return this;
   }
 
@@ -1668,8 +2638,869 @@ class GeoJSONLayer {
   }
 }
 
+// Icon with Leaflet-style API
+class Icon {
+  constructor(options = {}) {
+    this.options = { ...options };
+    if (!this.options.iconUrl && !(this instanceof DivIcon)) {
+      throw new Error('Icon requires an iconUrl option');
+    }
+  }
+}
+
+// Default icon (Leaflet-compatible image-based marker)
+Icon.Default = class extends Icon {
+  constructor() {
+    super({
+      iconUrl: 'marker-icon.png',
+      iconRetinaUrl: 'marker-icon-2x.png',
+      shadowUrl: 'marker-shadow.png',
+      iconSize: [25, 41],
+      iconAnchor: [12, 41],
+      popupAnchor: [1, -34],
+      shadowSize: [41, 41],
+      className: 'rustyleaf-div-icon-default'
+    });
+  }
+};
+
+// DivIcon — HTML-based icon
+class DivIcon extends Icon {
+  constructor(options = {}) {
+    super({ ...options, iconUrl: options.iconUrl || 'divicon' });
+  }
+}
+
+// Parse a #rrggbb / #rgb hex string into normalized [r, g, b] in [0, 1].
+function parseMarkerColor(hex) {
+  if (typeof hex !== 'string') return [0.878, 0.224, 0.243]; // default red
+  let h = hex.replace('#', '');
+  if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+  if (h.length !== 6) return [0.878, 0.224, 0.243];
+  const r = parseInt(h.slice(0, 2), 16) / 255;
+  const g = parseInt(h.slice(2, 4), 16) / 255;
+  const b = parseInt(h.slice(4, 6), 16) / 255;
+  return [r, g, b];
+}
+
+// Marker with Leaflet-style API.
+// Markers are rendered on the GPU inside the Rust/WASM core (as round sprites
+// via the shared point program), so the JS layer only manages state and
+// forwards it to the WASM map. Popups/tooltips remain DOM overlays.
+class Marker {
+  constructor(latlng, options = {}) {
+    if (!Array.isArray(latlng) || latlng.length !== 2 ||
+        typeof latlng[0] !== 'number' || typeof latlng[1] !== 'number' ||
+        isNaN(latlng[0]) || isNaN(latlng[1])) {
+      throw new Error('Invalid latlng: expected [lat, lng] numbers');
+    }
+    this._latlng = [latlng[0], latlng[1]];
+    this._options = options;
+    this._opacity = options.opacity !== undefined ? options.opacity : 1;
+    this._zIndexOffset = options.zIndexOffset !== undefined ? options.zIndexOffset : 0;
+    this._draggable = !!options.draggable;
+    this._icon = options.icon || new Icon.Default();
+    this._color = parseMarkerColor(options.color);
+    this._size = options.size !== undefined ? options.size : 14;
+    this._events = {};
+    this._map = null;
+    this._id = null;
+  }
+
+  getLatLng() {
+    return [this._latlng[0], this._latlng[1]];
+  }
+
+  setLatLng(latlng) {
+    if (!Array.isArray(latlng) || latlng.length !== 2 ||
+        typeof latlng[0] !== 'number' || typeof latlng[1] !== 'number' ||
+        isNaN(latlng[0]) || isNaN(latlng[1])) {
+      throw new Error('Invalid latlng: expected [lat, lng] numbers');
+    }
+    this._latlng = [latlng[0], latlng[1]];
+    if (this._map && this._id !== null) {
+      this._map.wasmMap.update_marker(this._id, latlng[0], latlng[1]);
+    }
+    return this;
+  }
+
+  getIcon() {
+    return this._icon;
+  }
+
+  setIcon(icon) {
+    this._icon = icon;
+    return this;
+  }
+
+  getOpacity() {
+    return this._opacity;
+  }
+
+  setOpacity(o) {
+    if (o < 0) o = 0;
+    if (o > 1) o = 1;
+    this._opacity = o;
+    this._applyStyle();
+    return this;
+  }
+
+  getZIndexOffset() {
+    return this._zIndexOffset;
+  }
+
+  setZIndexOffset(o) {
+    this._zIndexOffset = o;
+    this._applyStyle();
+    return this;
+  }
+
+  isDraggable() {
+    return this._draggable;
+  }
+
+  setDraggable(d) {
+    this._draggable = !!d;
+    return this;
+  }
+
+  on(event, callback) {
+    (this._events[event] = this._events[event] || []).push(callback);
+    return this;
+  }
+
+  off(event, callback) {
+    if (this._events[event]) {
+      this._events[event] = this._events[event].filter((h) => h !== callback);
+    }
+    return this;
+  }
+
+  fire(event, data) {
+    (this._events[event] || []).forEach((h) => h(data));
+    return this;
+  }
+
+  // Push current style (size/color/opacity/z) to the WASM core.
+  _applyStyle() {
+    if (this._map && this._id !== null) {
+      const [r, g, b] = this._color;
+      this._map.wasmMap.set_marker_style(
+        this._id, this._size, r, g, b, this._opacity, this._zIndexOffset
+      );
+    }
+  }
+
+  addTo(map) {
+    this._map = map;
+    this._id = map.wasmMap.add_marker();
+    map.wasmMap.update_marker(this._id, this._latlng[0], this._latlng[1]);
+    this._applyStyle();
+    map.wasmMap.set_marker_visible(this._id, true);
+    if (map._notifyLayerAdd) map._notifyLayerAdd(this);
+    this.fire('add', { target: this });
+    return this;
+  }
+
+  remove() {
+    if (this._map && this._id !== null) {
+      this._map.wasmMap.remove_marker(this._id);
+      if (this._map._notifyLayerRemove) this._map._notifyLayerRemove(this);
+      this._map = null;
+      this._id = null;
+      this.fire('remove', { target: this });
+    }
+    return this;
+  }
+
+  // Markers are GPU sprites, so there is no DOM element to return.
+  getElement() {
+    return null;
+  }
+
+  bindPopup(content) {
+    if (content && content instanceof Popup) this._popup = content;
+    else this._popupContent = content;
+    return this;
+  }
+
+  getPopupContent() {
+    return this._popupContent;
+  }
+
+  getPopup() {
+    return this._popup;
+  }
+
+  openPopup() {
+    this._popupOpen = true;
+    if (this._popup) {
+      this._popup.setLatLng(this._latlng);
+      if (this._map) this._popup.openOn(this._map);
+    }
+    return this;
+  }
+
+  closePopup() {
+    this._popupOpen = false;
+    if (this._popup) this._popup.close();
+    return this;
+  }
+
+  isPopupOpen() {
+    return this._popupOpen;
+  }
+
+  bindTooltip(content) {
+    if (content && content instanceof Popup) this._tooltip = content;
+    else this._tooltipContent = content;
+    return this;
+  }
+
+  getTooltipContent() {
+    return this._tooltipContent;
+  }
+
+  openTooltip() {
+    this._tooltipOpen = true;
+    return this;
+  }
+
+  closeTooltip() {
+    this._tooltipOpen = false;
+    return this;
+  }
+
+  isTooltipOpen() {
+    return this._tooltipOpen;
+  }
+}
+
+// Tooltip — a lightweight DOM overlay (like Popup but smaller), anchored to a
+// latlng or a layer. Renders above the canvas and tracks the map each frame via
+// the render loop (the same pattern as Popup).
+class Tooltip {
+  constructor(options = {}) {
+    this.options = Object.assign({
+      direction: 'auto',
+      opacity: 0.9,
+      className: '',
+      sticky: false,
+      offset: [0, 0]
+    }, options);
+    this.content = options.content !== undefined ? options.content : '';
+    this.latlng = null;
+    this.map = null;
+    this.element = null;
+    this._isOpen = false;
+  }
+
+  setContent(html) {
+    this.content = html;
+    if (this.element) this._updateContent();
+    return this;
+  }
+
+  getTooltipContent() {
+    return this.content;
+  }
+
+  setLatLng(latlng) {
+    this.latlng = latlng;
+    if (this._isOpen && this.map) this._updatePosition();
+    return this;
+  }
+
+  getLatLng() {
+    return this.latlng;
+  }
+
+  openOn(map) {
+    if (!map || !map.containerElement) return this;
+    this.map = map;
+    this._initLayout();
+    this._updateContent();
+    this._updatePosition();
+    map.containerElement.appendChild(this.element);
+    this._isOpen = true;
+    if (map._fireLocalEvent) map._fireLocalEvent('tooltipopen', { type: 'tooltipopen', tooltip: this });
+    return this;
+  }
+
+  close() {
+    if (!this._isOpen) return this;
+    if (this.element && this.element.parentNode) {
+      this.element.parentNode.removeChild(this.element);
+    }
+    this._isOpen = false;
+    if (this.map && this.map._fireLocalEvent) this.map._fireLocalEvent('tooltipclose', { type: 'tooltipclose', tooltip: this });
+    this.map = null;
+    return this;
+  }
+
+  isOpenTooltip() {
+    return this._isOpen;
+  }
+
+  isOpen() {
+    return this._isOpen;
+  }
+
+  getElement() {
+    return this._isOpen ? this.element : null;
+  }
+
+  _initLayout() {
+    this.element = document.createElement('div');
+    this.element.className = 'rustyleaf-tooltip' + (this.options.className ? ' ' + this.options.className : '');
+    Object.assign(this.element.style, {
+      position: 'absolute',
+      background: 'rgba(255,255,255,0.95)',
+      border: '1px solid #aaa',
+      borderRadius: '4px',
+      padding: '4px 8px',
+      fontSize: '12px',
+      zIndex: '1100',
+      pointerEvents: 'auto',
+      boxShadow: '0 1px 4px rgba(0,0,0,0.25)',
+      transform: 'translate(-50%, -120%)'
+    });
+  }
+
+  _updateContent() {
+    if (!this.element) return;
+    if (typeof this.content === 'string') {
+      this.element.innerHTML = this.content;
+    } else if (this.content instanceof HTMLElement) {
+      this.element.innerHTML = '';
+      this.element.appendChild(this.content);
+    }
+  }
+
+  _updatePosition() {
+    if (!this.map || !this.latlng || !this.element) return;
+    const xy = this.map.wasmMap.screen_xy(this.latlng[0], this.latlng[1]);
+    if (!xy) return;
+    this.element.style.left = xy[0] + 'px';
+    this.element.style.top = xy[1] + 'px';
+  }
+}
+
+// ---------- Controls (DOM overlays) ----------
+
+function cornerStyle(pos) {
+  switch (pos) {
+  case 'topright': return { top: '10px', right: '10px' };
+  case 'bottomleft': return { bottom: '10px', left: '10px' };
+  case 'bottomright': return { bottom: '10px', right: '10px' };
+  case 'topleft':
+  default: return { top: '10px', left: '10px' };
+  }
+}
+
+class Control {
+  constructor(options = {}) {
+    this.options = Object.assign({ position: 'topleft' }, options);
+    this._map = null;
+    this._container = null;
+  }
+
+  getPosition() {
+    return this.options.position;
+  }
+
+  setPosition(position) {
+    this.options.position = position;
+    return this;
+  }
+
+  // Subclasses override this to build and return their DOM element.
+  onAdd(map) {
+    return document.createElement('div');
+  }
+
+  onRemove(map) {
+    return this;
+  }
+
+  addTo(map) {
+    this._map = map;
+    this._container = this.onAdd(map);
+    if (this._container && map.containerElement) {
+      Object.assign(this._container.style, { position: 'absolute', zIndex: '1000' }, cornerStyle(this.options.position));
+      map.containerElement.appendChild(this._container);
+    }
+    return this;
+  }
+
+  remove() {
+    if (this._container && this._container.parentNode) {
+      this._container.parentNode.removeChild(this._container);
+    }
+    this._container = null;
+    this._map = null;
+    return this;
+  }
+
+  getContainer() {
+    return this._container;
+  }
+}
+
+class ZoomControl extends Control {
+  constructor(options = {}) {
+    super(Object.assign({ position: 'topleft' }, options));
+  }
+
+  onAdd(map) {
+    const el = document.createElement('div');
+    el.className = 'rustyleaf-zoom-control';
+    el.style.cssText = 'display:flex;flex-direction:column;';
+    const plus = document.createElement('button');
+    plus.textContent = '+';
+    const minus = document.createElement('button');
+    minus.textContent = '−';
+    [plus, minus].forEach((b) => {
+      b.style.cssText = 'width:30px;height:30px;font-size:18px;cursor:pointer;border:1px solid #ccc;background:#fff;';
+    });
+    plus.addEventListener('click', () => map.zoomIn());
+    minus.addEventListener('click', () => map.zoomOut());
+    el.appendChild(plus);
+    el.appendChild(minus);
+    return el;
+  }
+}
+
+class AttributionControl extends Control {
+  constructor(options = {}) {
+    super(Object.assign({ position: 'bottomright', prefix: 'Rustyleaf' }, options));
+    this._attributions = [];
+    this._prefix = this.options.prefix;
+  }
+
+  onAdd(map) {
+    const el = document.createElement('div');
+    el.className = 'rustyleaf-attribution';
+    Object.assign(el.style, {
+      background: 'rgba(255,255,255,0.8)',
+      font: '11px/1.4 sans-serif',
+      padding: '0 5px',
+      maxWidth: '60%',
+      overflow: 'hidden',
+      whiteSpace: 'nowrap',
+      textOverflow: 'ellipsis'
+    });
+    if (window.getComputedStyle(map.containerElement).position === 'static') {
+      map.containerElement.style.position = 'relative';
+    }
+    map.attributionControl = this;
+    this._container = el;
+    this._update();
+    return el;
+  }
+
+  addAttribution(text) {
+    if (text && this._attributions.indexOf(text) === -1) {
+      this._attributions.push(text);
+      this._update();
+    }
+    return this;
+  }
+
+  getAttributions() {
+    return this._attributions.slice();
+  }
+
+  setPrefix(prefix) {
+    this._prefix = prefix;
+    this._update();
+    return this;
+  }
+
+  getPrefix() {
+    return this._prefix;
+  }
+
+  _update() {
+    if (!this._container) return;
+    const parts = [];
+    if (this._prefix) parts.push(this._prefix);
+    parts.push.apply(parts, this._attributions);
+    this._container.innerHTML = parts.join(' | ');
+  }
+}
+
+class ScaleControl extends Control {
+  constructor(options = {}) {
+    super(Object.assign({ position: 'bottomleft', maxWidth: 100, imperial: true, metric: true }, options));
+  }
+
+  onAdd(map) {
+    const el = document.createElement('div');
+    el.className = 'rustyleaf-scale-control';
+    Object.assign(el.style, {
+      background: 'rgba(255,255,255,0.8)',
+      font: '11px/1.4 sans-serif',
+      padding: '2px 5px',
+      border: '1px solid #999',
+      borderTop: 'none'
+    });
+    this._containerEl = el;
+    this._update(map);
+    if (typeof map.on === 'function') {
+      map.on('move', () => this._update(map));
+      map.on('zoom', () => this._update(map));
+    }
+    return el;
+  }
+
+  _update(map) {
+    if (!this._containerEl || !map) return;
+    const zoom = typeof map.getZoom === 'function' ? map.getZoom() : 12;
+    const center = typeof map.getCenter === 'function' ? map.getCenter() : [0, 0];
+    const latRad = center[0] * Math.PI / 180;
+    const mpp = 156543.03392 * Math.cos(latRad) / Math.pow(2, zoom);
+    const maxPx = this.options.maxWidth || 100;
+    const meters = mpp * maxPx;
+    let label;
+    if (meters >= 1000) label = (meters / 1000).toFixed(meters >= 10000 ? 0 : 1) + ' km';
+    else label = Math.round(meters) + ' m';
+    this._containerEl.textContent = label;
+    this._containerEl.style.width = maxPx + 'px';
+  }
+}
+
+// ---------- WMS tiles ----------
+
+// TileLayer whose template is a WMS GetMap request; the per-tile bbox is
+// substituted by the Rust tile loader via the {bbox-epsg-3857} token.
+class WMSTileLayer extends TileLayer {
+  constructor(baseUrl, options = {}) {
+    const params = {
+      service: 'WMS',
+      request: 'GetMap',
+      layers: options.layers || '',
+      styles: options.styles || '',
+      format: options.format || 'image/png',
+      transparent: options.transparent ? 'true' : 'false',
+      version: options.version || '1.1.1',
+      width: options.tileSize || 256,
+      height: options.tileSize || 256,
+    };
+    params[params.version === '1.3.0' ? 'crs' : 'srs'] = 'EPSG:3857';
+    const sep = baseUrl.includes('?') ? '&' : '?';
+    const query = Object.entries(params)
+      .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
+      .join('&');
+    super(`${baseUrl}${sep}${query}&bbox={bbox-epsg-3857}`, options);
+    this.wmsParams = params;
+  }
+}
+
+// ---------- GridLayer (programmable DOM tiles) ----------
+
+// Leaflet-style GridLayer: subclass and override createTile(coords) to return
+// a DOM element per tile. Tiles are DOM overlays (not GPU textures).
+class GridLayer {
+  constructor(options = {}) {
+    this.options = Object.assign({ tileSize: 256, className: '' }, options);
+    this._map = null;
+    this._container = null;
+    this._tiles = {};
+    this._onViewChange = null;
+  }
+
+  // Override in subclasses. Return a DOM element for the given {z, x, y}.
+  createTile(coords) { // eslint-disable-line no-unused-vars
+    return document.createElement('div');
+  }
+
+  addTo(map) {
+    this._map = map;
+    if (!this._container) {
+      const c = document.createElement('div');
+      c.className = 'rustyleaf-grid-layer' + (this.options.className ? ' ' + this.options.className : '');
+      Object.assign(c.style, {
+        position: 'absolute',
+        top: '0',
+        left: '0',
+        width: '100%',
+        height: '100%',
+        overflow: 'hidden',
+        pointerEvents: 'none',
+        zIndex: '350',
+      });
+      this._container = c;
+    }
+    if (window.getComputedStyle(map.containerElement).position === 'static') {
+      map.containerElement.style.position = 'relative';
+    }
+    map.containerElement.appendChild(this._container);
+    this._update();
+    if (!this._onViewChange) {
+      this._onViewChange = () => deferCallback(() => this._update());
+      map.on('move', this._onViewChange);
+      map.on('zoom', this._onViewChange);
+      map.on('resize', this._onViewChange);
+    }
+    if (map._notifyLayerAdd) map._notifyLayerAdd(this);
+    return this;
+  }
+
+  _update() {
+    if (!this._map || !this._container) return;
+    const zoom = Math.round(this._map.getZoom());
+    const center = this._map.getCenter();
+    const size = this.options.tileSize;
+    const scale = size * Math.pow(2, zoom);
+    const cx = (center[1] + 180) / 360 * scale;
+    const latRad = center[0] * Math.PI / 180;
+    const cy = (1 - Math.log(Math.tan(Math.PI / 4 + latRad / 2)) / Math.PI) / 2 * scale;
+    const w = this._map.width || 800;
+    const h = this._map.height || 600;
+    const topLeftX = cx - w / 2;
+    const topLeftY = cy - h / 2;
+    const maxTiles = Math.pow(2, zoom);
+    const wanted = {};
+
+    for (let tx = Math.floor(topLeftX / size); tx <= Math.floor((topLeftX + w) / size); tx++) {
+      for (let ty = Math.floor(topLeftY / size); ty <= Math.floor((topLeftY + h) / size); ty++) {
+        if (ty < 0 || ty >= maxTiles) continue;
+        const wrappedX = ((tx % maxTiles) + maxTiles) % maxTiles;
+        const key = `${zoom}/${tx}/${ty}`;
+        wanted[key] = true;
+        let tile = this._tiles[key];
+        if (!tile) {
+          tile = this.createTile({ z: zoom, x: wrappedX, y: ty });
+          if (!tile) continue;
+          Object.assign(tile.style, { position: 'absolute', width: size + 'px', height: size + 'px' });
+          this._tiles[key] = tile;
+          this._container.appendChild(tile);
+        }
+        tile.style.left = Math.round(tx * size - topLeftX) + 'px';
+        tile.style.top = Math.round(ty * size - topLeftY) + 'px';
+      }
+    }
+
+    for (const key of Object.keys(this._tiles)) {
+      if (!wanted[key]) {
+        const tile = this._tiles[key];
+        if (tile.parentNode) tile.parentNode.removeChild(tile);
+        delete this._tiles[key];
+      }
+    }
+  }
+
+  remove() {
+    if (this._container && this._container.parentNode) {
+      this._container.parentNode.removeChild(this._container);
+    }
+    this._tiles = {};
+    if (this._map) {
+      if (this._onViewChange) {
+        this._map.off('move', this._onViewChange);
+        this._map.off('zoom', this._onViewChange);
+        this._map.off('resize', this._onViewChange);
+        this._onViewChange = null;
+      }
+      if (this._map._notifyLayerRemove) this._map._notifyLayerRemove(this);
+    }
+    return this;
+  }
+}
+
+// ---------- Plugin surface (Handler base + Util helpers) ----------
+
+// Leaflet-style Handler: subclass with addHooks/removeHooks, register via
+// map.addHandler(name, HandlerClass).
+class Handler {
+  constructor(map) {
+    this._map = map;
+    this._enabled = false;
+  }
+
+  enable() {
+    if (!this._enabled) {
+      this._enabled = true;
+      this.addHooks();
+    }
+    return this;
+  }
+
+  disable() {
+    if (this._enabled) {
+      this._enabled = false;
+      this.removeHooks();
+    }
+    return this;
+  }
+
+  enabled() {
+    return this._enabled;
+  }
+
+  addHooks() {}
+  removeHooks() {}
+}
+
+const Util = {
+  _lastId: 0,
+
+  extend(dest, ...sources) {
+    for (const src of sources) {
+      for (const key in src) dest[key] = src[key];
+    }
+    return dest;
+  },
+
+  stamp(obj) {
+    if (!obj._rustyleaf_id) {
+      Util._lastId += 1;
+      Object.defineProperty(obj, '_rustyleaf_id', {
+        value: Util._lastId,
+        enumerable: false,
+        configurable: true,
+        writable: true,
+      });
+    }
+    return obj._rustyleaf_id;
+  },
+
+  throttle(fn, time, context) {
+    let lock = false;
+    let pendingArgs = null;
+    const later = () => {
+      lock = false;
+      if (pendingArgs) {
+        const args = pendingArgs;
+        pendingArgs = null;
+        wrapped.apply(context, args);
+      }
+    };
+    function wrapped(...args) {
+      if (lock) {
+        pendingArgs = args;
+      } else {
+        fn.apply(context, args);
+        lock = true;
+        setTimeout(later, time);
+      }
+    }
+    return wrapped;
+  },
+
+  wrapNum(x, range, includeMax) {
+    const max = range[1];
+    const min = range[0];
+    const d = max - min;
+    return x === max && includeMax ? x : ((x - min) % d + d) % d + min;
+  },
+
+  falseFn() {
+    return false;
+  },
+
+  formatNum(num, digits) {
+    const pow = Math.pow(10, digits === undefined ? 6 : digits);
+    return Math.round(num * pow) / pow;
+  },
+
+  setOptions(obj, options) {
+    obj.options = Object.assign({}, obj.options, options);
+    return obj.options;
+  },
+
+  template(str, data) {
+    return str.replace(/\{ *([\w_ -]+) *\}/g, (match, key) => {
+      let value = data[key];
+      if (value === undefined) throw new Error('No value provided for variable ' + match);
+      if (typeof value === 'function') value = value(data);
+      return value;
+    });
+  },
+};
+
+// Leaflet-style layers control: checkboxes for overlays, radios for base layers.
+class LayersControl extends Control {
+  constructor(baseLayers, overlays, options = {}) {
+    super(Object.assign({ position: 'topright' }, options));
+    this._entries = [];
+    if (baseLayers) {
+      for (const name of Object.keys(baseLayers)) this.addBaseLayer(baseLayers[name], name);
+    }
+    if (overlays) {
+      for (const name of Object.keys(overlays)) this.addOverlay(overlays[name], name);
+    }
+  }
+
+  addBaseLayer(layer, name) {
+    this._entries.push({ layer, name, overlay: false });
+    this._refresh();
+    return this;
+  }
+
+  addOverlay(layer, name) {
+    this._entries.push({ layer, name, overlay: true });
+    this._refresh();
+    return this;
+  }
+
+  removeLayer(layer) {
+    this._entries = this._entries.filter((e) => e.layer !== layer);
+    this._refresh();
+    return this;
+  }
+
+  onAdd(map) {
+    const el = document.createElement('div');
+    el.className = 'rustyleaf-layers-control';
+    Object.assign(el.style, {
+      background: '#fff',
+      border: '1px solid #ccc',
+      borderRadius: '4px',
+      padding: '6px 8px',
+      font: '12px/1.5 sans-serif',
+      boxShadow: '0 1px 4px rgba(0,0,0,0.2)'
+    });
+    this._container = el;
+    this._refresh();
+    return el;
+  }
+
+  _refresh() {
+    if (!this._container) return;
+    const el = this._container;
+    el.innerHTML = '';
+    for (const entry of this._entries) {
+      const label = document.createElement('label');
+      label.style.display = 'block';
+      label.style.cursor = 'pointer';
+      const input = document.createElement('input');
+      input.type = entry.overlay ? 'checkbox' : 'radio';
+      if (!entry.overlay) input.name = 'rustyleaf-base-layer';
+      input.checked = true;
+      input.addEventListener('change', () => {
+        const map = this._map;
+        if (!map) return;
+        if (entry.overlay) {
+          if (input.checked) entry.layer.addTo(map);
+          else entry.layer.remove();
+        } else {
+          for (const other of this._entries) {
+            if (!other.overlay && other !== entry) other.layer.remove();
+          }
+          entry.layer.addTo(map);
+        }
+      });
+      label.appendChild(input);
+      label.appendChild(document.createTextNode(' ' + entry.name));
+      el.appendChild(label);
+    }
+  }
+}
+
 // Export classes
-export { Map, TileLayer, PointLayer, LineLayer, PolygonLayer, GeoJSONLayer, Popup };
+export { Map, TileLayer, PointLayer, LineLayer, PolygonLayer, GeoJSONLayer, Popup, Marker, Icon, DivIcon, Tooltip, Control, ZoomControl, AttributionControl, ScaleControl, LayersControl, Circle, CircleMarker, Rectangle, LayerGroup, FeatureGroup, ImageOverlay, VideoOverlay, SVGOverlay, WMSTileLayer, GridLayer, Handler, Util };
 
 // Default export for compatibility
-export default { Map, TileLayer, PointLayer, LineLayer, PolygonLayer, GeoJSONLayer, Popup };
+export default { Map, TileLayer, PointLayer, LineLayer, PolygonLayer, GeoJSONLayer, Popup, Marker, Icon, DivIcon, Tooltip, Control, ZoomControl, AttributionControl, ScaleControl, LayersControl, Circle, CircleMarker, Rectangle, LayerGroup, FeatureGroup, ImageOverlay, VideoOverlay, SVGOverlay, WMSTileLayer, GridLayer, Handler, Util };

@@ -586,8 +586,8 @@ describe('GeoJSONLayer', () => {
 
       expect(result).toBe(geojsonLayer);
       expect(geojsonLayer.map).toBe(mockMap);
-      // Indices are tracked per-map by the JS API (WASM add_geojson_layer returns void)
-      expect(geojsonLayer.layerIndex).toBe(0);
+      // The layer index comes from the WASM core's add_geojson_layer return value
+      expect(geojsonLayer.layerIndex).toBe(1);
       expect(mockMap.wasmMap.add_geojson_layer).toHaveBeenCalled();
       expect(mockMap.wasmMap.load_geojson).not.toHaveBeenCalled();
     });
@@ -663,15 +663,19 @@ describe('GeoJSONLayer', () => {
   });
 
   describe('remove method', () => {
-    test('should remove layer from map', () => {
+    test('should hide the wasm layer and keep the map reference for re-adding', () => {
       const geojsonLayer = new GeoJSONLayer();
-      const mockMap = {};
+      const mockMap = {
+        wasmMap: { set_geojson_layer_visible: jest.fn() }
+      };
       geojsonLayer.map = mockMap;
-      
+      geojsonLayer.layerIndex = 3;
+
       const result = geojsonLayer.remove();
-      
+
       expect(result).toBe(geojsonLayer); // Method chaining
-      expect(geojsonLayer.map).toBeNull();
+      expect(mockMap.wasmMap.set_geojson_layer_visible).toHaveBeenCalledWith(3, false);
+      expect(geojsonLayer.map).toBe(mockMap); // kept so addTo() can re-show
     });
 
     test('should handle remove when not on map', () => {

@@ -87,10 +87,20 @@ export const rustyleafmap_handle_contextmenu = jest.fn();
 export const rustyleafmap_resize = jest.fn();
 export const rustyleafmap_screen_xy = jest.fn(() => [400, 300]);
 export const rustyleafmap_add_tile_layer = jest.fn(() => 0);
-export const rustyleafmap_add_point_layer = jest.fn(() => 0);
-export const rustyleafmap_add_line_layer = jest.fn(() => 0);
-export const rustyleafmap_add_polygon_layer = jest.fn(() => 0);
-export const rustyleafmap_add_geojson_layer = jest.fn(() => 0);
+// add_*_layer return the new layer's index, like the real wasm core
+const nextLayerIndex = (ptr, kind) => {
+  const state = getMapState(ptr);
+  state[kind] = state[kind] || 0;
+  return state[kind]++;
+};
+export const rustyleafmap_add_point_layer = jest.fn((ptr) => nextLayerIndex(ptr, 'pointLayers'));
+export const rustyleafmap_add_line_layer = jest.fn((ptr) => nextLayerIndex(ptr, 'lineLayers'));
+export const rustyleafmap_add_polygon_layer = jest.fn((ptr) => nextLayerIndex(ptr, 'polygonLayers'));
+export const rustyleafmap_add_geojson_layer = jest.fn((ptr) => nextLayerIndex(ptr, 'geojsonLayers'));
+export const rustyleafmap_set_point_layer_visible = jest.fn();
+export const rustyleafmap_set_line_layer_visible = jest.fn();
+export const rustyleafmap_set_polygon_layer_visible = jest.fn();
+export const rustyleafmap_set_geojson_layer_visible = jest.fn();
 export const rustyleafmap_add_points = jest.fn();
 export const rustyleafmap_add_lines = jest.fn();
 export const rustyleafmap_add_polygons = jest.fn();
@@ -99,6 +109,14 @@ export const rustyleafmap_load_geojson_chunk = jest.fn();
 export const rustyleafmap_set_geojson_style = jest.fn();
 export const rustyleafmap_get_geojson_feature_count = jest.fn(() => 0);
 export const rustyleafmap_clear_geojson_layer = jest.fn();
+
+// Marker API mocks (markers are GPU-rendered in the Rust core)
+export const rustyleafmap_add_marker = jest.fn(() => 0);
+export const rustyleafmap_update_marker = jest.fn();
+export const rustyleafmap_set_marker_style = jest.fn();
+export const rustyleafmap_set_marker_visible = jest.fn();
+export const rustyleafmap_remove_marker = jest.fn();
+export const rustyleafmap_get_marker_latlng = jest.fn(() => [0, 0]);
 
 // Layer API mocks
 export const tilelayerapi_new = jest.fn(() => 1);
@@ -307,6 +325,22 @@ export class RustyleafMap {
     return rustyleafmap_add_geojson_layer(this.ptr);
   }
 
+  set_point_layer_visible(layerIndex, visible) {
+    rustyleafmap_set_point_layer_visible(this.ptr, layerIndex, visible);
+  }
+
+  set_line_layer_visible(layerIndex, visible) {
+    rustyleafmap_set_line_layer_visible(this.ptr, layerIndex, visible);
+  }
+
+  set_polygon_layer_visible(layerIndex, visible) {
+    rustyleafmap_set_polygon_layer_visible(this.ptr, layerIndex, visible);
+  }
+
+  set_geojson_layer_visible(layerIndex, visible) {
+    rustyleafmap_set_geojson_layer_visible(this.ptr, layerIndex, visible);
+  }
+
   add_points(layerIndex, points) {
     rustyleafmap_add_points(this.ptr, layerIndex, points);
   }
@@ -337,6 +371,30 @@ export class RustyleafMap {
 
   clear_geojson_layer(layerIndex) {
     rustyleafmap_clear_geojson_layer(this.ptr, layerIndex);
+  }
+
+  add_marker() {
+    return rustyleafmap_add_marker(this.ptr);
+  }
+
+  update_marker(id, lat, lng) {
+    rustyleafmap_update_marker(this.ptr, id, lat, lng);
+  }
+
+  set_marker_style(id, size, r, g, b, a, z) {
+    rustyleafmap_set_marker_style(this.ptr, id, size, r, g, b, a, z);
+  }
+
+  set_marker_visible(id, visible) {
+    rustyleafmap_set_marker_visible(this.ptr, id, visible);
+  }
+
+  remove_marker(id) {
+    rustyleafmap_remove_marker(this.ptr, id);
+  }
+
+  get_marker_latlng(id) {
+    return rustyleafmap_get_marker_latlng(this.ptr, id);
   }
 }
 
@@ -430,6 +488,10 @@ export default {
   rustyleafmap_add_line_layer,
   rustyleafmap_add_polygon_layer,
   rustyleafmap_add_geojson_layer,
+  rustyleafmap_set_point_layer_visible,
+  rustyleafmap_set_line_layer_visible,
+  rustyleafmap_set_polygon_layer_visible,
+  rustyleafmap_set_geojson_layer_visible,
   rustyleafmap_add_points,
   rustyleafmap_add_lines,
   rustyleafmap_add_polygons,
@@ -438,6 +500,12 @@ export default {
   rustyleafmap_set_geojson_style,
   rustyleafmap_get_geojson_feature_count,
   rustyleafmap_clear_geojson_layer,
+  rustyleafmap_add_marker,
+  rustyleafmap_update_marker,
+  rustyleafmap_set_marker_style,
+  rustyleafmap_set_marker_visible,
+  rustyleafmap_remove_marker,
+  rustyleafmap_get_marker_latlng,
   tilelayerapi_new,
   tilelayerapi_add_to,
   pointlayerapi_new,
