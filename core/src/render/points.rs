@@ -49,16 +49,40 @@ pub fn render_points(
 
         // Upload vertex data once (and again only when the points change).
         // Coords are stored normalized [0,1] so they're valid at every zoom.
+        // Vertices are uploaded in a deterministically shuffled order so the
+        // overdraw cap below can draw the first K as a fair random sample.
         if layer.gpu_dirty.get() || layer.vertex_buffer.borrow().is_none() {
-            let mut vertex_data: Vec<f32> = Vec::with_capacity(layer.points.len() * 7);
-            for p in &layer.points {
+            let n = layer.points.len();
+            let mut order: Vec<u32> = (0..n as u32).collect();
+            let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+            for i in (1..n).rev() {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let j = ((state >> 33) as usize) % (i + 1);
+                order.swap(i, j);
+            }
+
+            let mut min = (f32::MAX, f32::MAX);
+            let mut max = (f32::MIN, f32::MIN);
+            let mut area_sum = 0.0f64;
+            let mut vertex_data: Vec<f32> = Vec::with_capacity(n * 7);
+            for &idx in &order {
+                let p = &layer.points[idx as usize];
                 let (nx, ny) = viewport.lat_lng_to_normalized(p.lat, p.lng);
+                let (nx, ny) = (nx as f32, ny as f32);
+                min = (min.0.min(nx), min.1.min(ny));
+                max = (max.0.max(nx), max.1.max(ny));
+                area_sum += (p.size as f64) * (p.size as f64);
                 vertex_data.extend_from_slice(&[
-                    nx as f32, ny as f32,
+                    nx, ny,
                     p.size,
                     p.color[0], p.color[1], p.color[2], p.color[3],
                 ]);
             }
+            layer.norm_min.set(min);
+            layer.norm_max.set(max);
+            layer.avg_point_area.set((area_sum / n.max(1) as f64) as f32);
 
             if layer.vertex_buffer.borrow().is_none() {
                 let buf = context
@@ -93,7 +117,30 @@ pub fn render_points(
         context.enable_vertex_attrib_array(2);
         context.vertex_attrib_pointer_with_i32(2, 4, WebGl2RenderingContext::FLOAT, false, stride, 3 * 4);
 
-        context.draw_arrays(WebGl2RenderingContext::POINTS, 0, layer.vertex_count.get() as i32);
+        // Overdraw cap: when the layer's screen footprint is small (zoomed far
+        // out), millions of overlapping blended points serialize the ROP and
+        // fps collapses even though nothing more is visible. Bound the total
+        // fragment work to MAX_OVERDRAW writes per covered pixel by drawing
+        // only the first K pre-shuffled vertices (a fair random sample).
+        // Zoomed in the footprint covers the viewport, the budget exceeds the
+        // layer size, and every point is drawn. Hit-testing is unaffected.
+        const MAX_OVERDRAW: f32 = 40.0;
+        const MIN_SAMPLE: usize = 4096;
+        let total = layer.vertex_count.get();
+        let min = layer.norm_min.get();
+        let max = layer.norm_max.get();
+        let ext_x = ((max.0 - min.0) * world_scale).clamp(32.0, viewport.width as f32);
+        let ext_y = ((max.1 - min.1) * world_scale).clamp(32.0, viewport.height as f32);
+        let budget = MAX_OVERDRAW * ext_x * ext_y;
+        let avg_area = layer.avg_point_area.get().max(1.0);
+        let fragments = total as f32 * avg_area;
+        let draw_count = if fragments > budget {
+            ((budget / avg_area) as usize).max(MIN_SAMPLE).min(total)
+        } else {
+            total
+        };
+
+        context.draw_arrays(WebGl2RenderingContext::POINTS, 0, draw_count as i32);
     }
 
     Ok(())

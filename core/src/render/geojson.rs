@@ -71,10 +71,6 @@ pub fn render_geojson(ctx: &GeoJsonRenderCtx) -> Result<(), JsValue> {
         let mut line_features = Vec::new();
         let mut polygon_features = Vec::new();
 
-        if !geojson_layer.features.is_empty() {
-            web_sys::console::log_2(&"Processing GeoJSON features:".into(), &geojson_layer.features.len().into());
-        }
-
         for feature in &geojson_layer.features {
             let style = &geojson_layer.style;
 
@@ -150,7 +146,6 @@ pub fn render_geojson(ctx: &GeoJsonRenderCtx) -> Result<(), JsValue> {
                     }
                 },
                 GeoJSONGeometry::MultiPolygon { coordinates } => {
-                    web_sys::console::log_1(&"Found MultiPolygon geometry".into());
                     for polygon_coords in coordinates {
                         let polygon_rings: Vec<Vec<[f64; 2]>> = polygon_coords.iter()
                             .map(|ring| ring.iter()
@@ -171,12 +166,8 @@ pub fn render_geojson(ctx: &GeoJsonRenderCtx) -> Result<(), JsValue> {
             }
         }
 
-        web_sys::console::log_2(&"Final polygon features count:".into(), &polygon_features.len().into());
-
         if !polygon_features.is_empty() {
             render_geojson_polygons(ctx, &polygon_features)?;
-        } else {
-            web_sys::console::log_1(&"No polygon features to render".into());
         }
 
         if !line_features.is_empty() {
@@ -353,8 +344,6 @@ pub fn render_geojson_lines(ctx: &GeoJsonRenderCtx, lines: &[LineFeature]) -> Re
 }
 
 pub fn render_geojson_polygons(ctx: &GeoJsonRenderCtx, polygons: &[PolygonFeature]) -> Result<(), JsValue> {
-    web_sys::console::log_2(&"Rendering polygons count:".into(), &polygons.len().into());
-
     let context = ctx.context;
     let gl_state = ctx.gl_state;
 
@@ -472,10 +461,7 @@ pub fn render_geojson_polygons(ctx: &GeoJsonRenderCtx, polygons: &[PolygonFeatur
         }
 
         let total_vertices = vertex_data.len() / 6;
-        web_sys::console::log_2(&"Drawing triangles:".into(), &total_vertices.into());
         context.draw_arrays(WebGl2RenderingContext::TRIANGLES, 0, total_vertices as i32);
-    } else {
-        web_sys::console::log_1(&"No vertex data to render".into());
     }
 
     Ok(())

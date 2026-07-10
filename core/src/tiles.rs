@@ -40,8 +40,14 @@ pub struct TileLoader {
     pub tiles: HashMap<String, Tile>,
     pub requested: HashSet<String>,
     // Keyed by tile key so completed loads can be released in cleanup_old_tiles.
-    pub closures: HashMap<String, Closure<dyn FnMut()>>,
+    // The image is kept alongside its closure so handlers can be detached
+    // before the closure is dropped — otherwise a still-loading image fires
+    // "closure invoked recursively or after being dropped".
+    pub closures: HashMap<String, TileLoadHandler>,
 }
+
+// An in-flight tile load: the image and the onload/onerror closure bound to it.
+pub type TileLoadHandler = (HtmlImageElement, Closure<dyn FnMut()>);
 
 impl TileLoader {
     pub fn new() -> Self {
@@ -50,6 +56,15 @@ impl TileLoader {
             tiles: HashMap::new(),
             requested: HashSet::new(),
             closures: HashMap::new(),
+        }
+    }
+
+    // Detach handlers before dropping, so in-flight images can never invoke
+    // a dropped closure (used on destroy/context-loss).
+    pub fn release_all_closures(&mut self) {
+        for (_key, (image, _closure)) in self.closures.drain() {
+            image.set_onload(None);
+            image.set_onerror(None);
         }
     }
 
@@ -63,7 +78,18 @@ impl TileLoader {
         // Release onload closures for tiles whose load has definitively completed
         // (texture exists). In-flight loads keep their closure alive. Must run
         // before eviction below so completed-then-evicted tiles are covered.
-        self.closures.retain(|key, _| !textures.contains_key(key));
+        let done: Vec<String> = self
+            .closures
+            .keys()
+            .filter(|key| textures.contains_key(*key))
+            .cloned()
+            .collect();
+        for key in done {
+            if let Some((image, _closure)) = self.closures.remove(&key) {
+                image.set_onload(None);
+                image.set_onerror(None);
+            }
+        }
 
         let keys_to_remove: Vec<String> = textures
             .iter()
@@ -140,11 +166,14 @@ impl TileLoader {
         let mut load_count = 0;
         let max_load_per_frame = 3;
 
+        let world_tiles = 1i64 << zoom.min(30);
         for x in start_tile_x..(start_tile_x + tiles_x) {
             for y in start_tile_y..(start_tile_y + tiles_y) {
-                if x >= 0 && y >= 0 && x < (1 << zoom) && y < (1 << zoom) {
-                    let tile_coord = TileCoord { x, y, z: zoom };
-                    let tile_key = format!("{}/{}/{}", zoom, x, y);
+                // Wrap horizontally (the world repeats); latitude does not wrap.
+                let wrapped_x = (((x as i64 % world_tiles) + world_tiles) % world_tiles) as i32;
+                if y >= 0 && (y as i64) < world_tiles {
+                    let tile_coord = TileCoord { x: wrapped_x, y, z: zoom };
+                    let tile_key = format!("{}/{}/{}", zoom, wrapped_x, y);
                     let already_requested = self.requested.contains(&tile_key);
                     let already_cached = self.textures.borrow().contains_key(&tile_key);
 
@@ -177,12 +206,24 @@ impl TileLoader {
                 .get(((coord.x + coord.y) as usize) % tile_layer.subdomains.len())
                 .cloned()
                 .unwrap_or_else(|| "a".to_string());
-            tile_layer
+            let mut url = tile_layer
                 .url_template
                 .replace("{s}", &subdomain)
                 .replace("{z}", &coord.z.to_string())
                 .replace("{x}", &coord.x.to_string())
-                .replace("{y}", &coord.y.to_string())
+                .replace("{y}", &coord.y.to_string());
+            // WMS support: substitute the tile's EPSG:3857 bounding box
+            // (minx,miny,maxx,maxy in meters), as used by GetMap requests.
+            if url.contains("{bbox-epsg-3857}") {
+                const HALF_WORLD_M: f64 = 20037508.342789244;
+                let tiles_per_axis = (1u64 << coord.z.min(31)) as f64;
+                let tile_size_m = (HALF_WORLD_M * 2.0) / tiles_per_axis;
+                let min_x = -HALF_WORLD_M + coord.x as f64 * tile_size_m;
+                let max_y = HALF_WORLD_M - coord.y as f64 * tile_size_m;
+                let bbox = format!("{},{},{},{}", min_x, max_y - tile_size_m, min_x + tile_size_m, max_y);
+                url = url.replace("{bbox-epsg-3857}", &bbox);
+            }
+            url
         };
 
         if let Some(tile) = self.tiles.get_mut(&tile_key) {
@@ -190,6 +231,13 @@ impl TileLoader {
                 return;
             }
             tile.loading = true;
+        }
+
+        // A load for this key is already in flight (closure registered, no
+        // texture yet). Starting another would drop the old closure while its
+        // image can still fire ("closure invoked after being dropped").
+        if self.closures.contains_key(&tile_key) && !self.textures.borrow().contains_key(&tile_key) {
+            return;
         }
 
         let image = match HtmlImageElement::new() {
@@ -260,7 +308,7 @@ impl TileLoader {
 
         image.set_onload(Some(onload_closure.as_ref().unchecked_ref()));
         image.set_onerror(Some(onload_closure.as_ref().unchecked_ref()));
-        self.closures.insert(tile_key, onload_closure);
+        self.closures.insert(tile_key, (image.clone(), onload_closure));
 
         image.set_src(&url);
     }
@@ -277,12 +325,14 @@ fn visible_tile_keys(viewport: &Viewport, zoom: u32) -> HashSet<String> {
     let tiles_y = (viewport.height as f64 / viewport.tile_size as f64).ceil() as i32 + 2;
 
     let mut keys = HashSet::new();
+    let world_tiles = 1i64 << zoom.min(30);
     for i in 0..tiles_x {
         for j in 0..tiles_y {
-            let tile_x = start_tile_x + i;
-            let tile_y = start_tile_y + j;
-            if tile_x >= 0 && tile_y >= 0 && tile_x < (1 << zoom) && tile_y < (1 << zoom) {
-                keys.insert(format!("{}/{}/{}", zoom, tile_x, tile_y));
+            let tile_x = (start_tile_x + i) as i64;
+            let tile_y = (start_tile_y + j) as i64;
+            if tile_y >= 0 && tile_y < world_tiles {
+                let wrapped_x = ((tile_x % world_tiles) + world_tiles) % world_tiles;
+                keys.insert(format!("{}/{}/{}", zoom, wrapped_x, tile_y));
             }
         }
     }

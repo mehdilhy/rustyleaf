@@ -2,6 +2,7 @@ use rstar::{RTree, RTreeObject, AABB};
 use crate::layers::point::PointLayer;
 use crate::layers::line::LineLayer;
 use crate::layers::polygon::PolygonLayer;
+use crate::layers::geojson::GeoJSONLayer;
 use crate::projection::Viewport;
 
 #[derive(Clone, Debug)]
@@ -20,10 +21,12 @@ impl RTreeObject for SpatialFeature {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn rebuild_spatial_index(
     point_layers: &[PointLayer],
     line_layers: &[LineLayer],
     polygon_layers: &[PolygonLayer],
+    geojson_layers: &[GeoJSONLayer],
     index: &mut RTree<SpatialFeature>,
     dirty: &mut bool,
 ) {
@@ -119,6 +122,47 @@ pub fn rebuild_spatial_index(
         }
     }
 
+    // Index GeoJSON layer features (cached_points / cached_lines carry each
+    // feature's `properties` as meta, including any injected `__rl_fid` from
+    // onEachFeature). Polygons are only hit-testable via their outline —
+    // cached_polygon_triangles has no per-feature metadata after
+    // triangulation, so interior clicks don't hit-test yet.
+    for (layer_idx, layer) in geojson_layers.iter().enumerate() {
+        for (point_idx, point) in layer.cached_points.iter().enumerate() {
+            let bounds = AABB::from_corners(
+                [point.lng - tolerance, point.lat - tolerance],
+                [point.lng + tolerance, point.lat + tolerance]
+            );
+            let mut meta = serde_json::json!({});
+            meta["layer_type"] = "geojson-point".into();
+            meta["layer_index"] = layer_idx.into();
+            meta["feature_index"] = point_idx.into();
+            meta["original_meta"] = point.meta.clone();
+            new_index.insert(SpatialFeature { id: feature_id, bounds, meta });
+            feature_id += 1;
+        }
+
+        for (line_idx, line) in layer.cached_lines.iter().enumerate() {
+            for i in 0..line.points.len().saturating_sub(1) {
+                let start = line.points[i];
+                let end = line.points[i + 1];
+                let min_x = start[1].min(end[1]) - tolerance;
+                let max_x = start[1].max(end[1]) + tolerance;
+                let min_y = start[0].min(end[0]) - tolerance;
+                let max_y = start[0].max(end[0]) + tolerance;
+                let bounds = AABB::from_corners([min_x, min_y], [max_x, max_y]);
+                let mut meta = serde_json::json!({});
+                meta["layer_type"] = "geojson-line".into();
+                meta["layer_index"] = layer_idx.into();
+                meta["feature_index"] = line_idx.into();
+                meta["segment_index"] = i.into();
+                meta["original_meta"] = line.meta.clone();
+                new_index.insert(SpatialFeature { id: feature_id, bounds, meta });
+                feature_id += 1;
+            }
+        }
+    }
+
     *index = new_index;
     *dirty = false;
 }
@@ -144,8 +188,11 @@ pub fn hit_test(
         [lng + tolerance, lat + tolerance]
     );
 
+    // Intersection, not containment: a feature counts as hit when its bounds
+    // overlap the cursor's tolerance box (containment would require a
+    // pixel-perfect hit on the feature's center).
     index
-        .locate_in_envelope(&search_bounds)
+        .locate_in_envelope_intersecting(&search_bounds)
         .next()
         .map(|feature| feature.meta.clone())
 }

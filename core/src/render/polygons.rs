@@ -25,6 +25,15 @@ pub fn render_polygons(
         context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
     }
 
+    // This pass uploads screen-space coords, so neutralize the world-space
+    // projection uniforms (they default to 0, which collapses every vertex).
+    if let Some(ref loc) = gl_state.polygon_u_origin {
+        context.uniform2f(Some(loc), 0.0, 0.0);
+    }
+    if let Some(ref loc) = gl_state.polygon_u_world_scale {
+        context.uniform1f(Some(loc), 1.0);
+    }
+
     for layer in polygon_layers {
         if !layer.visible {
             continue;
@@ -92,6 +101,24 @@ pub fn triangulate_polygon(points: &[[f64; 2]]) -> Vec<[f64; 2]> {
 
     let mut triangles = Vec::new();
     let mut vertices: Vec<[f64; 2]> = points.to_vec();
+
+    // Drop a GeoJSON-style duplicated closing vertex.
+    if vertices.len() > 3 && vertices.first() == vertices.last() {
+        vertices.pop();
+    }
+
+    // Ear clipping below assumes counterclockwise winding (is_convex_vertex
+    // tests cross > 0). Normalize via the shoelace signed area, otherwise a
+    // clockwise ring finds no ear and silently produces zero triangles.
+    let n = vertices.len();
+    let mut signed_area = 0.0;
+    for i in 0..n {
+        let j = (i + 1) % n;
+        signed_area += vertices[i][0] * vertices[j][1] - vertices[j][0] * vertices[i][1];
+    }
+    if signed_area < 0.0 {
+        vertices.reverse();
+    }
 
     while vertices.len() >= 3 {
         let mut ear_found = false;

@@ -115,6 +115,8 @@ use crate::input::MouseState;
 use crate::input::momentum::{apply_drag, apply_momentum, start_momentum_animation};
 use crate::events::{EventSystem, trigger_event, create_map_event, create_click_event};
 use crate::layers::point::{PointFeature, PointLayer};
+use crate::layers::marker::Marker;
+use crate::render::screen_projection_matrix;
 use crate::layers::line::{LineFeature, LineLayer};
 use crate::layers::polygon::{PolygonFeature, PolygonLayer};
 use crate::layers::geojson::{GeoJSONLayer, GeoJSONFeature, GeoJSONGeometry, GeoJSONStyle};
@@ -137,6 +139,8 @@ pub(crate) struct WebGlState {
     pub(crate) point_buffer: OwnedBuffer,
     pub(crate) line_buffer: OwnedBuffer,
     pub(crate) polygon_buffer: OwnedBuffer,
+    pub(crate) marker_vao: OwnedVAO,
+    pub(crate) marker_buffer: OwnedBuffer,
     pub(crate) polygon_u_origin: Option<WebGlUniformLocation>,
     pub(crate) polygon_u_world_scale: Option<WebGlUniformLocation>,
     pub(crate) line_u_origin: Option<WebGlUniformLocation>,
@@ -269,8 +273,12 @@ pub struct RustyleafMap {
     line_layers: Vec<LineLayer>,
     polygon_layers: Vec<PolygonLayer>,
     geojson_layers: Vec<GeoJSONLayer>,
+    markers: Vec<Marker>,
     spatial_index: RTree<SpatialFeature>,
     spatial_index_dirty: bool,
+    // Whether the last hover hit-test found a feature (used to emit a single
+    // clearing event when the cursor leaves a feature).
+    hovering: bool,
     mouse_state: MouseState,
     // Smooth dragging with momentum
     drag_velocity: (f64, f64),
@@ -301,8 +309,10 @@ impl RustyleafMap {
             line_layers: Vec::new(),
             polygon_layers: Vec::new(),
             geojson_layers: Vec::new(),
+            markers: Vec::new(),
             spatial_index: RTree::new(),
             spatial_index_dirty: true,
+            hovering: false,
             mouse_state: MouseState {
                 is_dragging: false,
                 last_x: 0.0,
@@ -390,7 +400,7 @@ impl RustyleafMap {
         self.tile_loader.textures.borrow_mut().clear();
         self.tile_loader.tiles.clear();
         self.tile_loader.requested.clear();
-        self.tile_loader.closures.clear();
+        self.tile_loader.release_all_closures();
         // Clear GeoJSON layer GPU buffers (triggers OwnedBuffer::Drop → delete_buffer)
         for layer in &self.geojson_layers {
             layer.polygon_vertex_buffer.borrow_mut().take();
@@ -495,6 +505,9 @@ impl RustyleafMap {
         let line_vao = context.create_vertex_array().ok_or_else(|| RustyleafError::VaoCreation("Failed to create line VAO".into()))?;
         let polygon_vao = context.create_vertex_array().ok_or_else(|| RustyleafError::VaoCreation("Failed to create polygon VAO".into()))?;
 
+        let marker_vao = context.create_vertex_array().ok_or_else(|| RustyleafError::VaoCreation("Failed to create marker VAO".into()))?;
+        let marker_buffer = context.create_buffer().ok_or_else(|| RustyleafError::BufferCreation("Failed to create marker buffer".into()))?;
+
         let tile_buffer = context.create_buffer().ok_or_else(|| RustyleafError::BufferCreation("Failed to create tile buffer".into()))?;
         let point_buffer = context.create_buffer().ok_or_else(|| RustyleafError::BufferCreation("Failed to create point buffer".into()))?;
         let line_buffer = context.create_buffer().ok_or_else(|| RustyleafError::BufferCreation("Failed to create line buffer".into()))?;
@@ -528,6 +541,8 @@ impl RustyleafMap {
             point_vao: OwnedVAO::new(&context, point_vao),
             line_vao: OwnedVAO::new(&context, line_vao),
             polygon_vao: OwnedVAO::new(&context, polygon_vao),
+            marker_vao: OwnedVAO::new(&context, marker_vao),
+            marker_buffer: OwnedBuffer::new(&context, marker_buffer),
             tile_buffer: OwnedBuffer::new(&context, tile_buffer),
             point_buffer: OwnedBuffer::new(&context, point_buffer),
             line_buffer: OwnedBuffer::new(&context, line_buffer),
@@ -580,6 +595,7 @@ impl RustyleafMap {
         self.render_lines(&context)?;
         self.render_polygons(&context)?;
         self.render_geojson(&context)?;
+        self.render_markers(&context)?;
 
         Ok(())
     }
@@ -650,6 +666,80 @@ impl RustyleafMap {
         }
     }
 
+    fn render_markers(&mut self, context: &WebGl2RenderingContext) -> Result<(), JsValue> {
+        if self.markers.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(ref gl_state) = self.gl_state {
+            // Markers reuse the point program, drawn as round GPU sprites. We keep
+            // a dedicated VAO/buffer so we never disturb the point-layer VAO.
+            context.use_program(Some(gl_state.programs.point_program.inner()));
+            context.bind_vertex_array(Some(gl_state.marker_vao.inner()));
+
+            let count = self.markers.iter().filter(|m| m.visible.get()).count();
+            if count == 0 {
+                return Ok(());
+            }
+
+            // Sort by z_order so lower markers draw first (painter's algorithm).
+            let mut order: Vec<usize> = (0..self.markers.len()).collect();
+            order.sort_by_key(|&i| self.markers[i].z_order);
+
+            let mut vertex_data: Vec<f32> = Vec::with_capacity(count * 7);
+            for i in order {
+                let m = &self.markers[i];
+                if !m.visible.get() {
+                    continue;
+                }
+                let (nx, ny) = self.viewport().lat_lng_to_normalized(m.lat, m.lng);
+                vertex_data.extend_from_slice(&[
+                    nx as f32, ny as f32,
+                    m.size,
+                    m.color[0], m.color[1], m.color[2], m.color[3],
+                ]);
+            }
+
+            context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(gl_state.marker_buffer.inner()));
+            let vertices = Float32Array::from(&vertex_data[..]);
+            context.buffer_data_with_array_buffer_view(
+                WebGl2RenderingContext::ARRAY_BUFFER,
+                &vertices,
+                WebGl2RenderingContext::DYNAMIC_DRAW,
+            );
+
+            let stride = 7 * 4;
+            context.enable_vertex_attrib_array(0);
+            context.vertex_attrib_pointer_with_i32(0, 2, WebGl2RenderingContext::FLOAT, false, stride, 0);
+            context.enable_vertex_attrib_array(1);
+            context.vertex_attrib_pointer_with_i32(1, 1, WebGl2RenderingContext::FLOAT, false, stride, 2 * 4);
+            context.enable_vertex_attrib_array(2);
+            context.vertex_attrib_pointer_with_i32(2, 4, WebGl2RenderingContext::FLOAT, false, stride, 3 * 4);
+
+            let projection_matrix = screen_projection_matrix(&self.viewport());
+            if let Some(loc) = context.get_uniform_location(gl_state.programs.point_program.inner(), "u_matrix") {
+                context.uniform_matrix4fv_with_f32_array(Some(&loc), false, &projection_matrix);
+            }
+
+            let zoom = self.viewport().zoom.round() as u32;
+            let center_pixel = self.viewport().lat_lng_to_pixel(self.viewport().center_lat, self.viewport().center_lng, zoom);
+            let origin_x = (center_pixel.0 - self.viewport().width as f64 / 2.0) as f32;
+            let origin_y = (center_pixel.1 - self.viewport().height as f64 / 2.0) as f32;
+            let world_scale = self.viewport().tile_size as f32 * (1u32 << zoom) as f32;
+
+            if let Some(loc) = gl_state.point_u_origin.as_ref() {
+                context.uniform2f(Some(loc), origin_x, origin_y);
+            }
+            if let Some(loc) = gl_state.point_u_world_scale.as_ref() {
+                context.uniform1f(Some(loc), world_scale);
+            }
+
+            context.draw_arrays(WebGl2RenderingContext::POINTS, 0, (vertex_data.len() / 7) as i32);
+        }
+
+        Ok(())
+    }
+
     #[wasm_bindgen]
     pub fn resize(&mut self, width: u32, height: u32) -> Result<(), JsValue> {
         self.width = width;
@@ -672,8 +762,68 @@ impl RustyleafMap {
     // removed stale canvas 2D debug renderer
 
     // Event handling methods (simplified)
-    fn trigger_feature_click(&mut self, hit_info: serde_json::Value) {
-        web_sys::console::log_1(&format!("Feature clicked: {:?}", hit_info).into());
+    // Fire the map-level click callbacks with a `feature` payload (the hit
+    // feature's meta/properties) so JS layers can dispatch per-feature events.
+    fn trigger_feature_click(&mut self, hit_info: serde_json::Value, canvas_x: f64, canvas_y: f64) {
+        let point_array = Array::new();
+        point_array.push(&JsValue::from_f64(canvas_x));
+        point_array.push(&JsValue::from_f64(canvas_y));
+        let latlng = self.unproject(&point_array.into());
+        if latlng.length() != 2 {
+            return;
+        }
+        let lat = latlng.get(0).as_f64().unwrap_or(0.0);
+        let lng = latlng.get(1).as_f64().unwrap_or(0.0);
+        let latlng_arr = Array::new();
+        latlng_arr.push(&JsValue::from_f64(lat));
+        latlng_arr.push(&JsValue::from_f64(lng));
+        let point = self.project(&JsValue::from(latlng_arr));
+        if let Ok(event_obj) = create_click_event(lat, lng, &point) {
+            let feature = js_sys::JSON::parse(&hit_info.to_string()).unwrap_or(JsValue::NULL);
+            let _ = js_sys::Reflect::set(&event_obj, &JsValue::from_str("feature"), &feature);
+            trigger_event(&self.events.click_callbacks, &event_obj);
+        }
+    }
+
+    // Hover hit-testing, called from JS on mousemove while not dragging.
+    // Fires the hover callbacks with the hit feature (or leaves them silent
+    // when nothing is under the cursor and nothing was hovered before).
+    #[wasm_bindgen]
+    pub fn handle_mouse_hover(&mut self, canvas_x: f64, canvas_y: f64) {
+        if self.events.hover_callbacks.is_empty() {
+            return;
+        }
+        if self.spatial_index_dirty {
+            self.rebuild_spatial_index();
+        }
+        let hit = self.hit_test(canvas_x, canvas_y);
+        let was_hovering = self.hovering;
+        self.hovering = hit.is_some();
+        if hit.is_none() && !was_hovering {
+            return; // nothing hovered, nothing to clear
+        }
+        let point_array = Array::new();
+        point_array.push(&JsValue::from_f64(canvas_x));
+        point_array.push(&JsValue::from_f64(canvas_y));
+        let latlng = self.unproject(&point_array.into());
+        if latlng.length() != 2 {
+            return;
+        }
+        let lat = latlng.get(0).as_f64().unwrap_or(0.0);
+        let lng = latlng.get(1).as_f64().unwrap_or(0.0);
+        let latlng_arr = Array::new();
+        latlng_arr.push(&JsValue::from_f64(lat));
+        latlng_arr.push(&JsValue::from_f64(lng));
+        let point = self.project(&JsValue::from(latlng_arr));
+        if let Ok(event_obj) = create_click_event(lat, lng, &point) {
+            let _ = js_sys::Reflect::set(&event_obj, &JsValue::from_str("type"), &JsValue::from_str("hover"));
+            let feature = match hit {
+                Some(info) => js_sys::JSON::parse(&info.to_string()).unwrap_or(JsValue::NULL),
+                None => JsValue::NULL,
+            };
+            let _ = js_sys::Reflect::set(&event_obj, &JsValue::from_str("feature"), &feature);
+            trigger_event(&self.events.hover_callbacks, &event_obj);
+        }
     }
 
     // Public event registration methods
@@ -1087,8 +1237,16 @@ impl RustyleafMap {
     }
 
     #[wasm_bindgen]
-    pub fn add_point_layer(&mut self) {
+    pub fn add_point_layer(&mut self) -> usize {
         self.point_layers.push(PointLayer::new());
+        self.point_layers.len() - 1
+    }
+
+    #[wasm_bindgen]
+    pub fn set_point_layer_visible(&mut self, layer_index: usize, visible: bool) {
+        if let Some(layer) = self.point_layers.get_mut(layer_index) {
+            layer.visible = visible;
+        }
     }
 
     #[wasm_bindgen]
@@ -1141,13 +1299,83 @@ impl RustyleafMap {
         Ok(())
     }
 
+    // ---------- Markers (GPU-rendered sprites) ----------
+
     #[wasm_bindgen]
-    pub fn add_line_layer(&mut self) {
+    pub fn add_marker(&mut self) -> u32 {
+        let id = self.markers.len() as u32;
+        self.markers.push(Marker::new());
+        id
+    }
+
+    #[wasm_bindgen]
+    pub fn update_marker(&mut self, id: u32, lat: f64, lng: f64) {
+        if let Some(m) = self.markers.get_mut(id as usize) {
+            m.lat = lat;
+            m.lng = lng;
+        }
+    }
+
+    #[wasm_bindgen]
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_marker_style(
+        &mut self,
+        id: u32,
+        size: f32,
+        r: f32,
+        g: f32,
+        b: f32,
+        a: f32,
+        z_order: i32,
+    ) {
+        if let Some(m) = self.markers.get_mut(id as usize) {
+            m.size = size;
+            m.color = [r, g, b, a];
+            m.z_order = z_order;
+        }
+    }
+
+    #[wasm_bindgen]
+    pub fn set_marker_visible(&mut self, id: u32, visible: bool) {
+        if let Some(m) = self.markers.get_mut(id as usize) {
+            m.visible.set(visible);
+        }
+    }
+
+    #[wasm_bindgen]
+    pub fn remove_marker(&mut self, id: u32) {
+        if (id as usize) < self.markers.len() {
+            self.markers.remove(id as usize);
+        }
+    }
+
+    #[wasm_bindgen]
+    pub fn get_marker_latlng(&self, id: u32) -> Result<JsValue, JsValue> {
+        if let Some(m) = self.markers.get(id as usize) {
+            let arr = js_sys::Array::new();
+            arr.push(&JsValue::from_f64(m.lat));
+            arr.push(&JsValue::from_f64(m.lng));
+            Ok(arr.into())
+        } else {
+            Err(RustyleafError::LayerOutOfBounds { index: id as usize, len: self.markers.len() }.into())
+        }
+    }
+
+    #[wasm_bindgen]
+    pub fn add_line_layer(&mut self) -> usize {
         let line_layer = LineLayer {
             lines: Vec::new(),
             visible: true,
         };
         self.line_layers.push(line_layer);
+        self.line_layers.len() - 1
+    }
+
+    #[wasm_bindgen]
+    pub fn set_line_layer_visible(&mut self, layer_index: usize, visible: bool) {
+        if let Some(layer) = self.line_layers.get_mut(layer_index) {
+            layer.visible = visible;
+        }
     }
 
     #[wasm_bindgen]
@@ -1203,12 +1431,20 @@ impl RustyleafMap {
     }
 
     #[wasm_bindgen]
-    pub fn add_polygon_layer(&mut self) {
+    pub fn add_polygon_layer(&mut self) -> usize {
         let polygon_layer = PolygonLayer {
             polygons: Vec::new(),
             visible: true,
         };
         self.polygon_layers.push(polygon_layer);
+        self.polygon_layers.len() - 1
+    }
+
+    #[wasm_bindgen]
+    pub fn set_polygon_layer_visible(&mut self, layer_index: usize, visible: bool) {
+        if let Some(layer) = self.polygon_layers.get_mut(layer_index) {
+            layer.visible = visible;
+        }
     }
 
     #[wasm_bindgen]
@@ -1269,7 +1505,7 @@ impl RustyleafMap {
     }
 
     #[wasm_bindgen]
-    pub fn add_geojson_layer(&mut self) {
+    pub fn add_geojson_layer(&mut self) -> usize {
         let geojson_layer = GeoJSONLayer {
             features: Vec::new(),
             visible: true,
@@ -1283,6 +1519,14 @@ impl RustyleafMap {
             line_vertex_count: Cell::new(0),
         };
         self.geojson_layers.push(geojson_layer);
+        self.geojson_layers.len() - 1
+    }
+
+    #[wasm_bindgen]
+    pub fn set_geojson_layer_visible(&mut self, layer_index: usize, visible: bool) {
+        if let Some(layer) = self.geojson_layers.get_mut(layer_index) {
+            layer.visible = visible;
+        }
     }
 
     #[wasm_bindgen]
@@ -1372,6 +1616,10 @@ impl RustyleafMap {
             }
 
             self.geojson_layers[layer_index].style = style;
+            // The render cache bakes style into the cached features, so a
+            // style change must rebuild it — otherwise styles set after
+            // load_geojson (the normal addTo order) never take effect.
+            self.rebuild_geojson_cache(layer_index)?;
         }
 
         Ok(())
@@ -1456,7 +1704,7 @@ impl RustyleafMap {
                     self.rebuild_spatial_index();
                 }
                 if let Some(hit_info) = self.hit_test(canvas_x, canvas_y) {
-                    self.trigger_feature_click(hit_info);
+                    self.trigger_feature_click(hit_info, canvas_x, canvas_y);
                 } else {
                     // Convert canvas coordinates to lat/lng for map-level click
                     let point_array = Array::new();
@@ -1851,7 +2099,7 @@ impl RustyleafMap {
     // Spatial indexing and hit-testing methods
     fn rebuild_spatial_index(&mut self) {
         rebuild_spatial_index(
-            &self.point_layers, &self.line_layers, &self.polygon_layers,
+            &self.point_layers, &self.line_layers, &self.polygon_layers, &self.geojson_layers,
             &mut self.spatial_index, &mut self.spatial_index_dirty
         );
     }
@@ -2166,6 +2414,7 @@ impl PointLayerApi {
     }
 }
 
-// Test module
-#[cfg(test)]
+// Test module — uses wasm_bindgen_test, which only compiles for the wasm
+// target. Run with `wasm-pack test`; a native `cargo test` compiles nothing.
+#[cfg(all(test, target_arch = "wasm32"))]
 mod tests;

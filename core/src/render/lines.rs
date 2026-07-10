@@ -32,19 +32,38 @@ pub fn render_lines(
 
         let mut vertex_data = Vec::new();
 
+        // Each segment is expanded into a screen-space quad (two triangles)
+        // perpendicular to its direction, so `width` is honored — WebGL2's
+        // native lineWidth is effectively fixed at 1.0.
         for line in layer.lines.iter() {
+            let half_width = (line.width.max(1.0) as f64) / 2.0;
             for i in 0..line.points.len().saturating_sub(1) {
                 let start = line.points[i];
                 let end = line.points[i + 1];
 
-                let start_screen = viewport.lat_lng_to_screen(start[0], start[1]);
-                let end_screen = viewport.lat_lng_to_screen(end[0], end[1]);
+                let s = viewport.lat_lng_to_screen(start[0], start[1]);
+                let e = viewport.lat_lng_to_screen(end[0], end[1]);
 
+                let dx = e.0 - s.0;
+                let dy = e.1 - s.1;
+                let len = (dx * dx + dy * dy).sqrt();
+                if len < 1e-6 {
+                    continue;
+                }
+                let nx = (-dy / len * half_width) as f32;
+                let ny = (dx / len * half_width) as f32;
+                let (sx, sy) = (s.0 as f32, s.1 as f32);
+                let (ex, ey) = (e.0 as f32, e.1 as f32);
+                let c = line.color;
+
+                // quad corners: a = s+n, b = s-n, d = e+n, f = e-n
                 vertex_data.extend_from_slice(&[
-                    start_screen.0 as f32, start_screen.1 as f32,
-                    line.color[0], line.color[1], line.color[2], line.color[3],
-                    end_screen.0 as f32, end_screen.1 as f32,
-                    line.color[0], line.color[1], line.color[2], line.color[3],
+                    sx + nx, sy + ny, c[0], c[1], c[2], c[3],
+                    sx - nx, sy - ny, c[0], c[1], c[2], c[3],
+                    ex + nx, ey + ny, c[0], c[1], c[2], c[3],
+                    sx - nx, sy - ny, c[0], c[1], c[2], c[3],
+                    ex - nx, ey - ny, c[0], c[1], c[2], c[3],
+                    ex + nx, ey + ny, c[0], c[1], c[2], c[3],
                 ]);
             }
         }
@@ -76,7 +95,7 @@ pub fn render_lines(
             }
 
             let total_vertices = vertex_data.len() / 6;
-            context.draw_arrays(WebGl2RenderingContext::LINES, 0, total_vertices as i32);
+            context.draw_arrays(WebGl2RenderingContext::TRIANGLES, 0, total_vertices as i32);
         }
     }
 

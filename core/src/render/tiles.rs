@@ -45,15 +45,20 @@ pub fn render_tiles(
     let mut tiles_rendered = 0;
 
     let mut tiles_to_load = Vec::new();
+    let world_tiles = 1i64 << tile_zoom.min(30);
     for i in 0..tiles_x {
         for j in 0..tiles_y {
-            let tile_x = start_tile_x + i;
-            let tile_y = start_tile_y + j;
+            let tile_x = (start_tile_x + i) as i64;
+            let tile_y = (start_tile_y + j) as i64;
 
-            if tile_x >= 0 && tile_y >= 0 && tile_x < (1 << tile_zoom) && tile_y < (1 << tile_zoom) {
-                let key = format!("{}/{}/{}", tile_zoom, tile_x, tile_y);
-                let pixel_x = (tile_x * tile_size as i32) as f64 - start_x;
-                let pixel_y = (tile_y * tile_size as i32) as f64 - start_y;
+            // Wrap horizontally so the world repeats (Leaflet-style); latitude
+            // does not wrap. The texture key uses the wrapped x, the screen
+            // position uses the unwrapped one.
+            if tile_y >= 0 && tile_y < world_tiles {
+                let wrapped_x = ((tile_x % world_tiles) + world_tiles) % world_tiles;
+                let key = format!("{}/{}/{}", tile_zoom, wrapped_x, tile_y);
+                let pixel_x = (tile_x * tile_size as i64) as f64 - start_x;
+                let pixel_y = (tile_y * tile_size as i64) as f64 - start_y;
 
                 if let Some(texture) = tile_loader.textures.borrow().get(&key) {
                     context.active_texture(WebGl2RenderingContext::TEXTURE0);
@@ -100,7 +105,7 @@ pub fn render_tiles(
                     context.draw_arrays(WebGl2RenderingContext::TRIANGLE_STRIP, 0, 4);
                     tiles_rendered += 1;
                 } else {
-                    let tile_coord = TileCoord { x: tile_x, y: tile_y, z: tile_zoom };
+                    let tile_coord = TileCoord { x: wrapped_x as i32, y: tile_y as i32, z: tile_zoom };
                     let should_load = !tile_loader.requested.contains(&key);
                     if should_load {
                         tiles_to_load.push((key.clone(), tile_coord));

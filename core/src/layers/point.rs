@@ -10,6 +10,13 @@ pub struct PointLayer {
     pub(crate) vertex_count: Cell<usize>,
     // Set when `points` changes so the render pass re-uploads the GPU buffer.
     pub(crate) gpu_dirty: Cell<bool>,
+    // Normalized-mercator bounding box of the uploaded points and their mean
+    // footprint (size² px). Used by the render pass to bound overdraw: when
+    // the layer collapses to a small screen area at low zoom, only a fair
+    // random sample is drawn (vertices are uploaded pre-shuffled).
+    pub(crate) norm_min: Cell<(f32, f32)>,
+    pub(crate) norm_max: Cell<(f32, f32)>,
+    pub(crate) avg_point_area: Cell<f32>,
 }
 
 impl PointLayer {
@@ -20,6 +27,9 @@ impl PointLayer {
             vertex_buffer: RefCell::new(None),
             vertex_count: Cell::new(0),
             gpu_dirty: Cell::new(true),
+            norm_min: Cell::new((0.0, 0.0)),
+            norm_max: Cell::new((1.0, 1.0)),
+            avg_point_area: Cell::new(25.0),
         }
     }
 }
