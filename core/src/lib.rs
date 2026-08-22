@@ -134,6 +134,11 @@ pub(crate) struct WebGlState {
     pub(crate) tile_vao: OwnedVAO,
     pub(crate) point_vao: OwnedVAO,
     pub(crate) line_vao: OwnedVAO,
+    pub(crate) line_gpu_vao: OwnedVAO,
+    // Held for RAII lifetime only — its attribute pointers live inside
+    // line_gpu_vao after initialize_webgl configures them.
+    #[allow(dead_code)]
+    pub(crate) line_gpu_corner_buffer: OwnedBuffer,
     pub(crate) polygon_vao: OwnedVAO,
     pub(crate) tile_buffer: OwnedBuffer,
     pub(crate) point_buffer: OwnedBuffer,
@@ -145,6 +150,8 @@ pub(crate) struct WebGlState {
     pub(crate) polygon_u_world_scale: Option<WebGlUniformLocation>,
     pub(crate) line_u_origin: Option<WebGlUniformLocation>,
     pub(crate) line_u_world_scale: Option<WebGlUniformLocation>,
+    pub(crate) line_gpu_u_origin: Option<WebGlUniformLocation>,
+    pub(crate) line_gpu_u_world_scale: Option<WebGlUniformLocation>,
     pub(crate) point_u_origin: Option<WebGlUniformLocation>,
     pub(crate) point_u_world_scale: Option<WebGlUniformLocation>,
 }
@@ -506,6 +513,9 @@ impl RustyleafMap {
         let line_u_origin = context.get_uniform_location(programs.line_program.inner(), "u_origin");
         let line_u_world_scale = context.get_uniform_location(programs.line_program.inner(), "u_world_scale");
 
+        let line_gpu_u_origin = context.get_uniform_location(programs.line_gpu_program.inner(), "u_origin");
+        let line_gpu_u_world_scale = context.get_uniform_location(programs.line_gpu_program.inner(), "u_world_scale");
+
         let point_u_origin = context.get_uniform_location(programs.point_program.inner(), "u_origin");
         let point_u_world_scale = context.get_uniform_location(programs.point_program.inner(), "u_world_scale");
 
@@ -513,6 +523,7 @@ impl RustyleafMap {
         let tile_vao = context.create_vertex_array().ok_or_else(|| RustyleafError::VaoCreation("Failed to create tile VAO".into()))?;
         let point_vao = context.create_vertex_array().ok_or_else(|| RustyleafError::VaoCreation("Failed to create point VAO".into()))?;
         let line_vao = context.create_vertex_array().ok_or_else(|| RustyleafError::VaoCreation("Failed to create line VAO".into()))?;
+        let line_gpu_vao = context.create_vertex_array().ok_or_else(|| RustyleafError::VaoCreation("Failed to create GPU line VAO".into()))?;
         let polygon_vao = context.create_vertex_array().ok_or_else(|| RustyleafError::VaoCreation("Failed to create polygon VAO".into()))?;
 
         let marker_vao = context.create_vertex_array().ok_or_else(|| RustyleafError::VaoCreation("Failed to create marker VAO".into()))?;
@@ -522,6 +533,30 @@ impl RustyleafMap {
         let point_buffer = context.create_buffer().ok_or_else(|| RustyleafError::BufferCreation("Failed to create point buffer".into()))?;
         let line_buffer = context.create_buffer().ok_or_else(|| RustyleafError::BufferCreation("Failed to create line buffer".into()))?;
         let polygon_buffer = context.create_buffer().ok_or_else(|| RustyleafError::BufferCreation("Failed to create polygon buffer".into()))?;
+        let line_gpu_corner_buffer = context.create_buffer().ok_or_else(|| RustyleafError::BufferCreation("Failed to create GPU line corner buffer".into()))?;
+
+        // Static corner table for the instanced GPU line path: 6 corners per
+        // segment as (t along segment, side sign) — two triangles.
+        context.bind_vertex_array(Some(&line_gpu_vao));
+        context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(&line_gpu_corner_buffer));
+        let corners: [f32; 12] = [
+            0.0, 1.0,
+            0.0, -1.0,
+            1.0, 1.0,
+            0.0, -1.0,
+            1.0, -1.0,
+            1.0, 1.0,
+        ];
+        let corner_array = Float32Array::from(&corners[..]);
+        context.buffer_data_with_array_buffer_view(
+            WebGl2RenderingContext::ARRAY_BUFFER,
+            &corner_array,
+            WebGl2RenderingContext::STATIC_DRAW,
+        );
+        context.enable_vertex_attrib_array(4); // a_corner
+        context.vertex_attrib_pointer_with_i32(4, 2, WebGl2RenderingContext::FLOAT, false, 8, 0);
+        context.vertex_attrib_divisor(4, 0);
+        context.bind_vertex_array(None);
 
         // Setup tile VAO with fixed attribute indices (matched via bind_attrib_location)
         context.bind_vertex_array(Some(&tile_vao));
@@ -550,6 +585,8 @@ impl RustyleafMap {
             tile_vao: OwnedVAO::new(&context, tile_vao),
             point_vao: OwnedVAO::new(&context, point_vao),
             line_vao: OwnedVAO::new(&context, line_vao),
+            line_gpu_vao: OwnedVAO::new(&context, line_gpu_vao),
+            line_gpu_corner_buffer: OwnedBuffer::new(&context, line_gpu_corner_buffer),
             polygon_vao: OwnedVAO::new(&context, polygon_vao),
             marker_vao: OwnedVAO::new(&context, marker_vao),
             marker_buffer: OwnedBuffer::new(&context, marker_buffer),
@@ -561,6 +598,8 @@ impl RustyleafMap {
             polygon_u_world_scale,
             line_u_origin,
             line_u_world_scale,
+            line_gpu_u_origin,
+            line_gpu_u_world_scale,
             point_u_origin,
             point_u_world_scale,
         });
@@ -659,7 +698,8 @@ impl RustyleafMap {
         }
 
         if let Some(ref gl_state) = self.gl_state {
-            render::points::render_points(context, gl_state, &self.point_layers, &self.viewport())
+            let interacting = self.mouse_state.is_dragging || self.has_momentum;
+            render::points::render_points(context, gl_state, &self.point_layers, &self.viewport(), interacting)
         } else {
             Ok(())
         }
@@ -1476,10 +1516,7 @@ impl RustyleafMap {
     #[wasm_bindgen]
     pub fn add_line_layer(&mut self) -> usize {
         self.needs_redraw = true;
-        let line_layer = LineLayer {
-            lines: Vec::new(),
-            visible: true,
-        };
+        let line_layer = LineLayer::new();
         self.line_layers.push(line_layer);
         self.line_layers.len() - 1
     }
@@ -1541,6 +1578,7 @@ impl RustyleafMap {
         }
 
         self.line_layers[layer_index].lines = lines;
+        self.line_layers[layer_index].gpu_dirty.set(true);
         self.spatial_index_dirty = true;
         Ok(())
     }
@@ -1548,10 +1586,7 @@ impl RustyleafMap {
     #[wasm_bindgen]
     pub fn add_polygon_layer(&mut self) -> usize {
         self.needs_redraw = true;
-        let polygon_layer = PolygonLayer {
-            polygons: Vec::new(),
-            visible: true,
-        };
+        let polygon_layer = PolygonLayer::new();
         self.polygon_layers.push(polygon_layer);
         self.polygon_layers.len() - 1
     }
@@ -1618,6 +1653,7 @@ impl RustyleafMap {
         }
 
         self.polygon_layers[layer_index].polygons = polygons;
+        self.polygon_layers[layer_index].gpu_dirty.set(true);
         self.spatial_index_dirty = true;
         Ok(())
     }

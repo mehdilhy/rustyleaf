@@ -4,6 +4,8 @@ use js_sys::Float32Array;
 
 use crate::layers::polygon::PolygonLayer;
 use crate::projection::Viewport;
+use crate::error::RustyleafError;
+use crate::OwnedBuffer;
 use crate::WebGlState;
 
 pub fn render_polygons(
@@ -16,83 +18,111 @@ pub fn render_polygons(
         return Ok(());
     }
 
-    context.use_program(Some(gl_state.programs.polygon_program.inner()));
-    context.bind_vertex_array(Some(gl_state.polygon_vao.inner()));
-
-    let projection_matrix = super::screen_projection_matrix(viewport);
-    let u_matrix = context.get_uniform_location(gl_state.programs.polygon_program.inner(), "u_matrix");
-    if let Some(loc) = u_matrix.as_ref() {
-        context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
-    }
-
-    // This pass uploads screen-space coords, so neutralize the world-space
-    // projection uniforms (they default to 0, which collapses every vertex).
-    if let Some(ref loc) = gl_state.polygon_u_origin {
-        context.uniform2f(Some(loc), 0.0, 0.0);
-    }
-    if let Some(ref loc) = gl_state.polygon_u_world_scale {
-        context.uniform1f(Some(loc), 1.0);
-    }
-
     for layer in polygon_layers {
         if !layer.visible {
             continue;
         }
 
-        let mut vertex_data = Vec::new();
+        // Triangulate + project ONCE per data change (normalized world
+        // coords); every later frame is a single draw call with the view
+        // applied through uniforms.
+        if layer.gpu_dirty.get() || layer.vertex_buffer.borrow().is_none() {
+            let mut vertex_data: Vec<f32> = Vec::new();
+            const MAX_VERTICES: usize = 2_000_000;
 
-        for polygon in layer.polygons.iter() {
-            if polygon.rings.is_empty() {
-                continue;
-            }
-
-            for ring in &polygon.rings {
-                if ring.len() < 3 {
+            'outer: for polygon in layer.polygons.iter() {
+                if polygon.rings.is_empty() {
                     continue;
                 }
-
-                let triangles = triangulate_polygon(ring);
-
-                for triangle in triangles.chunks(3) {
-                    if triangle.len() == 3 {
-                        for &[lat, lng] in triangle {
-                            let screen_pos = viewport.lat_lng_to_screen(lat, lng);
+                for ring in &polygon.rings {
+                    if ring.len() < 3 {
+                        continue;
+                    }
+                    let triangles = triangulate_polygon(ring);
+                    let mut i = 0;
+                    while i + 2 < triangles.len() {
+                        for k in 0..3 {
+                            let t = triangles[i + k];
+                            let (nx, ny) = viewport.lat_lng_to_normalized(t[0], t[1]);
                             vertex_data.extend_from_slice(&[
-                                screen_pos.0 as f32, screen_pos.1 as f32,
+                                nx as f32, ny as f32,
                                 polygon.color[0], polygon.color[1], polygon.color[2], polygon.color[3],
                             ]);
+                        }
+                        i += 3;
+                        if vertex_data.len() > MAX_VERTICES * 6 {
+                            break 'outer;
                         }
                     }
                 }
             }
-        }
 
-        if !vertex_data.is_empty() {
-            // Bulk copy — element-wise set_index is prohibitively slow for large layers
-            let vertices = Float32Array::from(&vertex_data[..]);
+            if layer.vertex_buffer.borrow().is_none() {
+                let buf = context
+                    .create_buffer()
+                    .ok_or_else(|| RustyleafError::BufferCreation("Failed to create polygon layer buffer".into()))?;
+                *layer.vertex_buffer.borrow_mut() = Some(OwnedBuffer::new(context, buf));
+            }
 
-            context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(gl_state.polygon_buffer.inner()));
+            context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(layer.vertex_buffer.borrow().as_ref().unwrap().inner()));
+            let array = Float32Array::from(&vertex_data[..]);
             context.buffer_data_with_array_buffer_view(
                 WebGl2RenderingContext::ARRAY_BUFFER,
-                &vertices,
+                &array,
                 WebGl2RenderingContext::STATIC_DRAW,
             );
-
-            let stride = 6 * 4;
-
-            context.enable_vertex_attrib_array(0);
-            context.vertex_attrib_pointer_with_i32(0, 2, WebGl2RenderingContext::FLOAT, false, stride, 0);
-
-            context.enable_vertex_attrib_array(1);
-            context.vertex_attrib_pointer_with_i32(1, 4, WebGl2RenderingContext::FLOAT, false, stride, 2 * 4);
-
-            let total_vertices = vertex_data.len() / 6;
-            context.draw_arrays(WebGl2RenderingContext::TRIANGLES, 0, total_vertices as i32);
+            layer.vertex_count.set(vertex_data.len() / 6);
+            layer.gpu_dirty.set(false);
         }
+
+        let vertex_count = layer.vertex_count.get();
+        if vertex_count == 0 {
+            continue;
+        }
+
+        let buffer_owned = layer.vertex_buffer.borrow();
+        let buffer = match buffer_owned.as_ref() {
+            Some(b) => b,
+            None => continue,
+        };
+
+        context.use_program(Some(gl_state.programs.polygon_program.inner()));
+        context.bind_vertex_array(Some(gl_state.polygon_vao.inner()));
+        context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(buffer.inner()));
+
+        let stride = 6 * 4;
+        context.enable_vertex_attrib_array(0);
+        context.vertex_attrib_pointer_with_i32(0, 2, WebGl2RenderingContext::FLOAT, false, stride, 0);
+        context.enable_vertex_attrib_array(1);
+        context.vertex_attrib_pointer_with_i32(1, 4, WebGl2RenderingContext::FLOAT, false, stride, 12);
+
+        let projection_matrix = super::screen_projection_matrix(viewport);
+        let program = gl_state.programs.polygon_program.inner();
+        let u_matrix = context.get_uniform_location(program, "u_matrix");
+        if let Some(loc) = u_matrix.as_ref() {
+            context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
+        }
+
+        let zoom = (viewport.zoom.round() as i64).clamp(0, 30) as u32;
+        let center_pixel = viewport.lat_lng_to_pixel(viewport.center_lat, viewport.center_lng, zoom);
+        if let Some(loc) = gl_state.polygon_u_origin.as_ref() {
+            context.uniform2f(
+                Some(loc),
+                (center_pixel.0 - viewport.width as f64 / 2.0) as f32,
+                (center_pixel.1 - viewport.height as f64 / 2.0) as f32,
+            );
+        }
+        if let Some(loc) = gl_state.polygon_u_world_scale.as_ref() {
+            context.uniform1f(Some(loc), (viewport.tile_size as u64 * (1u64 << zoom)) as f32);
+        }
+
+        context.draw_arrays(WebGl2RenderingContext::TRIANGLES, 0, vertex_count as i32);
     }
 
     Ok(())
 }
+
+// Ear-clipping triangulation helpers (shared with the GeoJSON path).
 
 pub fn triangulate_polygon(points: &[[f64; 2]]) -> Vec<[f64; 2]> {
     if points.len() < 3 {

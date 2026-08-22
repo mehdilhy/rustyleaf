@@ -11,6 +11,7 @@ pub fn render_points(
     gl_state: &WebGlState,
     point_layers: &[PointLayer],
     viewport: &Viewport,
+    interaction_lod: bool,
 ) -> Result<(), JsValue> {
     if point_layers.is_empty() {
         return Ok(());
@@ -134,11 +135,21 @@ pub fn render_points(
         let budget = MAX_OVERDRAW * ext_x * ext_y;
         let avg_area = layer.avg_point_area.get().max(1.0);
         let fragments = total as f32 * avg_area;
-        let draw_count = if fragments > budget {
+        let mut draw_count = if fragments > budget {
             ((budget / avg_area) as usize).max(MIN_SAMPLE).min(total)
         } else {
             total
         };
+
+        // Interaction LOD: while the user is actively dragging/flinging,
+        // software rasterizers (and weak GPUs) choke on full multi-million
+        // point draws. Vertices are uploaded pre-shuffled, so capping to a
+        // prefix is a fair random sample; the next frame after the gesture
+        // ends redraws everything.
+        const INTERACTION_MAX: usize = 50_000;
+        if interaction_lod && draw_count > INTERACTION_MAX {
+            draw_count = INTERACTION_MAX;
+        }
 
         context.draw_arrays(WebGl2RenderingContext::POINTS, 0, draw_count as i32);
     }

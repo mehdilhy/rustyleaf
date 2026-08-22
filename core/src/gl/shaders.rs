@@ -113,12 +113,42 @@ void main() {
 }
 "#;
 
+// GPU-resident width-expanded lines. Segment data is uploaded ONCE (per
+// instance: start/end in normalized world coords + pixel half-width + color)
+// and each of the 6 corner vertices per segment is expanded in the vertex
+// shader, so panning/zooming costs no CPU vertex rebuilds at all.
+pub(crate) const LINE_GPU_VERTEX_SHADER: &str = r#"
+attribute vec2 a_start;      // normalized [0..1] segment start (per instance)
+attribute vec2 a_end;        // normalized [0..1] segment end   (per instance)
+attribute float a_half_width; // pixels                          (per instance)
+attribute vec4 a_color;      //                                 (per instance)
+attribute vec2 a_corner;     // (t along segment, side sign)    (per vertex)
+
+varying vec4 v_color;
+uniform mat4 u_matrix;
+uniform float u_world_scale;
+uniform vec2 u_origin;
+
+void main() {
+    vec2 sp = a_start * u_world_scale - u_origin;
+    vec2 ep = a_end * u_world_scale - u_origin;
+    vec2 dir = ep - sp;
+    float len = length(dir);
+    // Pixel-space perpendicular; degenerate segments collapse to zero area.
+    vec2 n = len > 0.000001 ? vec2(-dir.y, dir.x) / len : vec2(0.0);
+    vec2 p = mix(sp, ep, a_corner.x) + n * (a_half_width * a_corner.y);
+    gl_Position = u_matrix * vec4(p, 0.0, 1.0);
+    v_color = a_color;
+}
+"#;
+
 // ---------- ShaderPrograms struct ----------
 
 pub(crate) struct ShaderPrograms {
     pub tile_program: OwnedProgram,
     pub point_program: OwnedProgram,
     pub line_program: OwnedProgram,
+    pub line_gpu_program: OwnedProgram,
     pub polygon_program: OwnedProgram,
 }
 
@@ -261,6 +291,29 @@ pub(crate) fn create_shader_programs(
         &[(0, "a_position"), (1, "a_color")],
     )?;
 
+    let line_gpu_vertex_shader = create_shader(
+        context,
+        WebGl2RenderingContext::VERTEX_SHADER,
+        LINE_GPU_VERTEX_SHADER,
+    )?;
+    let line_gpu_fragment_shader = create_shader(
+        context,
+        WebGl2RenderingContext::FRAGMENT_SHADER,
+        LINE_FRAGMENT_SHADER,
+    )?;
+    let line_gpu_program = create_program_with_bindings(
+        context,
+        &line_gpu_vertex_shader,
+        &line_gpu_fragment_shader,
+        &[
+            (0, "a_start"),
+            (1, "a_end"),
+            (2, "a_half_width"),
+            (3, "a_color"),
+            (4, "a_corner"),
+        ],
+    )?;
+
     Ok(ShaderPrograms {
         tile_program: OwnedProgram::new(
             context,
@@ -279,6 +332,12 @@ pub(crate) fn create_shader_programs(
             line_program,
             line_vertex_shader,
             line_fragment_shader,
+        ),
+        line_gpu_program: OwnedProgram::new(
+            context,
+            line_gpu_program,
+            line_gpu_vertex_shader,
+            line_gpu_fragment_shader,
         ),
         polygon_program: OwnedProgram::new(
             context,
