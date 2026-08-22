@@ -72,7 +72,7 @@ Leaflet-style) instead of showing empty gray past ±180°.
 - **Spherical Mercator only** — no custom CRS (EPSG:4326/3395, `SimpleCRS`).
 - Line width applies to `LineLayer`; GeoJSON-styled lines still render 1px.
 - No vector tiles.
-- Polygon *interiors* aren't hit-testable in GeoJSON layers yet — only their outline (triangulated fill geometry has no per-feature metadata attached). `PointLayer`/`LineLayer`/`PolygonLayer` (non-GeoJSON) hit-test normally.
+- Polygon *interiors* are hit-tested via point-in-polygon on the outer ring (holes aren't subtracted yet). `PointLayer`/`LineLayer`/`PolygonLayer` (non-GeoJSON) hit-test normally.
 - Line/polygon vertex data is cached in GPU buffers per layer, but heavy combined scenes still cost more than points alone.
 - Calling map methods synchronously inside a raw wasm event callback (`move`, `zoom`, `click`, ...) throws a re-entrancy error — defer with `queueMicrotask` (the built-in layers already do).
 - Layer `remove()` releases the layer's GPU buffers; the data stays in JS and `addTo` re-uploads it.
