@@ -43,20 +43,22 @@ pub fn render_geojson(ctx: &GeoJsonRenderCtx) -> Result<(), JsValue> {
         if !(geojson_layer.cached_points.is_empty()
             && geojson_layer.cached_lines.is_empty()
             && geojson_layer.cached_polygon_triangles.is_empty()) {
+            // Per-layer GPU buffers only ever belong to THIS layer — never
+            // borrow another layer's buffer (multi-layer mixing bug).
             if !geojson_layer.cached_polygon_triangles.is_empty() {
-                let has_gpu_buffer = ctx.geojson_layers.iter()
-                    .any(|l| l.visible && l.polygon_vertex_buffer.borrow().is_some());
-                if has_gpu_buffer {
-                    render_geojson_polygons(ctx, &[])?;
+                let has_own_gpu_buffer = geojson_layer.polygon_vertex_count.get() > 0
+                    && geojson_layer.polygon_vertex_buffer.borrow().is_some();
+                if has_own_gpu_buffer {
+                    draw_geojson_polygon_gpu(ctx, geojson_layer)?;
                 } else {
                     render_geojson_polygon_triangles(ctx, &geojson_layer.cached_polygon_triangles, geojson_layer.style.polygon_color)?;
                 }
             }
             if !geojson_layer.cached_lines.is_empty() {
-                let has_line_gpu_buffer = ctx.geojson_layers.iter()
-                    .any(|l| l.visible && l.line_vertex_buffer.borrow().is_some());
-                if has_line_gpu_buffer {
-                    render_geojson_lines(ctx, &[])?;
+                let has_own_line_gpu_buffer = geojson_layer.line_vertex_count.get() > 0
+                    && geojson_layer.line_vertex_buffer.borrow().is_some();
+                if has_own_line_gpu_buffer {
+                    draw_geojson_line_gpu(ctx, geojson_layer)?;
                 } else {
                     render_geojson_lines(ctx, &geojson_layer.cached_lines)?;
                 }
@@ -239,45 +241,57 @@ pub fn render_geojson_points(ctx: &GeoJsonRenderCtx, points: &[PointFeature]) ->
     Ok(())
 }
 
+pub fn draw_geojson_line_gpu(ctx: &GeoJsonRenderCtx, layer: &GeoJSONLayer) -> Result<(), JsValue> {
+    let context = ctx.context;
+    let gl_state = ctx.gl_state;
+
+    let buffer = match layer.line_vertex_buffer.borrow().clone() {
+        Some(b) => b,
+        None => return Ok(()),
+    };
+
+    context.use_program(Some(gl_state.programs.line_program.inner()));
+    context.bind_vertex_array(Some(gl_state.line_vao.inner()));
+
+    context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(buffer.inner()));
+    let stride = 6 * 4;
+    context.enable_vertex_attrib_array(0);
+    context.vertex_attrib_pointer_with_i32(0, 2, WebGl2RenderingContext::FLOAT, false, stride, 0);
+    context.enable_vertex_attrib_array(1);
+    context.vertex_attrib_pointer_with_i32(1, 4, WebGl2RenderingContext::FLOAT, false, stride, 2 * 4);
+
+    let projection_matrix = ctx.create_projection_matrix();
+    let u_matrix_loc = context.get_uniform_location(gl_state.programs.line_program.inner(), "u_matrix");
+    if let Some(loc) = u_matrix_loc.as_ref() {
+        context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
+    }
+
+    if let Some(ref loc) = gl_state.line_u_origin {
+        let zoom = ctx.zoom_round();
+        let center_pixel = ctx.viewport.lat_lng_to_pixel(ctx.viewport.center_lat, ctx.viewport.center_lng, zoom);
+        let origin_x = center_pixel.0 - (ctx.viewport.width as f64 / 2.0);
+        let origin_y = center_pixel.1 - (ctx.viewport.height as f64 / 2.0);
+        context.uniform2f(Some(loc), origin_x as f32, origin_y as f32);
+    }
+    if let Some(ref loc) = gl_state.line_u_world_scale {
+        let zoom = ctx.zoom_round();
+        let world_scale = ctx.viewport.tile_size as f32 * (1u32 << zoom) as f32;
+        context.uniform1f(Some(loc), world_scale);
+    }
+
+    let total_vertices = layer.line_vertex_count.get() as i32;
+    if total_vertices > 0 {
+        context.draw_arrays(WebGl2RenderingContext::LINES, 0, total_vertices);
+    }
+    Ok(())
+}
+
 pub fn render_geojson_lines(ctx: &GeoJsonRenderCtx, lines: &[LineFeature]) -> Result<(), JsValue> {
     let context = ctx.context;
     let gl_state = ctx.gl_state;
 
     context.use_program(Some(gl_state.programs.line_program.inner()));
     context.bind_vertex_array(Some(gl_state.line_vao.inner()));
-
-    if let Some(buffer) = ctx.geojson_layers.iter().find(|l| l.visible && l.line_vertex_buffer.borrow().is_some()).and_then(|l| l.line_vertex_buffer.borrow().clone()) {
-        context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(buffer.inner()));
-        let stride = 6 * 4;
-        context.enable_vertex_attrib_array(0);
-        context.vertex_attrib_pointer_with_i32(0, 2, WebGl2RenderingContext::FLOAT, false, stride, 0);
-        context.enable_vertex_attrib_array(1);
-        context.vertex_attrib_pointer_with_i32(1, 4, WebGl2RenderingContext::FLOAT, false, stride, 2 * 4);
-
-        let projection_matrix = ctx.create_projection_matrix();
-        let u_matrix_loc = context.get_uniform_location(gl_state.programs.line_program.inner(), "u_matrix");
-        if let Some(loc) = u_matrix_loc.as_ref() {
-            context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
-        }
-
-        if let Some(ref loc) = gl_state.line_u_origin {
-            let zoom = ctx.zoom_round();
-            let center_pixel = ctx.viewport.lat_lng_to_pixel(ctx.viewport.center_lat, ctx.viewport.center_lng, zoom);
-            let origin_x = center_pixel.0 - (ctx.viewport.width as f64 / 2.0);
-            let origin_y = center_pixel.1 - (ctx.viewport.height as f64 / 2.0);
-            context.uniform2f(Some(loc), origin_x as f32, origin_y as f32);
-        }
-        if let Some(ref loc) = gl_state.line_u_world_scale {
-            let zoom = ctx.zoom_round();
-            let world_scale = ctx.viewport.tile_size as f32 * (1u32 << zoom) as f32;
-            context.uniform1f(Some(loc), world_scale);
-        }
-
-        if let Some(layer) = ctx.geojson_layers.iter().find(|l| l.visible && l.line_vertex_buffer.borrow().is_some()) {
-            let total_vertices = layer.line_vertex_count.get() as i32;
-            if total_vertices > 0 { context.draw_arrays(WebGl2RenderingContext::LINES, 0, total_vertices); return Ok(()); }
-        }
-    }
 
     let mut vertex_data = Vec::new();
 
@@ -343,45 +357,57 @@ pub fn render_geojson_lines(ctx: &GeoJsonRenderCtx, lines: &[LineFeature]) -> Re
     Ok(())
 }
 
+pub fn draw_geojson_polygon_gpu(ctx: &GeoJsonRenderCtx, layer: &GeoJSONLayer) -> Result<(), JsValue> {
+    let context = ctx.context;
+    let gl_state = ctx.gl_state;
+
+    let buffer = match layer.polygon_vertex_buffer.borrow().clone() {
+        Some(b) => b,
+        None => return Ok(()),
+    };
+
+    context.use_program(Some(gl_state.programs.polygon_program.inner()));
+    context.bind_vertex_array(Some(gl_state.polygon_vao.inner()));
+
+    context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(buffer.inner()));
+    let stride = 6 * 4;
+    context.enable_vertex_attrib_array(0);
+    context.vertex_attrib_pointer_with_i32(0, 2, WebGl2RenderingContext::FLOAT, false, stride, 0);
+    context.enable_vertex_attrib_array(1);
+    context.vertex_attrib_pointer_with_i32(1, 4, WebGl2RenderingContext::FLOAT, false, stride, 2 * 4);
+
+    let projection_matrix = ctx.create_projection_matrix();
+    let u_matrix_loc = context.get_uniform_location(gl_state.programs.polygon_program.inner(), "u_matrix");
+    if let Some(loc) = u_matrix_loc.as_ref() {
+        context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
+    }
+
+    if let Some(ref loc) = gl_state.polygon_u_origin {
+        let zoom = ctx.zoom_round();
+        let center_pixel = ctx.viewport.lat_lng_to_pixel(ctx.viewport.center_lat, ctx.viewport.center_lng, zoom);
+        let origin_x = center_pixel.0 - (ctx.viewport.width as f64 / 2.0);
+        let origin_y = center_pixel.1 - (ctx.viewport.height as f64 / 2.0);
+        context.uniform2f(Some(loc), origin_x as f32, origin_y as f32);
+    }
+    if let Some(ref loc) = gl_state.polygon_u_world_scale {
+        let zoom = ctx.zoom_round();
+        let world_scale = ctx.viewport.tile_size as f32 * (1u32 << zoom) as f32;
+        context.uniform1f(Some(loc), world_scale);
+    }
+
+    let total_vertices = layer.polygon_vertex_count.get() as i32;
+    if total_vertices > 0 {
+        context.draw_arrays(WebGl2RenderingContext::TRIANGLES, 0, total_vertices);
+    }
+    Ok(())
+}
+
 pub fn render_geojson_polygons(ctx: &GeoJsonRenderCtx, polygons: &[PolygonFeature]) -> Result<(), JsValue> {
     let context = ctx.context;
     let gl_state = ctx.gl_state;
 
     context.use_program(Some(gl_state.programs.polygon_program.inner()));
     context.bind_vertex_array(Some(gl_state.polygon_vao.inner()));
-
-    if let Some(buffer) = ctx.geojson_layers.iter().find(|l| l.visible && !l.cached_polygon_triangles.is_empty()).and_then(|l| l.polygon_vertex_buffer.borrow().clone()) {
-        context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(buffer.inner()));
-        let stride = 6 * 4;
-        context.enable_vertex_attrib_array(0);
-        context.vertex_attrib_pointer_with_i32(0, 2, WebGl2RenderingContext::FLOAT, false, stride, 0);
-        context.enable_vertex_attrib_array(1);
-        context.vertex_attrib_pointer_with_i32(1, 4, WebGl2RenderingContext::FLOAT, false, stride, 2 * 4);
-
-        let projection_matrix = ctx.create_projection_matrix();
-        let u_matrix_loc = context.get_uniform_location(gl_state.programs.polygon_program.inner(), "u_matrix");
-        if let Some(loc) = u_matrix_loc.as_ref() {
-            context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
-        }
-
-        if let Some(ref loc) = gl_state.polygon_u_origin {
-            let zoom = ctx.zoom_round();
-            let center_pixel = ctx.viewport.lat_lng_to_pixel(ctx.viewport.center_lat, ctx.viewport.center_lng, zoom);
-            let origin_x = center_pixel.0 - (ctx.viewport.width as f64 / 2.0);
-            let origin_y = center_pixel.1 - (ctx.viewport.height as f64 / 2.0);
-            context.uniform2f(Some(loc), origin_x as f32, origin_y as f32);
-        }
-        if let Some(ref loc) = gl_state.polygon_u_world_scale {
-            let zoom = ctx.zoom_round();
-            let world_scale = ctx.viewport.tile_size as f32 * (1u32 << zoom) as f32;
-            context.uniform1f(Some(loc), world_scale);
-        }
-
-        if let Some(layer) = ctx.geojson_layers.iter().find(|l| l.visible && l.polygon_vertex_buffer.borrow().is_some()) {
-            let total_vertices = layer.polygon_vertex_count.get() as i32;
-            if total_vertices > 0 { context.draw_arrays(WebGl2RenderingContext::TRIANGLES, 0, total_vertices); return Ok(()); }
-        }
-    }
 
     let mut vertex_data = Vec::new();
     const MAX_VERTICES: usize = 1000000;
@@ -396,7 +422,10 @@ pub fn render_geojson_polygons(ctx: &GeoJsonRenderCtx, polygons: &[PolygonFeatur
                 continue;
             }
 
-            if ring.len() > 1000 {
+            // Ear clipping is O(n^2); 100k vertices is the practical ceiling.
+            // Previously anything over 1_000 was silently dropped, losing
+            // detailed coastlines/boundaries without any error.
+            if ring.len() > 100_000 {
                 continue;
             }
 

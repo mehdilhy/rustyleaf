@@ -220,6 +220,11 @@ class Map {
     // Derived Leaflet-style events (movestart/moveend, zoomstart/zoomend)
     this._setupDerivedEvents();
 
+    // Marker interactivity (click/hover/mouseover/mouseout + popup auto-open)
+    this._markerRegistry = [];
+    this._hoveredMarker = null;
+    this._setupMarkerInteractivity();
+
     // Start render loop
     this._startRenderLoop();
 
@@ -321,20 +326,82 @@ class Map {
     return this;
   }
   
-  panBy(dx, dy) {
-    this.wasmMap.pan(dx, dy);
+  // Leaflet signature: panBy(offset) where offset is a Point/[x, y] array.
+  // (dx, dy) as two numbers is also accepted for convenience.
+  panBy(dxOrOffset, dy) {
+    let dx = dxOrOffset;
+    if (Array.isArray(dxOrOffset) || (dxOrOffset && typeof dxOrOffset === 'object' && 'x' in dxOrOffset)) {
+      dx = dxOrOffset.x !== undefined ? dxOrOffset.x : dxOrOffset[0];
+      dy = dxOrOffset.y !== undefined ? dxOrOffset.y : dxOrOffset[1];
+    }
+    this.wasmMap.pan(Number(dx) || 0, Number(dy) || 0);
     return this;
   }
   
-  zoomIn() {
-    this.wasmMap.zoom_in();
+  zoomIn(delta) {
+    const n = Math.max(1, Math.round(delta === undefined ? 1 : delta));
+    for (let i = 0; i < n; i++) this.wasmMap.zoom_in();
     return this;
   }
-  
-  zoomOut() {
-    this.wasmMap.zoom_out();
+
+  zoomOut(delta) {
+    const n = Math.max(1, Math.round(delta === undefined ? 1 : delta));
+    for (let i = 0; i < n; i++) this.wasmMap.zoom_out();
     return this;
   }
+
+  // Leaflet-style setters -------------------------------------------------
+
+  setZoom(zoom) {
+    return this.setView(this.getCenter(), zoom);
+  }
+
+  panTo(center) {
+    return this.setView(center, this.getZoom());
+  }
+
+  // Great-circle distance in meters (haversine, R = 6371000 like Leaflet).
+  distance(latlng1, latlng2) {
+    const rad = Math.PI / 180;
+    const dLat = (latlng2[0] - latlng1[0]) * rad;
+    const dLng = (latlng2[1] - latlng1[1]) * rad;
+    const a = Math.sin(dLat / 2) * Math.sin(dLat / 2)
+      + Math.cos(latlng1[0] * rad) * Math.cos(latlng2[0] * rad)
+      * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+    return 6371000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  }
+
+  containerPointToLatLng(point) {
+    const p = Array.isArray(point) ? point : [point.x, point.y];
+    return this.unproject(p);
+  }
+
+  latLngToContainerPoint(latlng) {
+    const p = Array.isArray(latlng) ? latlng : [latlng.lat, latlng.lng];
+    return this.project(p);
+  }
+
+  closePopup() {
+    if (this._activePopup && typeof this._activePopup.close === 'function') {
+      this._activePopup.close();
+    }
+    return this;
+  }
+
+  closeTooltip() {
+    if (this._activeTooltip && typeof this._activeTooltip.close === 'function') {
+      this._activeTooltip.close();
+    }
+    return this;
+  }
+
+  eachLayer(fn) {
+    if (this._attachedLayers) {
+      for (const layer of Array.from(this._attachedLayers)) fn(layer);
+    }
+    return this;
+  }
+
   
   // Get WebGL support information
   getWebGLSupport() {
@@ -378,12 +445,22 @@ class Map {
     return this;
   }
 
-  // Animated pan+zoom to a target view (Leaflet-style flyTo).
-  flyTo(latlng, options = {}) {
-    const duration = options.duration !== undefined ? options.duration : 400;
+  // Animated pan+zoom to a target view. Leaflet signature:
+  // flyTo(latlng, zoom?, options?) — a numeric second arg is the target zoom;
+  // an options object as the second arg is also accepted (rustyleaf legacy).
+  flyTo(latlng, zoomOrOptions, options = {}) {
+    let opts;
+    if (typeof zoomOrOptions === 'number') {
+      opts = { zoom: zoomOrOptions, ...options };
+    } else if (zoomOrOptions && typeof zoomOrOptions === 'object') {
+      opts = zoomOrOptions;
+    } else {
+      opts = {};
+    }
+    const duration = opts.duration !== undefined ? opts.duration : 400;
     const from = this.getCenter();
     const fromZoom = this.getZoom();
-    const targetZoom = options.zoom !== undefined ? options.zoom : fromZoom;
+    const targetZoom = opts.zoom !== undefined ? opts.zoom : fromZoom;
     if (this._flyTimer) {
       clearInterval(this._flyTimer);
       this._flyTimer = null;
@@ -495,50 +572,106 @@ class Map {
     return [latlng[0], latlng[1]];
   }
   
-  on(event, callback) {
-    const eventMap = {
-      'move': 'on_move',
-      'zoom': 'on_zoom',
-      'click': 'on_click',
-      'hover': 'on_hover',
-      'mousedown': 'on_mouse_down',
-      'mouseup': 'on_mouse_up',
-      'contextmenu': 'on_contextmenu',
-      'keydown': 'on_key_down',
-      'keyup': 'on_key_up',
-      'dragend': 'on_dragend'
-    };
-    
-    const wasmMethod = eventMap[event];
-    if (wasmMethod) {
-      this.wasmMap[wasmMethod](callback);
+  static _WASM_EVENT_MAP = {
+    'move': 'on_move',
+    'zoom': 'on_zoom',
+    'click': 'on_click',
+    'hover': 'on_hover',
+    'mousedown': 'on_mouse_down',
+    'mouseup': 'on_mouse_up',
+    'contextmenu': 'on_contextmenu',
+    'keydown': 'on_key_down',
+    'keyup': 'on_key_up',
+    'dragend': 'on_dragend'
+  };
+
+  static _WASM_OFF_MAP = {
+    'move': 'off_move',
+    'zoom': 'off_zoom',
+    'click': 'off_click',
+    'hover': 'off_hover',
+    'mousedown': 'off_mouse_down',
+    'mouseup': 'off_mouse_up',
+    'contextmenu': 'off_contextmenu',
+    'keydown': 'off_key_down',
+    'keyup': 'off_key_up',
+    'dragend': 'off_dragend'
+  };
+
+  _listenerEntry(event, callback) {
+    if (!this._listeners || !this._listeners[event]) return null;
+    return this._listeners[event].find((e) => e.callback === callback) || null;
+  }
+
+  on(event, callback, context) {
+    if (typeof callback !== 'function') return this;
+    this._listeners = this._listeners || {};
+    this._localEvents = this._localEvents || {};
+
+    const wasmMethod = Map._WASM_EVENT_MAP[event];
+    const isWasmEvent = wasmMethod && typeof this.wasmMap[wasmMethod] === 'function';
+
+    if (isWasmEvent) {
+      // WASM events fire while the Rust map is mutably borrowed; any handler
+      // that calls back into the map would hit a RefCell borrow conflict and
+      // abort the callback chain. Defer every wasm-event listener to a
+      // microtask so handlers can safely use the map API (Leaflet handlers
+      // stay synchronous — only the dispatch boundary is async here).
+      const wrapped = (ev) => deferCallback(() => callback.apply(context || this, [ev]));
+      (this._listeners[event] = this._listeners[event] || []).push({ callback, wrapped });
+      this.wasmMap[wasmMethod](wrapped);
     } else {
-      // JS-side events (e.g. 'locationfound', 'locationerror') not handled by the WASM core
-      this._localEvents = this._localEvents || {};
-      (this._localEvents[event] = this._localEvents[event] || []).push(callback);
+      const wrapped = (ev) => callback.apply(context || this, [ev]);
+      (this._listeners[event] = this._listeners[event] || []).push({ callback, wrapped });
+      // JS-side events (e.g. 'locationfound', 'resize', 'load', 'drag*')
+      this._localEvents[event] = this._localEvents[event] || [];
+      this._localEvents[event].push(wrapped);
     }
     return this;
   }
 
-  off(event, callback) {
-    const eventMap = {
-      'move': 'off_move',
-      'zoom': 'off_zoom',
-      'click': 'off_click',
-      'hover': 'off_hover',
-      'mousedown': 'off_mouse_down',
-      'mouseup': 'off_mouse_up',
-      'contextmenu': 'off_contextmenu',
-      'keydown': 'off_key_down',
-      'keyup': 'off_key_up',
-      'dragend': 'off_dragend'
+  once(event, callback, context) {
+    if (typeof callback !== 'function') return this;
+    // Wasm-event dispatch is deferred (microtask), so two events can queue
+    // two invocations before the first one unregisters — guard with a flag.
+    let done = false;
+    let wrapper;
+    wrapper = (ev) => {
+      if (done) return undefined;
+      done = true;
+      this.off(event, wrapper);
+      return callback.apply(context || this, [ev]);
     };
-    
-    const wasmMethod = eventMap[event];
-    if (wasmMethod) {
-      this.wasmMap[wasmMethod](callback);
-    } else if (this._localEvents && this._localEvents[event]) {
-      this._localEvents[event] = this._localEvents[event].filter((cb) => cb !== callback);
+    return this.on(event, wrapper);
+  }
+
+  off(event, callback) {
+    const offMethod = Map._WASM_OFF_MAP[event];
+    const hasWasm = offMethod && typeof this.wasmMap[offMethod] === 'function';
+    this._listeners = this._listeners || {};
+    this._localEvents = this._localEvents || {};
+
+    if (typeof callback === 'function') {
+      const entry = this._listenerEntry(event, callback);
+      const target = entry ? entry.wrapped : callback;
+      if (hasWasm) this.wasmMap[offMethod](target);
+      if (this._localEvents[event]) {
+        this._localEvents[event] = this._localEvents[event].filter((cb) => cb !== target);
+      }
+      if (entry) {
+        this._listeners[event] = this._listeners[event].filter((e) => e !== entry);
+      }
+    } else {
+      // Leaflet semantics: off(type) removes ALL listeners for that type.
+      if (this._listeners[event]) {
+        if (hasWasm) {
+          for (const entry of this._listeners[event]) {
+            this.wasmMap[offMethod](entry.wrapped);
+          }
+        }
+        this._listeners[event] = [];
+      }
+      this._localEvents[event] = [];
     }
     return this;
   }
@@ -602,14 +735,42 @@ class Map {
         return;
       }
       if (e.button === 0) { // Left mouse button only
-        isDragging = true;
-        hasDragged = false;
         // Convert screen coordinates to canvas coordinates (accounting for scaling)
         const rect = this.canvas.getBoundingClientRect();
         const scaleX = this.canvas.width / rect.width;
         const scaleY = this.canvas.height / rect.height;
         dragStartX = (e.clientX - rect.left) * scaleX;
         dragStartY = (e.clientY - rect.top) * scaleY;
+
+        // Draggable markers take precedence over map panning.
+        const hitMarker = this._topmostMarkerAt(dragStartX, dragStartY);
+        if (hitMarker && typeof hitMarker.isDraggable === 'function' && hitMarker.isDraggable()) {
+          this.canvas.style.cursor = 'move';
+          document.addEventListener('selectstart', preventSelection);
+          hitMarker.fire('dragstart', { type: 'dragstart', target: hitMarker, latlng: hitMarker.getLatLng() });
+          const markerMove = (ev) => {
+            const r2 = this.canvas.getBoundingClientRect();
+            const cx2 = (ev.clientX - r2.left) * (this.canvas.width / r2.width);
+            const cy2 = (ev.clientY - r2.top) * (this.canvas.height / r2.height);
+            const ll = this.containerPointToLatLng([cx2, cy2]);
+            if (ll && isFinite(ll[0]) && isFinite(ll[1])) {
+              hitMarker.setLatLng(ll);
+              hitMarker.fire('drag', { type: 'drag', target: hitMarker, latlng: ll });
+            }
+          };
+          const markerUp = () => {
+            document.removeEventListener('mousemove', markerMove);
+            document.removeEventListener('mouseup', markerUp);
+            this.canvas.style.cursor = 'grab';
+            hitMarker.fire('dragend', { type: 'dragend', target: hitMarker, latlng: hitMarker.getLatLng() });
+          };
+          document.addEventListener('mousemove', markerMove);
+          document.addEventListener('mouseup', markerUp);
+          return;
+        }
+
+        isDragging = true;
+        hasDragged = false;
         this.canvas.style.cursor = 'move';
 
         // Prevent text selection during drag
@@ -647,7 +808,10 @@ class Map {
         const rect = this.canvas.getBoundingClientRect();
         const scaleX = this.canvas.width / rect.width;
         const scaleY = this.canvas.height / rect.height;
-        this.wasmMap.handle_mouse_hover((e.clientX - rect.left) * scaleX, (e.clientY - rect.top) * scaleY);
+        const canvasX = (e.clientX - rect.left) * scaleX;
+        const canvasY = (e.clientY - rect.top) * scaleY;
+        this._updateMarkerHover(canvasX, canvasY);
+        this.wasmMap.handle_mouse_hover(canvasX, canvasY);
       });
     });
 
@@ -668,6 +832,69 @@ class Map {
 
     this._setupKeyboardHandlers();
     this._setupTouchHandlers();
+  }
+
+  // --- Marker interactivity ---
+  // Markers are GPU sprites with no DOM node, so hit-testing runs here in the
+  // wrapper: clicks reuse the map-level click event, hovers use mousemove.
+
+  _registerMarker(marker) {
+    this._markerRegistry.push(marker);
+  }
+
+  _unregisterMarker(marker) {
+    const i = this._markerRegistry.indexOf(marker);
+    if (i !== -1) this._markerRegistry.splice(i, 1);
+    if (this._hoveredMarker === marker) this._hoveredMarker = null;
+  }
+
+  _topmostMarkerAt(x, y) {
+    let best = null;
+    for (let i = this._markerRegistry.length - 1; i >= 0; i--) {
+      const m = this._markerRegistry[i];
+      if (!m || !m.getLatLng) continue;
+      if ((m.getOpacity !== undefined ? m.getOpacity() : 1) <= 0.01) continue;
+      const [lat, lng] = m.getLatLng();
+      const sp = this.wasmMap.screen_xy(lat, lng);
+      const dx = x - sp[0];
+      const dy = y - sp[1];
+      const radius = Math.max((m._size || 14) / 2 + 4, 10);
+      if (dx * dx + dy * dy <= radius * radius) {
+        if (!best || (m.getZIndexOffset ? m.getZIndexOffset() : 0) > (best.getZIndexOffset ? best.getZIndexOffset() : 0)) {
+          best = m;
+        }
+      }
+    }
+    return best;
+  }
+
+  _setupMarkerInteractivity() {
+    this.on('click', (e) => {
+      const cp = e && e.containerPoint;
+      if (!cp || cp.length < 2) return;
+      const marker = this._topmostMarkerAt(cp[0], cp[1]);
+      if (!marker) return;
+      marker.fire('click', { type: 'click', latlng: e.latlng, containerPoint: cp, target: marker });
+      // Leaflet default: a bound popup opens when its marker is clicked —
+      // and must survive this same click's autoClose pass.
+      if ((marker._popup || marker._popupContent) && !marker.isPopupOpen()) {
+        marker.openPopup();
+        const popup = marker.getPopup();
+        if (popup) popup._skipAutoCloseOnce = true;
+      }
+    });
+  }
+
+  _updateMarkerHover(x, y) {
+    const marker = this._topmostMarkerAt(x, y);
+    if (marker === this._hoveredMarker) return;
+    if (this._hoveredMarker) {
+      this._hoveredMarker.fire('mouseout', { type: 'mouseout', target: this._hoveredMarker });
+    }
+    if (marker) {
+      marker.fire('mouseover', { type: 'mouseover', target: marker });
+    }
+    this._hoveredMarker = marker;
   }
 
   // Arrow keys pan, +/- zoom (canvas is focusable; click it first)
@@ -891,6 +1118,20 @@ class TileLayer {
 
   addTo(map) {
     this.wasmTileLayer.add_to(map.wasmMap);
+    // Plumb Leaflet-style options into the Rust tile loader.
+    if (typeof map.wasmMap.configure_tile_layer === 'function') {
+      try {
+        const subs = this.options.subdomains !== undefined
+          ? (Array.isArray(this.options.subdomains) ? this.options.subdomains : String(this.options.subdomains).split(''))
+          : ['a', 'b', 'c'];
+        const minZ = typeof this.options.minZoom === 'number' ? this.options.minZoom : 0;
+        const maxZ = typeof this.options.maxZoom === 'number' ? this.options.maxZoom : 18;
+        const ts = typeof this.options.tileSize === 'number' ? this.options.tileSize : 256;
+        map.wasmMap.configure_tile_layer(subs, minZ, maxZ, ts);
+      } catch (e) {
+        console.warn('TileLayer: failed to apply options:', e);
+      }
+    }
     if (this.options.attribution && map.containerElement) {
       let attrib = map.containerElement.querySelector('.rustyleaf-attribution');
       if (!attrib) {
@@ -915,12 +1156,26 @@ class TileLayer {
   }
 
   remove() {
-    if (this._map && this._map._notifyLayerRemove) this._map._notifyLayerRemove(this);
+    if (this._map) {
+      // Actually detach the tile layer in the WASM core — otherwise tiles
+      // keep rendering after remove() (Leaflet fires 'remove' here too).
+      if (this._map.wasmMap && typeof this._map.wasmMap.remove_tile_layer === 'function') {
+        this._map.wasmMap.remove_tile_layer();
+      }
+      if (this._attributionElement && this.options.attribution) {
+        const parts = this._attributionElement.innerHTML.split(' | ')
+          .filter((p) => p !== this.options.attribution);
+        this._attributionElement.innerHTML = parts.join(' | ');
+        this._attributionElement = null;
+      }
+      if (this._map._notifyLayerRemove) this._map._notifyLayerRemove(this);
+      this._map = null;
+    }
     return this;
   }
 }
 
-// PointLayer with Leaflet-style API  
+// PointLayer with Leaflet-style API
 class PointLayer {
   constructor() {
     // Check if WASM is available, otherwise use mock
@@ -1138,6 +1393,9 @@ class Popup {
     // Add event listeners
     this._addEventListeners();
 
+    // Track the active popup so Map.closePopup() works (Leaflet parity).
+    if (map) map._activePopup = this;
+
     if (map._fireLocalEvent) map._fireLocalEvent('popupopen', { type: 'popupopen', popup: this });
     return this;
   }
@@ -1153,6 +1411,7 @@ class Popup {
     
     this._removeEventListeners();
     this.isOpen = false;
+    if (this.map && this.map._activePopup === this) this.map._activePopup = null;
     if (this.map && this.map._fireLocalEvent) this.map._fireLocalEvent('popupclose', { type: 'popupclose', popup: this });
     this.map = null;
     
@@ -1386,37 +1645,64 @@ class Popup {
   }
   
   _addEventListeners() {
-    if (this.options.autoClose) {
-      // Close popup when clicking on the map
-      this.map.on('click', this._onMapClick, this);
+    // Bind handlers ONCE — re-creating .bind(this) refs per open leaks
+    // listeners that off() can never match.
+    if (!this._boundFns) {
+      this._boundFns = {
+        resize: this._handleResize.bind(this),
+        move: this._updatePosition.bind(this),
+        zoom: this._updatePosition.bind(this)
+      };
     }
-    
-    // Handle window resize
-    window.addEventListener('resize', this._handleResize.bind(this));
-    
-    // Handle map move/zoom to update position
-    this.map.on('move', this._updatePosition.bind(this));
-    this.map.on('zoom', this._updatePosition.bind(this));
+    if (this.options.autoClose && !this._autoCloseBound) {
+      this._autoCloseBound = true;
+      // Register OUTSIDE any wasm event dispatch — openOn() typically runs
+      // inside a click handler, and registering a wasm listener there trips
+      // the re-entrancy guard.
+      deferCallback(() => {
+        if (this._autoCloseBound && this.map && typeof this.map.on === 'function') {
+          this.map.on('click', this._onMapClick, this);
+        }
+      });
+    }
+
+    // Handle window resize (DOM listener — always safe)
+    window.addEventListener('resize', this._boundFns.resize);
+
+    // Track map move/zoom to update position — deferred for the same reason.
+    deferCallback(() => {
+      if (this.map && this._boundFns && typeof this.map.on === 'function') {
+        this.map.on('move', this._boundFns.move);
+        this.map.on('zoom', this._boundFns.zoom);
+      }
+    });
   }
-  
+
   _removeEventListeners() {
-    if (this.options.autoClose && this.map) {
-      this.map.off('click', this._onMapClick, this);
+    if (this._autoCloseBound && this.map) {
+      this.map.off('click', this._onMapClick);
+      this._autoCloseBound = false;
     }
-    
-    window.removeEventListener('resize', this._handleResize.bind(this));
-    
-    if (this.map) {
-      this.map.off('move', this._updatePosition.bind(this));
-      this.map.off('zoom', this._updatePosition.bind(this));
+
+    if (this._boundFns) {
+      window.removeEventListener('resize', this._boundFns.resize);
+      if (this.map) {
+        this.map.off('move', this._boundFns.move);
+        this.map.off('zoom', this._boundFns.zoom);
+      }
     }
   }
-  
+
   _onMapClick(e) {
     // Don't close if clicking on the popup itself or its source
-    if (this.element && this.element.contains(e.target)) return;
-    if (this._source && e.target === this._source.getElement) return;
-    
+    if (this.element && e && e.target && this.element.contains(e.target)) return;
+    if (this._source && e && e.target === this._source.getElement) return;
+    // A marker just opened us during this same click — don't immediately close.
+    if (this._skipAutoCloseOnce) {
+      this._skipAutoCloseOnce = false;
+      return;
+    }
+
     this.close();
   }
   
@@ -1564,9 +1850,9 @@ class Circle extends Shape {
   }
 
   getLatLng() { return [this._latlng[0], this._latlng[1]]; }
-  setLatLng(latlng) { this._latlng = [latlng[0], latlng[1]]; return this; }
+  setLatLng(latlng) { this._latlng = [latlng[0], latlng[1]]; return this.redraw(); }
   getRadius() { return this._radius; }
-  setRadius(radius) { this._radius = radius; return this; }
+  setRadius(radius) { this._radius = radius; return this.redraw(); }
 
   _delta() {
     const dLat = this._radius / METERS_PER_DEG_LAT;
@@ -1613,9 +1899,9 @@ class CircleMarker extends Shape {
   }
 
   getLatLng() { return [this._latlng[0], this._latlng[1]]; }
-  setLatLng(latlng) { this._latlng = [latlng[0], latlng[1]]; return this; }
+  setLatLng(latlng) { this._latlng = [latlng[0], latlng[1]]; return this.redraw(); }
   getRadius() { return this._radius; }
-  setRadius(radius) { this._radius = radius; return this; }
+  setRadius(radius) { this._radius = radius; return this.redraw(); }
 
   addTo(map) {
     if (this._reattached(map)) return this;
@@ -1645,7 +1931,7 @@ class Rectangle extends Shape {
 
   setBounds(bounds) {
     this._bounds = [[bounds[0][0], bounds[0][1]], [bounds[1][0], bounds[1][1]]];
-    return this;
+    return this.redraw();
   }
 
   addTo(map) {
@@ -1723,8 +2009,35 @@ class LayerGroup {
 // LayerGroup with combined bounds and events delegated to every child.
 class FeatureGroup extends LayerGroup {
   on(event, callback) {
+    // Remember the binding so layers added later receive it too.
+    this._groupBindings = this._groupBindings || [];
+    const existing = this._groupBindings.find((b) => b.event === event && b.callback === callback);
+    if (!existing) this._groupBindings.push({ event, callback });
     for (const layer of this._layers) {
       if (typeof layer.on === 'function') layer.on(event, callback);
+    }
+    return this;
+  }
+
+  off(event, callback) {
+    if (this._groupBindings) {
+      this._groupBindings = typeof callback === 'function'
+        ? this._groupBindings.filter((b) => !(b.event === event && b.callback === callback))
+        : this._groupBindings.filter((b) => b.event !== event);
+    }
+    for (const layer of this._layers) {
+      if (typeof layer.off === 'function') layer.off(event, callback);
+    }
+    return this;
+  }
+
+  addLayer(layer) {
+    super.addLayer(layer);
+    // Apply previously-bound group listeners to late-added children.
+    if (this._groupBindings && typeof layer.on === 'function') {
+      for (const { event, callback } of this._groupBindings) {
+        layer.on(event, callback);
+      }
     }
     return this;
   }
@@ -1880,7 +2193,7 @@ class VideoOverlay extends ImageOverlay {
     const video = document.createElement('video');
     video.className = 'rustyleaf-video-overlay';
     video.src = this._url;
-    video.muted = this.options.muted !== false;
+    video.muted = this.options.muted === true;
     video.loop = this.options.loop !== false;
     video.autoplay = this.options.autoplay !== false;
     video.playsInline = true;
@@ -1931,6 +2244,7 @@ class GeoJSONLayer {
     this._mountedFeatureLayerCount = 0;
     this._optionsApplied = false;
     this._clickDispatcherAttached = false;
+    this._layerEvents = {};          // layer-level click/hover listeners
     this._openTooltip = null;
     this._openTooltipFid = undefined;
   }
@@ -2007,10 +2321,12 @@ class GeoJSONLayer {
     while (this._mountedFeatureLayerCount < this._featureLayers.length) {
       this._featureLayers[this._mountedFeatureLayerCount++].addTo(map);
     }
-    if (!this._clickDispatcherAttached && this._featureHandles.length > 0) {
+    if (!this._clickDispatcherAttached && this.map) {
       this._clickDispatcherAttached = true;
-      map.on('click', (e) => deferCallback(() => this._dispatchFeatureEvent(e, 'click')));
-      map.on('hover', (e) => deferCallback(() => this._dispatchFeatureEvent(e, 'hover')));
+      // Attach whenever the layer is on a map — feature handles AND
+      // layer-level click/hover listeners both dispatch through here.
+      this.map.on('click', (e) => deferCallback(() => this._dispatchFeatureEvent(e, 'click')));
+      this.map.on('hover', (e) => deferCallback(() => this._dispatchFeatureEvent(e, 'hover')));
     }
   }
 
@@ -2029,7 +2345,25 @@ class GeoJSONLayer {
       this._openTooltip = null;
       this._openTooltipFid = undefined;
     }
-    if (fid === undefined || fid === null) return;
+    if (fid === undefined || fid === null) {
+      // No per-feature handle hit — still deliver layer-level listeners.
+      // Normalize the payload shape: consumers expect e.feature.properties,
+      // so wrap the raw hit meta like the feature-handle path does.
+      if ((this._layerEvents[kind] || []).length > 0) {
+        const normalizedFeature = props && props.original_meta !== undefined && props.original_meta !== null
+          ? { geometry: null, properties: props.original_meta }
+          : null;
+        const layerEvent = Object.assign({}, e, { type: kind, target: this, feature: normalizedFeature });
+        for (const cb of this._layerEvents[kind]) {
+          try {
+            cb(layerEvent);
+          } catch (err) {
+            console.error(`Rustyleaf: error in GeoJSONLayer '${kind}' handler:`, err);
+          }
+        }
+      }
+      return;
+    }
     const handle = this._featureHandles[fid];
     if (!handle) return;
     const event = Object.assign({}, e, { feature: handle.feature });
@@ -2047,14 +2381,36 @@ class GeoJSONLayer {
       this._openTooltip = new Tooltip({ content: handle._tooltipContent }).setLatLng(e.latlng).openOn(this.map);
       this._openTooltipFid = fid;
     }
+    // Layer-level listeners always see feature hits too.
+    if ((this._layerEvents[kind] || []).length > 0) {
+      const layerEvent = Object.assign({}, e, { type: kind, target: this, feature: handle.feature });
+      for (const cb of this._layerEvents[kind]) {
+        try {
+          cb(layerEvent);
+        } catch (err) {
+          console.error(`Rustyleaf: error in GeoJSONLayer '${kind}' handler:`, err);
+        }
+      }
+    }
   }
 
   // Load GeoJSON data
   loadData(geojson) {
-    // Prevent loading the same data multiple times
-    if (this.dataLoaded) {
-      console.log('GeoJSONLayer: Data already loaded, skipping');
+    // Re-loading with new data replaces the old dataset (Leaflet-style);
+    // an identical no-op call is skipped.
+    if (this.dataLoaded && this.geojson === geojson) {
       return this;
+    }
+    if (this.dataLoaded) {
+      // Reset per-load state so filter/onEachFeature/pointToLayer re-apply.
+      if (this.map && this.layerIndex !== undefined && typeof this.map.wasmMap.clear_geojson_layer === 'function') {
+        try { this.map.wasmMap.clear_geojson_layer(this.layerIndex); } catch (e) { /* layer may be gone */ }
+      }
+      this._featureLayers = [];
+      this._featureHandles = [];
+      this._mountedFeatureLayerCount = 0;
+      this._optionsApplied = false;
+      this.dataLoaded = false;
     }
 
     // Normalize input: keep an object for API helpers and a string for WASM
@@ -2294,6 +2650,15 @@ class GeoJSONLayer {
   // Process a single chunk of GeoJSON data
   processChunk(chunk, isFinal) {
     if (this.map && this.layerIndex !== undefined) {
+      // Keep a client-side copy so query APIs (getFeaturesInBounds/getBounds)
+      // work for streamed layers too.
+      this._streamedText = (this._streamedText || '') + chunk;
+      if (isFinal && !this.geojson && this._streamedText) {
+        try {
+          this.geojson = JSON.parse(this._streamedText);
+          this.dataLoaded = true;
+        } catch (e) { /* partial/NDJSON streams stay query-less */ }
+      }
       try {
         this.map.wasmMap.load_geojson_chunk(this.layerIndex, chunk, isFinal);
       } catch (error) {
@@ -2389,12 +2754,20 @@ class GeoJSONLayer {
     return this;
   }
 
-  // Event handlers
+  // Event handlers — layer-level click/hover, dispatched from the wasm
+  // hit-test pipeline via _dispatchFeatureEvent.
   on(event, callback) {
-    if (event === 'click') {
-      this.clickCallback = callback;
-    } else if (event === 'hover') {
-      this.hoverCallback = callback;
+    if (typeof callback !== 'function') return this;
+    (this._layerEvents[event] = this._layerEvents[event] || []).push(callback);
+    return this;
+  }
+
+  off(event, callback) {
+    if (!this._layerEvents[event]) return this;
+    if (typeof callback === 'function') {
+      this._layerEvents[event] = this._layerEvents[event].filter((cb) => cb !== callback);
+    } else {
+      delete this._layerEvents[event];
     }
     return this;
   }
@@ -2621,11 +2994,23 @@ class GeoJSONLayer {
     return this;
   }
 
-  // Get features in current view bounds
+  // Get features intersecting [ [s,lat],[n,lat] ] bounds (Leaflet LatLngBounds shape)
   getFeaturesInBounds(bounds) {
-    // This would require spatial indexing implementation
-    // For now, return all features
-    return this.geojson ? (this.geojson.features || [this.geojson]) : [];
+    const features = this.geojson
+      ? (this.geojson.type === 'FeatureCollection' ? this.geojson.features : this.geojson.type === 'Feature' ? [this.geojson] : [])
+      : [];
+    if (!bounds || !Array.isArray(bounds)) return features.slice();
+    const south = Math.min(bounds[0][0], bounds[1][0]);
+    const north = Math.max(bounds[0][0], bounds[1][0]);
+    const west = Math.min(bounds[0][1], bounds[1][1]);
+    const east = Math.max(bounds[0][1], bounds[1][1]);
+    const coordIn = ([lng, lat]) => lat >= south && lat <= north && lng >= west && lng <= east;
+    const anyCoord = (coords) => {
+      if (!Array.isArray(coords)) return false;
+      if (typeof coords[0] === 'number') return coordIn(coords);
+      return coords.some(anyCoord);
+    };
+    return features.filter((f) => f && f.geometry && anyCoord(f.geometry.coordinates));
   }
 
   // Set data-driven styling based on properties
@@ -2668,6 +3053,9 @@ Icon.Default = class extends Icon {
 class DivIcon extends Icon {
   constructor(options = {}) {
     super({ ...options, iconUrl: options.iconUrl || 'divicon' });
+    // Leaflet parity: DivIcon renders `html` (string or HTMLElement) as a
+    // DOM overlay marker instead of a GPU sprite.
+    this.options.html = options.html !== undefined ? options.html : '';
   }
 }
 
@@ -2721,6 +3109,7 @@ class Marker {
     if (this._map && this._id !== null) {
       this._map.wasmMap.update_marker(this._id, latlng[0], latlng[1]);
     }
+    this._updateDomPosition();
     return this;
   }
 
@@ -2770,10 +3159,23 @@ class Marker {
   }
 
   off(event, callback) {
-    if (this._events[event]) {
+    if (!this._events[event]) return this;
+    if (typeof callback === 'function') {
       this._events[event] = this._events[event].filter((h) => h !== callback);
+    } else {
+      // Leaflet semantics: no callback removes all listeners for the event.
+      delete this._events[event];
     }
     return this;
+  }
+
+  once(event, callback) {
+    if (typeof callback !== 'function') return this;
+    const wrapper = (data) => {
+      this.off(event, wrapper);
+      callback(data);
+    };
+    return this.on(event, wrapper);
   }
 
   fire(event, data) {
@@ -2793,22 +3195,92 @@ class Marker {
 
   addTo(map) {
     this._map = map;
+    if (this._icon instanceof DivIcon && typeof map.containerElement !== 'undefined') {
+      return this._mountDomOverlay(map);
+    }
     this._id = map.wasmMap.add_marker();
     map.wasmMap.update_marker(this._id, this._latlng[0], this._latlng[1]);
     this._applyStyle();
     map.wasmMap.set_marker_visible(this._id, true);
+    if (map._registerMarker) map._registerMarker(this);
     if (map._notifyLayerAdd) map._notifyLayerAdd(this);
-    this.fire('add', { target: this });
+    this.fire('add', { type: 'add', target: this });
     return this;
   }
 
+  // DivIcon markers render as tracked DOM overlays with native events.
+  _mountDomOverlay(map) {
+    const el = document.createElement('div');
+    el.className = 'rustyleaf-marker-overlay'
+      + (this._icon.options.className ? ' ' + this._icon.options.className : '');
+    el.style.cssText = 'position:absolute;z-index:700;pointer-events:auto;';
+    const html = this._icon.options.html;
+    if (typeof html === 'string') el.innerHTML = html;
+    else if (html instanceof HTMLElement) el.appendChild(html);
+    if (this._opacity < 1) el.style.opacity = String(this._opacity);
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.fire('click', { type: 'click', latlng: this.getLatLng(), target: this, originalEvent: e });
+      if ((this._popup || this._popupContent) && !this.isPopupOpen()) {
+        this.openPopup();
+        const p = this.getPopup();
+        if (p) p._skipAutoCloseOnce = true;
+      }
+    });
+    el.addEventListener('mouseover', () => this.fire('mouseover', { type: 'mouseover', target: this }));
+    el.addEventListener('mouseout', () => this.fire('mouseout', { type: 'mouseout', target: this }));
+    map.containerElement.appendChild(el);
+    this._domElement = el;
+
+    if (!this._boundFns) {
+      this._boundFns = { reposition: () => this._updateDomPosition() };
+    }
+    deferCallback(() => {
+      if (this._map && this._domElement && typeof this._map.on === 'function') {
+        this._map.on('move', this._boundFns.reposition);
+        this._map.on('zoom', this._boundFns.reposition);
+      }
+    });
+    this._updateDomPosition();
+    if (map._notifyLayerAdd) map._notifyLayerAdd(this);
+    this.fire('add', { type: 'add', target: this });
+    return this;
+  }
+
+  _updateDomPosition() {
+    if (!this._domElement || !this._map || !this._map.project) return;
+    const xy = this._map.project(this._latlng);
+    const anchor = (this._icon && this._icon.options.iconAnchor) || null;
+    const size = (this._icon && this._icon.options.iconSize) || null;
+    let tx = '-50%', ty = '-50%';
+    if (anchor && size) {
+      tx = anchor[0] === 0 ? '0%' : `${-(anchor[0] / size[0]) * 100}%`;
+      ty = anchor[1] === 0 ? '0%' : `${-(anchor[1] / size[1]) * 100}%`;
+    }
+    this._domElement.style.left = xy[0] + 'px';
+    this._domElement.style.top = xy[1] + 'px';
+    this._domElement.style.transform = `translate(${tx}, ${ty})`;
+  }
+
   remove() {
-    if (this._map && this._id !== null) {
-      this._map.wasmMap.remove_marker(this._id);
+    if (this._map) {
+      this.closePopup();
+      this.closeTooltip();
+      if (this._domElement) {
+        if (this._domElement.parentNode) this._domElement.parentNode.removeChild(this._domElement);
+        this._domElement = null;
+        if (this._boundFns && typeof this._map.off === 'function') {
+          this._map.off('move', this._boundFns.reposition);
+          this._map.off('zoom', this._boundFns.reposition);
+        }
+      } else if (this._id !== null) {
+        this._map.wasmMap.remove_marker(this._id);
+        if (this._map._unregisterMarker) this._map._unregisterMarker(this);
+      }
       if (this._map._notifyLayerRemove) this._map._notifyLayerRemove(this);
       this._map = null;
       this._id = null;
-      this.fire('remove', { target: this });
+      this.fire('remove', { type: 'remove', target: this });
     }
     return this;
   }
@@ -2834,9 +3306,15 @@ class Marker {
 
   openPopup() {
     this._popupOpen = true;
+    if (!this._map) return this;
     if (this._popup) {
       this._popup.setLatLng(this._latlng);
-      if (this._map) this._popup.openOn(this._map);
+      this._popup.openOn(this._map);
+    } else if (this._popupContent !== undefined) {
+      // String/DOM content bound via bindPopup(content) — wrap lazily.
+      this._popup = new Popup({ content: this._popupContent });
+      this._popup.setLatLng(this._latlng);
+      this._popup.openOn(this._map);
     }
     return this;
   }
@@ -2863,11 +3341,28 @@ class Marker {
 
   openTooltip() {
     this._tooltipOpen = true;
+    if (!this._map) return this;
+    if (this._tooltip && typeof this._tooltip.openOn === 'function') {
+      this._tooltip.setLatLng(this._latlng);
+      this._tooltip.openOn(this._map);
+    } else if (this._tooltipContent !== undefined) {
+      // String/DOM content bound via bindTooltip(content) — wrap lazily.
+      if (!this._boundTooltip || !(this._boundTooltip instanceof Tooltip)) {
+        this._boundTooltip = new Tooltip({ content: this._tooltipContent });
+      }
+      this._boundTooltip.setLatLng(this._latlng);
+      this._boundTooltip.openOn(this._map);
+    }
     return this;
   }
 
   closeTooltip() {
     this._tooltipOpen = false;
+    if (this._tooltip && typeof this._tooltip.close === 'function') this._tooltip.close();
+    if (this._boundTooltip) {
+      if (typeof this._boundTooltip.close === 'function') this._boundTooltip.close();
+      this._boundTooltip = null;
+    }
     return this;
   }
 
@@ -2923,6 +3418,23 @@ class Tooltip {
     this._updatePosition();
     map.containerElement.appendChild(this.element);
     this._isOpen = true;
+    // Stay anchored to the latlng while the user pans/zooms. Registration is
+    // deferred: openOn often runs inside a wasm event handler.
+    if (typeof map.on === 'function') {
+      if (!this._boundFns) {
+        this._boundFns = {
+          move: () => { if (this._isOpen && this.map) this._updatePosition(); },
+          zoom: () => { if (this._isOpen && this.map) this._updatePosition(); }
+        };
+      }
+      deferCallback(() => {
+        if (this._isOpen && this.map && typeof this.map.on === 'function') {
+          this.map.on('move', this._boundFns.move);
+          this.map.on('zoom', this._boundFns.zoom);
+        }
+      });
+    }
+    if (map) map._activeTooltip = this;
     if (map._fireLocalEvent) map._fireLocalEvent('tooltipopen', { type: 'tooltipopen', tooltip: this });
     return this;
   }
@@ -2933,6 +3445,11 @@ class Tooltip {
       this.element.parentNode.removeChild(this.element);
     }
     this._isOpen = false;
+    if (this.map && this._boundFns && typeof this.map.off === 'function') {
+      this.map.off('move', this._boundFns.move);
+      this.map.off('zoom', this._boundFns.zoom);
+    }
+    if (this.map && this.map._activeTooltip === this) this.map._activeTooltip = null;
     if (this.map && this.map._fireLocalEvent) this.map._fireLocalEvent('tooltipclose', { type: 'tooltipclose', tooltip: this });
     this.map = null;
     return this;
@@ -3034,6 +3551,9 @@ class Control {
   }
 
   remove() {
+    if (this._map && typeof this.onRemove === 'function') {
+      this.onRemove(this._map);
+    }
     if (this._container && this._container.parentNode) {
       this._container.parentNode.removeChild(this._container);
     }
@@ -3148,10 +3668,23 @@ class ScaleControl extends Control {
     this._containerEl = el;
     this._update(map);
     if (typeof map.on === 'function') {
-      map.on('move', () => this._update(map));
-      map.on('zoom', () => this._update(map));
+      this._viewHandlers = {
+        move: () => this._update(map),
+        zoom: () => this._update(map)
+      };
+      map.on('move', this._viewHandlers.move);
+      map.on('zoom', this._viewHandlers.zoom);
     }
     return el;
+  }
+
+  onRemove(map) {
+    if (this._viewHandlers && typeof map.off === 'function') {
+      map.off('move', this._viewHandlers.move);
+      map.off('zoom', this._viewHandlers.zoom);
+      this._viewHandlers = null;
+    }
+    return this;
   }
 
   _update(map) {
@@ -3162,11 +3695,56 @@ class ScaleControl extends Control {
     const mpp = 156543.03392 * Math.cos(latRad) / Math.pow(2, zoom);
     const maxPx = this.options.maxWidth || 100;
     const meters = mpp * maxPx;
-    let label;
-    if (meters >= 1000) label = (meters / 1000).toFixed(meters >= 10000 ? 0 : 1) + ' km';
-    else label = Math.round(meters) + ' m';
-    this._containerEl.textContent = label;
-    this._containerEl.style.width = maxPx + 'px';
+    const parts = [];
+    // Leaflet rounds the scale to a "nice" number so the bar width matches
+    // the label exactly; render metric and/or imperial per options.
+    const niceNumber = (v) => {
+      const pow = Math.pow(10, Math.floor(Math.log10(v)));
+      const d = v / pow;
+      const nice = d >= 5 ? 5 : d >= 2 ? 2 : 1;
+      return nice * pow;
+    };
+    if (this.options.metric !== false) {
+      let mLabel;
+      if (meters >= 1000) {
+        const km = niceNumber(meters / 1000);
+        mLabel = km + ' km';
+        parts.push({ text: mLabel, width: Math.round(km * 1000 / mpp) });
+      } else {
+        const m = niceNumber(Math.max(1, meters));
+        mLabel = m + ' m';
+        parts.push({ text: mLabel, width: Math.round(m / mpp) });
+      }
+    }
+    if (this.options.imperial) {
+      const feet = meters * 3.280839895;
+      if (feet >= 5280) {
+        const mi = niceNumber(feet / 5280);
+        // miles → meters (÷3.28084 ft/m converts mi→m via ft) → pixels
+        parts.push({ text: mi + ' mi', width: Math.max(1, Math.round(mi * 5280 / (mpp * 3.280839895))) });
+      } else {
+        const ft = niceNumber(Math.max(1, feet));
+        parts.push({ text: ft + ' ft', width: Math.max(1, Math.round(ft / (mpp * 3.280839895))) });
+      }
+    }
+    if (parts.length === 0) {
+      // Match Leaflet: with both disabled nothing sensible renders — keep metric.
+      parts.push({ text: Math.round(meters) + ' m', width: maxPx });
+    }
+    this._containerEl.innerHTML = '';
+    for (const part of parts) {
+      const seg = document.createElement('div');
+      seg.style.cssText = `border:1px solid #777;border-top:none;box-sizing:border-box;height:4px;margin-top:2px;width:${part.width}px;overflow:hidden;`;
+      seg.textContent = part.text;
+      seg.style.height = 'auto';
+      seg.style.border = 'none';
+      const lineEl = document.createElement('div');
+      lineEl.style.cssText = `border:1px solid #777;border-top:none;box-sizing:border-box;height:4px;width:${part.width}px;`;
+      const labelEl = document.createElement('span');
+      labelEl.textContent = part.text;
+      this._containerEl.appendChild(labelEl);
+      this._containerEl.appendChild(lineEl);
+    }
   }
 }
 
@@ -3194,6 +3772,41 @@ class WMSTileLayer extends TileLayer {
       .join('&');
     super(`${baseUrl}${sep}${query}&bbox={bbox-epsg-3857}`, options);
     this.wmsParams = params;
+    this._baseUrl = baseUrl;
+  }
+
+  // Leaflet parity: update WMS request parameters and reload tiles.
+  setParams(params) {
+    Object.assign(this.wmsParams, params);
+    const p = this.wmsParams;
+    p[p.version === '1.3.0' ? 'crs' : 'srs'] = 'EPSG:3857';
+    const sep = this._baseUrl.includes('?') ? '&' : '?';
+    const query = Object.entries(p)
+      .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
+      .join('&');
+    const newUrl = `${this._baseUrl}${sep}${query}&bbox={bbox-epsg-3857}`;
+    if (this._map && this._map.wasmMap && typeof this._map.wasmMap.add_tile_layer === 'function') {
+      // Replace the layer in the Rust core with the updated template.
+      if (typeof this._map.wasmMap.remove_tile_layer === 'function') {
+        this._map.wasmMap.remove_tile_layer();
+      }
+      this.wasmTileLayer = new TileLayerApi(newUrl);
+      this.wasmTileLayer.add_to(this._map.wasmMap);
+      if (this.options.subdomains !== undefined || typeof this.options.maxZoom === 'number') {
+        const subs = Array.isArray(this.options.subdomains)
+          ? this.options.subdomains
+          : String(this.options.subdomains || 'abc').split('');
+        this._map.wasmMap.configure_tile_layer(
+          subs,
+          typeof this.options.minZoom === 'number' ? this.options.minZoom : 0,
+          typeof this.options.maxZoom === 'number' ? this.options.maxZoom : 18,
+          typeof this.options.tileSize === 'number' ? this.options.tileSize : 256
+        );
+      }
+    } else if (this.wasmTileLayer && typeof this.wasmTileLayer.url_template !== 'undefined') {
+      this.wasmTileLayer.url_template = newUrl;
+    }
+    return this;
   }
 }
 

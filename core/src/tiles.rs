@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::cell::RefCell;
+use std::cell::{RefCell, Cell};
 use std::rc::Rc;
 use web_sys::{WebGl2RenderingContext, WebGlTexture, HtmlImageElement};
 use wasm_bindgen::prelude::*;
@@ -39,6 +39,10 @@ pub struct TileLoader {
     pub textures: Rc<RefCell<HashMap<String, OwnedTexture>>>,
     pub tiles: HashMap<String, Tile>,
     pub requested: HashSet<String>,
+    // Bumped every time a tile texture lands in the cache. The render loop
+    // compares against the last-drawn generation to know when a new tile
+    // arrived and the frame must be redrawn.
+    pub texture_generation: Rc<Cell<u64>>,
     // Keyed by tile key so completed loads can be released in cleanup_old_tiles.
     // The image is kept alongside its closure so handlers can be detached
     // before the closure is dropped — otherwise a still-loading image fires
@@ -55,6 +59,7 @@ impl TileLoader {
             textures: Rc::new(RefCell::new(HashMap::new())),
             tiles: HashMap::new(),
             requested: HashSet::new(),
+            texture_generation: Rc::new(Cell::new(0)),
             closures: HashMap::new(),
         }
     }
@@ -255,6 +260,7 @@ impl TileLoader {
         let img_clone = image.clone();
         let context_clone = context.clone();
         let tile_textures = Rc::clone(&self.textures);
+        let generation_cell = Rc::clone(&self.texture_generation);
 
         let onload_closure = Closure::wrap(Box::new(move || {
             let texture = match context_clone.create_texture() {
@@ -303,6 +309,8 @@ impl TileLoader {
                 tile_textures
                     .borrow_mut()
                     .insert(tile_key_clone.clone(), OwnedTexture::new(&context_clone, texture));
+                // Signal the render loop that a fresh tile needs a frame.
+                generation_cell.set(generation_cell.get() + 1);
             }
         }) as Box<dyn FnMut()>);
 

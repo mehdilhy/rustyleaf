@@ -11,6 +11,32 @@ pub(crate) struct SpatialFeature {
     pub(crate) id: u32,
     pub(crate) bounds: AABB<[f64; 2]>,
     pub(crate) meta: serde_json::Value,
+    // When present, the feature is an area (polygon): a cursor only "hits"
+    // it when point-in-ring passes — not merely by touching its bbox.
+    pub(crate) ring: Option<Vec<[f64; 2]>>,
+}
+
+/// Ray-casting point-in-polygon on the [lat, lng] plane.
+fn point_in_ring(lat: f64, lng: f64, ring: &[[f64; 2]]) -> bool {
+    let n = ring.len();
+    if n < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let yi = ring[i][0];
+        let xi = ring[i][1];
+        let yj = ring[j][0];
+        let xj = ring[j][1];
+        let intersects = (yi > lat) != (yj > lat)
+            && lng < (xj - xi) * (lat - yi) / (yj - yi + f64::EPSILON) + xi;
+        if intersects {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
 }
 
 impl RTreeObject for SpatialFeature {
@@ -56,6 +82,7 @@ pub fn rebuild_spatial_index(
                 id: feature_id,
                 bounds,
                 meta,
+                ring: None,
             };
 
             new_index.insert(feature);
@@ -89,6 +116,7 @@ pub fn rebuild_spatial_index(
                     id: feature_id,
                     bounds,
                     meta,
+                    ring: None,
                 };
 
                 new_index.insert(feature);
@@ -97,25 +125,32 @@ pub fn rebuild_spatial_index(
         }
     }
 
-    // Index polygon features (centroid-based hits for now)
+    // Index polygon features: full bbox envelope plus the outer ring so
+    // hit_test can run a point-in-polygon refinement (Leaflet-like interior
+    // clicks) instead of the old centroid-only approximation.
     for (layer_idx, layer) in polygon_layers.iter().enumerate() {
         for (poly_idx, poly) in layer.polygons.iter().enumerate() {
             if let Some(ring) = poly.rings.first() {
                 if ring.len() >= 3 {
-                    let (sum_lat, sum_lng) = ring.iter()
-                        .fold((0.0, 0.0), |(sy, sx), p| (sy + p[0], sx + p[1]));
-                    let n = ring.len() as f64;
-                    let (lat, lng) = (sum_lat / n, sum_lng / n);
+                    let min_lat = ring.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min);
+                    let max_lat = ring.iter().map(|p| p[0]).fold(f64::NEG_INFINITY, f64::max);
+                    let min_lng = ring.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min);
+                    let max_lng = ring.iter().map(|p| p[1]).fold(f64::NEG_INFINITY, f64::max);
                     let bounds = AABB::from_corners(
-                        [lng - tolerance, lat - tolerance],
-                        [lng + tolerance, lat + tolerance]
+                        [min_lng - tolerance, min_lat - tolerance],
+                        [max_lng + tolerance, max_lat + tolerance]
                     );
                     let mut meta = serde_json::json!({});
                     meta["layer_type"] = "polygon".into();
                     meta["layer_index"] = layer_idx.into();
                     meta["feature_index"] = poly_idx.into();
                     meta["original_meta"] = poly.meta.clone();
-                    new_index.insert(SpatialFeature { id: feature_id, bounds, meta });
+                    new_index.insert(SpatialFeature {
+                        id: feature_id,
+                        bounds,
+                        meta,
+                        ring: Some(ring.clone()),
+                    });
                     feature_id += 1;
                 }
             }
@@ -138,7 +173,7 @@ pub fn rebuild_spatial_index(
             meta["layer_index"] = layer_idx.into();
             meta["feature_index"] = point_idx.into();
             meta["original_meta"] = point.meta.clone();
-            new_index.insert(SpatialFeature { id: feature_id, bounds, meta });
+            new_index.insert(SpatialFeature { id: feature_id, bounds, meta, ring: None });
             feature_id += 1;
         }
 
@@ -157,9 +192,36 @@ pub fn rebuild_spatial_index(
                 meta["feature_index"] = line_idx.into();
                 meta["segment_index"] = i.into();
                 meta["original_meta"] = line.meta.clone();
-                new_index.insert(SpatialFeature { id: feature_id, bounds, meta });
+                new_index.insert(SpatialFeature { id: feature_id, bounds, meta, ring: None });
                 feature_id += 1;
             }
+        }
+
+        // Polygon interiors: bbox envelope + point-in-ring refinement.
+        for (poly_idx, hit) in layer.cached_polygon_hits.iter().enumerate() {
+            if hit.outer_ring.len() < 3 {
+                continue;
+            }
+            let min_lat = hit.outer_ring.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min);
+            let max_lat = hit.outer_ring.iter().map(|p| p[0]).fold(f64::NEG_INFINITY, f64::max);
+            let min_lng = hit.outer_ring.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min);
+            let max_lng = hit.outer_ring.iter().map(|p| p[1]).fold(f64::NEG_INFINITY, f64::max);
+            let bounds = AABB::from_corners(
+                [min_lng - tolerance, min_lat - tolerance],
+                [max_lng + tolerance, max_lat + tolerance]
+            );
+            let mut meta = serde_json::json!({});
+            meta["layer_type"] = "geojson-polygon".into();
+            meta["layer_index"] = layer_idx.into();
+            meta["feature_index"] = poly_idx.into();
+            meta["original_meta"] = hit.meta.clone();
+            new_index.insert(SpatialFeature {
+                id: feature_id,
+                bounds,
+                meta,
+                ring: Some(hit.outer_ring.clone()),
+            });
+            feature_id += 1;
         }
     }
 
@@ -191,8 +253,29 @@ pub fn hit_test(
     // Intersection, not containment: a feature counts as hit when its bounds
     // overlap the cursor's tolerance box (containment would require a
     // pixel-perfect hit on the feature's center).
-    index
+    //
+    // Area features (polygons) additionally require the point-in-ring test to
+    // pass, so clicking NEAR but outside a polygon doesn't match it — and a
+    // polygon's bbox never shadows a point/line underneath it.
+    let candidates: Vec<&SpatialFeature> = index
         .locate_in_envelope_intersecting(&search_bounds)
-        .next()
-        .map(|feature| feature.meta.clone())
+        .collect();
+
+    let mut fallback = None;
+    for feature in candidates {
+        match &feature.ring {
+            None => {
+                if fallback.is_none() {
+                    fallback = Some(feature);
+                }
+            }
+            Some(ring) => {
+                if point_in_ring(lat, lng, ring) {
+                    return Some(feature.meta.clone());
+                }
+            }
+        }
+    }
+
+    fallback.map(|feature| feature.meta.clone())
 }

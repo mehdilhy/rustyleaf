@@ -113,9 +113,18 @@ impl EventSystem {
 }
 
 /// Invoke every registered callback with the given event object.
+///
+/// Iterates a SNAPSHOT so listeners that (de)register during dispatch cannot
+/// abort the loop, and isolates failures: a throwing listener is reported on
+/// the console but never prevents the remaining listeners from running.
+/// (Calling any wasm method from inside a listener trips wasm-bindgen's
+/// re-entrancy guard — that throw must not take down the whole event.)
 pub fn trigger_event(callbacks: &[Function], event_obj: &JsValue) {
-    for callback in callbacks {
-        let _ = callback.call1(&JsValue::null(), event_obj);
+    let snapshot: Vec<Function> = callbacks.to_vec();
+    for callback in snapshot {
+        if let Err(e) = callback.call1(&JsValue::null(), event_obj) {
+            web_sys::console::error_1(&e);
+        }
     }
 }
 
@@ -127,6 +136,10 @@ pub fn create_map_event(event_type: &str, center: &Array, zoom: f64, bounds: &Ar
         .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set target: {:?}", e)))?;
     js_sys::Reflect::set(&obj, &JsValue::from_str("sourceTarget"), &JsValue::null())
         .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set sourceTarget: {:?}", e)))?;
+    js_sys::Reflect::set(&obj, &JsValue::from_str("propagatedFrom"), &JsValue::null())
+        .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set propagatedFrom: {:?}", e)))?;
+    js_sys::Reflect::set(&obj, &JsValue::from_str("originalEvent"), &JsValue::null())
+        .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set originalEvent: {:?}", e)))?;
 
     js_sys::Reflect::set(&obj, &JsValue::from_str("center"), center)
         .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set center: {:?}", e)))?;
@@ -140,12 +153,16 @@ pub fn create_map_event(event_type: &str, center: &Array, zoom: f64, bounds: &Ar
     Ok(obj.into())
 }
 
-pub fn create_click_event(lat: f64, lng: f64, container_point: &Array) -> Result<JsValue, JsValue> {
+pub fn create_click_event(lat: f64, lng: f64, container_point: &Array, layer_point: &Array, original_event: Option<&JsValue>) -> Result<JsValue, JsValue> {
     let obj = js_sys::Object::new();
     js_sys::Reflect::set(&obj, &JsValue::from_str("type"), &JsValue::from_str("click"))
         .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set click type: {:?}", e)))?;
     js_sys::Reflect::set(&obj, &JsValue::from_str("target"), &JsValue::null())
         .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set click target: {:?}", e)))?;
+    js_sys::Reflect::set(&obj, &JsValue::from_str("sourceTarget"), &JsValue::null())
+        .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set click sourceTarget: {:?}", e)))?;
+    js_sys::Reflect::set(&obj, &JsValue::from_str("propagatedFrom"), &JsValue::null())
+        .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set click propagatedFrom: {:?}", e)))?;
 
     let latlng = Array::new();
     latlng.push(&JsValue::from_f64(lat));
@@ -156,8 +173,15 @@ pub fn create_click_event(lat: f64, lng: f64, container_point: &Array) -> Result
     js_sys::Reflect::set(&obj, &JsValue::from_str("containerPoint"), container_point)
         .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set click containerPoint: {:?}", e)))?;
 
-    js_sys::Reflect::set(&obj, &JsValue::from_str("layerPoint"), container_point)
+    js_sys::Reflect::set(&obj, &JsValue::from_str("layerPoint"), layer_point)
         .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set click layerPoint: {:?}", e)))?;
+
+    let original_js = match original_event {
+        Some(ev) => ev.clone(),
+        None => JsValue::NULL,
+    };
+    js_sys::Reflect::set(&obj, &JsValue::from_str("originalEvent"), &original_js)
+        .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set click originalEvent: {:?}", e)))?;
 
     Ok(obj.into())
 }
