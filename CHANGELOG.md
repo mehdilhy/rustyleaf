@@ -178,11 +178,21 @@ development — expect API churn and missing features.
 - WebGL2 required; no Canvas2D/WebGL1 rendering fallback
 - Spherical Mercator only — no custom CRS
 - Line width honored for `LineLayer`; GeoJSON-styled lines still 1px
-- Touch covers pan + pinch; no tap-hold or double-tap zoom
 - Streaming GeoJSON parser is regex-assisted and fragile on exotic input
-- Standalone line/polygon layers still rebuild vertex data on the CPU each
-  frame (points and GeoJSON layers are GPU-cached; these are next)
 - Normalized-coordinate precision degrades at very high zoom (z≈18+)
+
+## Unreleased
+
+### Added
+- Touch gestures: double-tap zoom (+1 level at the tap point) and long-press
+  (~500ms) firing the context menu; both cancelled by drag, pinch, or early lift
+- GPU buffer freeing: `free_point_layer_gpu` / `free_line_layer_gpu` /
+  `free_polygon_layer_gpu` / `free_geojson_layer_gpu` wasm methods, wired into
+  every layer's `remove()` — data is retained in JS and re-uploads on `addTo()`
+
+### Updated
+- README/FAQ/guide no longer claim line/polygon layers rebuild vertex data on
+  the CPU each frame (they are GPU-cached as of this release cycle)
 
 ## Pre-history - 2025-09-11
 - Initial experiment: WebGL2 tile and point rendering, basic WASM bindings

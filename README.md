@@ -53,7 +53,7 @@ Leaflet-style) instead of showing empty gray past ±180°.
 - Point, line, and polygon layers with per-feature color/size/metadata; **line width is honored** (segments are expanded into screen-space quads on the GPU)
 - **Markers rendered on the GPU** — `Marker` with `Icon` / `DivIcon`, popups & tooltips, draggable flag, opacity/z-index, Leaflet-style events (`click`, `mouseover`, `mouseout`, `dragstart`/`drag`/`dragend`). Markers are drawn as GPU sprites inside the Rust/WASM core, not DOM overlays, so they scale like the rest of rustyleaf's layers.
 - GeoJSON layer: load from object, string, URL, `File`, or streamed chunks; styling options; GPU-cached geometry; Leaflet-style `filter` / `pointToLayer` / `onEachFeature` (with per-feature popups and click/hover handlers)
-- Pan, scroll-zoom, momentum ("kinetic") dragging, **box zoom** (shift-drag), **keyboard navigation** (arrows pan, +/- zoom), and **touch gestures** (one-finger pan with momentum, two-finger pinch zoom)
+- Pan, scroll-zoom, momentum ("kinetic") dragging, **box zoom** (shift-drag), **keyboard navigation** (arrows pan, +/- zoom), and **touch gestures** (one-finger pan with momentum, two-finger pinch zoom, double-tap zoom, long-press for the context menu)
 - Click / hover hit-testing via an R-tree spatial index (rebuilt only when data changes)
 - Leaflet-style events: `move(start/end)`, `zoom(start/end)`, `click`/`hover` (with hit-tested `feature` payloads), `dragstart`/`drag`/`dragend`, `layeradd`/`layerremove`, `popupopen/close`, `tooltipopen/close`, `boxzoomend`, `resize`, `load`, `locationfound`/`locationerror`, plus raw `mousedown`/`mouseup`/`contextmenu`/`keydown`/`keyup`
 - HTML popups with auto-pan, plus lightweight **Tooltip** overlays (bound to markers/layers)
@@ -71,11 +71,11 @@ Leaflet-style) instead of showing empty gray past ±180°.
 - **WebGL2 required.** No Canvas2D or WebGL1 rendering fallback (detection exists; rendering does not).
 - **Spherical Mercator only** — no custom CRS (EPSG:4326/3395, `SimpleCRS`).
 - Line width applies to `LineLayer`; GeoJSON-styled lines still render 1px.
-- No vector tiles. Touch support covers pan + pinch (no tap-hold or double-tap zoom yet).
+- No vector tiles.
 - Polygon *interiors* aren't hit-testable in GeoJSON layers yet — only their outline (triangulated fill geometry has no per-feature metadata attached). `PointLayer`/`LineLayer`/`PolygonLayer` (non-GeoJSON) hit-test normally.
-- Line/polygon vertex data is rebuilt on the CPU every frame (unlike points, which are GPU-resident); heavy combined scenes (thousands of lines/polygons alongside a large point layer) cost more than points alone. GPU-resident lines/polygons are on the [roadmap](ROADMAP.md).
+- Line/polygon vertex data is cached in GPU buffers per layer, but heavy combined scenes still cost more than points alone.
 - Calling map methods synchronously inside a raw wasm event callback (`move`, `zoom`, `click`, ...) throws a re-entrancy error — defer with `queueMicrotask` (the built-in layers already do).
-- Layer `remove()` hides the layer (and `addTo` re-shows it); GPU memory is only freed on `map.destroy()`.
+- Layer `remove()` releases the layer's GPU buffers; the data stays in JS and `addTo` re-uploads it.
 - The streaming GeoJSON parser is regex-assisted and can misbehave on exotic input.
 - API is unstable until 0.1.0.
 
