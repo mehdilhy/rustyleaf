@@ -2501,6 +2501,13 @@ class GeoJSONLayer {
       if (this.map && this.layerIndex !== undefined && typeof this.map.wasmMap.clear_geojson_layer === 'function') {
         try { this.map.wasmMap.clear_geojson_layer(this.layerIndex); } catch (e) { /* layer may be gone */ }
       }
+      // Detach previously mounted pointToLayer layers so they don't linger
+      // rendered on the map alongside the new dataset's layers.
+      if (this.map) {
+        for (const layer of this._featureLayers) {
+          try { layer.remove(); } catch (e) { /* already gone */ }
+        }
+      }
       this._featureLayers = [];
       this._featureHandles = [];
       this._mountedFeatureLayerCount = 0;

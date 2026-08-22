@@ -43,6 +43,9 @@ pub struct TileLoader {
     // compares against the last-drawn generation to know when a new tile
     // arrived and the frame must be redrawn.
     pub texture_generation: Rc<Cell<u64>>,
+    // Shared handle so the onerror closure can record failed tiles. Same
+    // Rc-sharing pattern as `textures`.
+    pub failed: Rc<RefCell<HashSet<String>>>,
     // Keyed by tile key so completed loads can be released in cleanup_old_tiles.
     // The image is kept alongside its closure so handlers can be detached
     // before the closure is dropped — otherwise a still-loading image fires
@@ -59,6 +62,7 @@ impl TileLoader {
             textures: Rc::new(RefCell::new(HashMap::new())),
             tiles: HashMap::new(),
             requested: HashSet::new(),
+            failed: Rc::new(RefCell::new(HashSet::new())),
             texture_generation: Rc::new(Cell::new(0)),
             closures: HashMap::new(),
         }
@@ -181,8 +185,16 @@ impl TileLoader {
                     let tile_key = format!("{}/{}/{}", zoom, wrapped_x, y);
                     let already_requested = self.requested.contains(&tile_key);
                     let already_cached = self.textures.borrow().contains_key(&tile_key);
+                    // A previously failed tile is eligible for a retry: clear
+                    // its bookkeeping so the load below is issued again.
+                    let failed_retry = self.failed.borrow_mut().remove(&tile_key);
+                    if failed_retry {
+                        self.requested.remove(&tile_key);
+                        self.tiles.remove(&tile_key);
+                        self.closures.remove(&tile_key);
+                    }
 
-                    if !already_requested && !already_cached && load_count < max_load_per_frame {
+                    if (!already_requested || failed_retry) && !already_cached && load_count < max_load_per_frame {
                         let tile = Tile {
                             coord: tile_coord.clone(),
                             texture: None,
@@ -314,9 +326,23 @@ impl TileLoader {
             }
         }) as Box<dyn FnMut()>);
 
+        // Error handler: record the failure so update_visible_tiles can retry
+        // the tile on a later frame. Without this, `requested` keeps the key
+        // forever and the tile stays blank permanently.
+        let tile_key_err = tile_key.clone();
+        let failed_set = Rc::clone(&self.failed);
+        let onerror_closure = Closure::wrap(Box::new(move || {
+            web_sys::console::warn_1(&JsValue::from_str(&format!(
+                "Tile request failed, will retry: {}",
+                tile_key_err
+            )));
+            failed_set.borrow_mut().insert(tile_key_err.clone());
+        }) as Box<dyn FnMut()>);
+
         image.set_onload(Some(onload_closure.as_ref().unchecked_ref()));
-        image.set_onerror(Some(onload_closure.as_ref().unchecked_ref()));
-        self.closures.insert(tile_key, (image.clone(), onload_closure));
+        image.set_onerror(Some(onerror_closure.as_ref().unchecked_ref()));
+        self.closures
+            .insert(tile_key, (image.clone(), onload_closure));
 
         image.set_src(&url);
     }
