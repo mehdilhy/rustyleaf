@@ -79,7 +79,7 @@ describe('TileLayer', () => {
       // The current implementation will throw an error when trying to access wasmMap on null
       expect(() => {
         tileLayer.addTo(null as any);
-      }).toThrow("Cannot read properties of null (reading 'wasmMap')");
+      }).toThrow('Cannot read properties of null (reading \'wasmMap\')');
     });
   });
 

@@ -2,295 +2,196 @@
   <img src="assets/logo.png" alt="Rustyleaf Logo" width="150">
 </p>
 
-<h1 align="center">🚨 Rustyleaf 🗺️ v0.0.1</h1>
+<h1 align="center">Rustyleaf</h1>
+
 <p align="center">
-  <strong>EXPERIMENTAL - WORK IN PROGRESS</strong>
+  <strong>A Leaflet-style map API with a Rust + WebAssembly + WebGL2 rendering core.</strong><br>
+  Built for one thing: keeping the familiar Leaflet developer experience while rendering datasets that make DOM-based maps fall over.
 </p>
 
 <p align="center">
-  ⚠️ WARNING: This is an early-stage experimental project. Currently incomplete and NOT FOR PRODUCTION.
+  <a href="https://www.npmjs.com/package/rustyleaf"><img src="https://img.shields.io/npm/v/rustyleaf" alt="npm"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/status-pre--alpha-orange" alt="pre-alpha">
 </p>
 
-<p align="center">
-  <strong>Tiny, modern Rust-based map visualization engine (WASM + WebGL2).</strong><br>
-  Leaflet-simple API. Currently in active development with many unfinished features.
-</p>
+> ⚠️ **Pre-alpha (v0.0.1).** The API will change without notice and this is not production-ready. It is, however, honestly documented: everything listed below works today and is covered by unit and end-to-end tests.
 
 ---
 
-## 🎯 Current Status: PRE-ALPHA
+## Why Rustyleaf?
 
-### ✅ What Works (Basic Features)
-- 🗺️ **Tile rendering**: Basic XYZ tile support with WebGL2
-- 📍 **Point rendering**: Simple point display with basic styling
-- 🎮 **Basic interaction**: Pan, zoom, click events (limited)
-- 📦 **WASM compilation**: Rust core with JavaScript API
-- 🎯 **Spatial indexing**: R-tree for hit-testing (partially implemented)
+Leaflet's API is beloved, but its DOM/Canvas renderer struggles past a few thousand features. WebGL map engines (MapLibre GL, deck.gl) scale, but with a different mental model. Rustyleaf is an experiment in having both:
 
-### ❌ What's Missing (Critical Issues)
-- 🔴 **Memory leaks**: Multiple memory management issues
-- ⚡ **Performance problems**: Slow rendering, inefficient algorithms
-- 🛡️ **Poor error handling**: Many unwrap() calls, crashes easily
-- 📱 **No mobile support**: Limited touch event handling
-- 🔧 **Incomplete features**: Many placeholder implementations
-- 🐛 **Unstable API**: Breaking changes likely
-- 📊 **No testing**: Minimal test coverage
+- **Leaflet-shaped API** — `new Map('map')`, `layer.addTo(map)`, `map.on('click', ...)`.
+- **Rust/WASM core** — GeoJSON parsing, polygon tessellation (Lyon), and R-tree spatial indexing run in compiled Rust, not the JS main thread.
+- **WebGL2 rendering** — tiles, points, lines, and polygons drawn on the GPU; GeoJSON geometry is triangulated once, cached in GPU buffers, and reused across frames.
 
----
+**Performance:** point rendering is GPU-resident (upload once, project in the
+vertex shader), so it holds **60fps at 1,000,000 points** in the
+[reproducible benchmark](benchmark/). Against Leaflet's canvas renderer that's
+~3× faster at 100k and ~37× at 1M; against MapLibre GL it ties on render FPS
+while setting up ~3× faster and still rendering at 1M points (where MapLibre ran
+out of memory in the test environment). Numbers are hardware-specific — run the
+benchmark yourself. This measures point-rendering throughput only, not features
+or ecosystem, where Leaflet and MapLibre are far more mature.
 
-## 🚀 Quick Start
+Point layers also cap total per-frame fragment work: zoomed far enough out
+that a layer's on-screen footprint collapses (e.g. panning a 1M-point dataset
+out to a world view), only a bounded, deterministically-shuffled sample of
+the *unmodified* vertex buffer is drawn — a fair subset, not a truncation —
+so overlapping blended points can't serialize the GPU into single digits of
+fps. At full-viewport coverage the budget exceeds the point count and every
+point draws.
 
-### Installation
+Raster tile layers wrap horizontally at the antimeridian (the world repeats,
+Leaflet-style) instead of showing empty gray past ±180°.
+
+## What works today
+
+- XYZ raster tiles (OpenStreetMap-compatible URL templates, subdomain rotation, tile cache with eviction), **WMS layers** (`WMSTileLayer`, per-tile EPSG:3857 bbox computed in the Rust core), and a programmable **`GridLayer`** (DOM tiles via `createTile`)
+- Point, line, and polygon layers with per-feature color/size/metadata; **line width is honored** (segments are expanded into screen-space quads on the GPU)
+- **Markers rendered on the GPU** — `Marker` with `Icon` / `DivIcon`, popups & tooltips, draggable flag, opacity/z-index, Leaflet-style events (`click`, `mouseover`, `mouseout`, `dragstart`/`drag`/`dragend`). Markers are drawn as GPU sprites inside the Rust/WASM core, not DOM overlays, so they scale like the rest of rustyleaf's layers.
+- GeoJSON layer: load from object, string, URL, `File`, or streamed chunks; styling options; GPU-cached geometry; Leaflet-style `filter` / `pointToLayer` / `onEachFeature` (with per-feature popups and click/hover handlers)
+- Pan, scroll-zoom, momentum ("kinetic") dragging, **box zoom** (shift-drag), **keyboard navigation** (arrows pan, +/- zoom), and **touch gestures** (one-finger pan with momentum, two-finger pinch zoom, double-tap zoom, long-press for the context menu)
+- Click / hover hit-testing via an R-tree spatial index (rebuilt only when data changes)
+- Leaflet-style events: `move(start/end)`, `zoom(start/end)`, `click`/`hover` (with hit-tested `feature` payloads), `dragstart`/`drag`/`dragend`, `layeradd`/`layerremove`, `popupopen/close`, `tooltipopen/close`, `boxzoomend`, `resize`, `load`, `locationfound`/`locationerror`, plus raw `mousedown`/`mouseup`/`contextmenu`/`keydown`/`keyup`
+- HTML popups with auto-pan, plus lightweight **Tooltip** overlays (bound to markers/layers)
+- **Vector shapes** — `Circle` (geodesic radius in meters), `CircleMarker` (pixel radius, drawn as a GPU point), `Rectangle` (from bounds)
+- **Layer grouping** — `LayerGroup` (bulk add/remove) and `FeatureGroup` (union `getBounds`, events delegated to children); `map.addLayer/removeLayer/hasLayer`
+- **Ground overlays** — `ImageOverlay`, `VideoOverlay`, `SVGOverlay` pinned to bounds and repositioned every frame
+- **Plugin surface** — `Handler` base class with `map.addHandler(name, HandlerClass)`, plus `Util` helpers (`stamp`, `template`, `throttle`, `wrapNum`, ...)
+- **UI controls** — `Control` base with `ZoomControl` (zoom in/out buttons), `AttributionControl` (prefix + attributions), `ScaleControl` (metric/imperial scale bar), `LayersControl` (overlay checkboxes + base-layer radios), added via `map.addControl(...)` or `control.addTo(map)`
+- **Map navigation** — animated `flyTo`/`flyToBounds`, `setMaxBounds` (centers clamp on `setView`), `invalidateSize`, `locate()` geolocation with `locationfound`/`locationerror` events
+- TypeScript definitions matching the actual runtime API
+- RAII-managed WebGL resources (textures, buffers, VAOs, programs are freed deterministically; verified by GL leak-detection e2e tests)
+
+## Known limitations (v0.0.1)
+
+- **WebGL2 required.** No Canvas2D or WebGL1 rendering fallback (detection exists; rendering does not).
+- **Spherical Mercator only** — no custom CRS (EPSG:4326/3395, `SimpleCRS`).
+- Line width applies to `LineLayer`; GeoJSON-styled lines still render 1px.
+- No vector tiles.
+- Polygon *interiors* aren't hit-testable in GeoJSON layers yet — only their outline (triangulated fill geometry has no per-feature metadata attached). `PointLayer`/`LineLayer`/`PolygonLayer` (non-GeoJSON) hit-test normally.
+- Line/polygon vertex data is cached in GPU buffers per layer, but heavy combined scenes still cost more than points alone.
+- Calling map methods synchronously inside a raw wasm event callback (`move`, `zoom`, `click`, ...) throws a re-entrancy error — defer with `queueMicrotask` (the built-in layers already do).
+- Layer `remove()` releases the layer's GPU buffers; the data stays in JS and `addTo` re-uploads it.
+- The streaming GeoJSON parser is regex-assisted and can misbehave on exotic input.
+- API is unstable until 0.1.0.
+
+## Browser support
+
+| Browser | Status |
+|---|---|
+| Chrome / Edge 90+ | ✅ tested (CI runs Chromium) |
+| Firefox 90+ | ✅ expected (WebGL2 since 51) |
+| Safari 15.4+ | ⚠️ untested — WebGL2 is available; reports welcome |
+| Anything without WebGL2 | ❌ not supported |
+
+## Bundle size
+
+| Artifact | Raw | Gzipped |
+|---|---|---|
+| WASM core | 1.5 MB | ~500 KB |
+| JS wrapper | 55 KB | 18 KB |
+
+Reducing WASM size (currently built with `opt-level = "z"` + LTO, `wasm-opt` pending) is an active work item.
+
+## Install
+
 ```bash
 npm install rustyleaf
-# or
-yarn add rustyleaf
-# or
-pnpm add rustyleaf
 ```
 
-### Basic Usage
-```javascript
-import { Map } from 'rustyleaf';
+The package ships an ES module bundle with the WASM inlined via async loading. It works out of the box with Vite, Webpack 5, and other bundlers that support async WebAssembly. No runtime dependencies.
 
-// Create map instance
-const map = new Map({
-  container: 'map',
-  center: [40.7128, -74.0060], // [lat, lng]
-  zoom: 10
+## Quick start
+
+```javascript
+import { Map, TileLayer, PointLayer, GeoJSONLayer } from 'rustyleaf';
+
+const map = new Map('map', {
+  center: [48.8566, 2.3522], // [lat, lng]
+  zoom: 12,
 });
 
-// Add tile layer
-map.addTileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-  attribution: '© OpenStreetMap contributors'
-});
+// Raster tiles — attribution is required by the OSM tile usage policy
+new TileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+}).addTo(map);
 
-// Add GeoJSON layer
-map.addGeoJSONLayer({
-  type: 'Feature',
-  geometry: {
-    type: 'Point',
-    coordinates: [-74.0060, 40.7128]
-  },
-  properties: {
-    name: 'New York City'
-  }
-});
+// 100k points? Go ahead.
+const points = new PointLayer();
+points.add(
+  Array.from({ length: 100_000 }, () => ({
+    lat: 48.8 + Math.random() * 0.2,
+    lng: 2.2 + Math.random() * 0.3,
+    size: 4,
+    color: '#e0393e',
+  }))
+);
+points.addTo(map);
 
-// Handle events
-map.on('click', (event) => {
-  console.log('Clicked at:', event.latlng);
-});
+// GeoJSON from a URL, parsed and triangulated in Rust
+const geojson = new GeoJSONLayer(null, { polygonColor: '#3388ff80' });
+geojson.addTo(map);
+await geojson.loadFromUrl('/data/regions.geojson');
+
+map.on('click', (e) => console.log('clicked', e.latlng));
 ```
 
----
+If you use raster tiles from OpenStreetMap, follow their [tile usage policy](https://operations.osmfoundation.org/policies/tiles/) — heavy production use requires your own tile provider.
 
-## 📚 API Reference
+## API overview
 
-### Core Classes
+The full, accurate surface lives in [`types/rustyleaf.d.ts`](types/rustyleaf.d.ts) — it is deliberately trimmed to what actually exists.
 
-#### Map
-```javascript
-const map = new Map(options);
-```
+| Class | Purpose | Key methods |
+|---|---|---|
+| `Map` | Container, viewport, events | `setView`, `panBy`, `zoomIn/Out`, `fitBounds`, `project/unproject`, `on/off`, `destroy` |
+| `TileLayer` | XYZ raster tiles | `addTo`, `remove` |
+| `PointLayer` | GPU point rendering | `add(points)`, `clear`, `on('click'\|'hover')` |
+| `LineLayer` | Polylines | `add(lines)`, `clear`, `on(...)` |
+| `PolygonLayer` | Filled polygons | `add(polygons)`, `clear`, `on(...)` |
+| `GeoJSONLayer` | GeoJSON with streaming | `loadData`, `loadFromUrl`, `loadFile`, `setStyle`, `getBounds` |
+| `Marker` | GPU sprite markers | `setLatLng`, `setIcon`, `bindPopup`, `bindTooltip`, `on(...)` |
+| `Circle` / `CircleMarker` / `Rectangle` | Vector shapes | `setLatLng`/`setBounds`, `setRadius`, `getBounds`, `addTo` |
+| `LayerGroup` / `FeatureGroup` | Layer grouping | `addLayer`, `removeLayer`, `eachLayer`, `getBounds` |
+| `Control` (+ Zoom/Attribution/Scale/Layers) | UI controls | `addTo`, `setPosition`, `addOverlay`/`addBaseLayer` |
+| `Popup` | HTML popups | `setLatLng`, `setContent`, `openOn`, `close` |
+| `Tooltip` | Hover overlays | `setContent`, `setLatLng`, `openOn`, `close` |
 
-**Options:**
-- `container`: `string | HTMLElement` - Map container element or selector
-- `center`: `[number, number]` - Initial center as [lat, lng]
-- `zoom`: `number` - Initial zoom level (0-22)
-- `width`: `number` - Map width in pixels (optional)
-- `height`: `number` - Map height in pixels (optional)
+## Development
 
-**Methods:**
-- `setView(center: [number, number], zoom: number): void`
-- `panBy(deltaX: number, deltaY: number): void`
-- `fitBounds(bounds: [[number, number], [number, number]]): void`
-- `on(event: string, callback: Function): void`
-- `off(event: string, callback: Function): void`
+Prerequisites: Rust (stable) with the `wasm32-unknown-unknown` target, `wasm-pack`, Node.js 18+.
 
-#### TileLayer
-```javascript
-const tileLayer = map.addTileLayer(urlTemplate, options);
-```
-
-**Options:**
-- `attribution`: `string` - Attribution text
-- `maxZoom`: `number` - Maximum zoom level
-- `subdomains`: `string[]` - Subdomain array for URL template
-
-#### GeoJSONLayer
-```javascript
-const geojsonLayer = map.addGeoJSONLayer(geojson, options);
-```
-
-**Options:**
-- `style`: `object` - Styling options for features
-- `pointToLayer`: `Function` - Custom point rendering
-- `onEachFeature`: `Function` - Feature event handlers
-
----
-
-## 🛠️ Development
-
-### Prerequisites
-- Rust 1.70+ with `wasm32-unknown-unknown` target
-- Node.js 18+
-- wasm-pack
-
-### Setup
 ```bash
-# Clone the repository
 git clone https://github.com/mehdilhy/rustyleaf.git
 cd rustyleaf
-
-# Install Rust target
 rustup target add wasm32-unknown-unknown
-
-# Install wasm-pack
 cargo install wasm-pack
-
-# Install dependencies
-npm install
-```
-
-### Development Commands
-```bash
-# Build project
-npm run build
-
-# Development mode with watch
-npm run dev
-
-# Run tests
-npm test
-
-# Run tests with coverage
-npm run test:coverage
-
-# Lint code
-npm run lint
-
-# Format code
-npm run format
-
-# Type checking
-npm run typecheck
-```
-
----
-
-## 🛠️ Development
-
-### Prerequisites
-- Rust (latest stable)
-- Node.js 18+
-- wasm-pack
-
-### Setup
-```bash
-# Clone the repository
-git clone https://github.com/mehdilhy/rustyleaf.git
-cd rustyleaf
-
-# Install dependencies
 npm install
 
-# Install wasm-pack
-cargo install wasm-pack
+npm run build        # wasm-pack + webpack production build
+npm test             # Jest unit tests (405 tests)
+npm run lint         # ESLint
+npm run typecheck    # tsc --noEmit
+cargo clippy --manifest-path core/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+
+npm run setup:e2e    # one-time: install Playwright Chromium
+npm run test:e2e     # visual regression, GL leak detection, memory soak, FPS, kitchen sink
 ```
 
-### Development
-```bash
-# Build project (Rust -> WASM and JS bundle)
-npm run build
+The e2e suite is the interesting part: screenshot-based visual regression, WebGL resource-leak detection, multi-instance isolation, idle-CPU checks, a memory soak test, and a kitchen-sink stress test (`e2e/tests/kitchen-sink.spec.ts`) that puts every public feature — markers, shapes, groups, controls, overlays, WMS/grid tiles, GeoJSON with `onEachFeature`, keyboard/touch/box-zoom input, and a 1,000,000-point layer — on one map and asserts both correctness and fps under combined load, all run in CI.
 
-# Run tests
-npm test
+## Contributing
 
-# Run tests with coverage
-npm run test:coverage
+Contributions are very welcome — this project is young enough that a single PR can meaningfully shape it. See [CONTRIBUTING.md](CONTRIBUTING.md), the [ROADMAP](ROADMAP.md), and issues labeled `good first issue`.
 
-# Run benchmarks
-npm run bench
+## License
 
-# Format code
-npm run format
+[MIT](LICENSE)
 
-# Lint code
-npm run lint
-```
+## Acknowledgments
 
-### Build WASM
-```bash
-# Build WebAssembly module
-npm run build:wasm
-
-# Build everything for release
-npm run prepublishOnly
-```
-
-### Run Examples (no dev server)
-```bash
-# Build once
-npm run build
-
-# Open basic example
-# Windows:
-start examples\\basic\\index.html
-# macOS:
-open examples/basic/index.html
-# Linux:
-xdg-open examples/basic/index.html
-
-# Open React/Vue CDN examples similarly:
-# start examples\\react\\index.html
-# start examples\\vue\\index.html
-```
-
-### Cross-platform build notes
-- Windows: use MSVC toolchain for Rust (default on rustup for Windows). Ensure `wasm-pack` is installed and available in PATH. If you hit OpenSSL or linker errors, run `rustup target add wasm32-unknown-unknown` and retry `npm run build`.
-- Linux/macOS: ensure `wasm32-unknown-unknown` target is installed: `rustup target add wasm32-unknown-unknown`.
-- CI builds on Ubuntu are configured in `.github/workflows/ci.yml`.
-
----
-
-## 🎯 Development Goals (Theoretical)
-
-**NOTE: These are aspirational goals, not current capabilities.**
-
-| Feature | Goal | Current Status |
-|---------|------|----------------|
-| Vector rendering | WebGL2 acceleration | 🚧 Basic implementation |
-| Point display | GPU instancing | ✅ Working |
-| Tile loading | Smooth experience | ✅ Working |
-| Memory management | No leaks | ❌ Issues present |
-
----
-
-## ⚠️ Security and Stability
-
-This is an early experimental release. No network requests or telemetry beyond fetching public tiles via the URL you provide. Review the source if you embed in production.
-
-
-
-## 🤝 Contributing
-
-We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-**Current focus areas:**
-- Mobile performance optimization
-- Advanced rendering features
-- More layer types
-- Better documentation
-
----
-
-## 📄 License
-
-MIT License - see [LICENSE](LICENSE) file
-
----
-
-## 🙏 Acknowledgments
-
-Inspired by Leaflet, MapLibre GL JS, and the amazing Rust/WASM ecosystem.
+Standing on the shoulders of [Leaflet](https://leafletjs.com/), [MapLibre GL JS](https://maplibre.org/), [Lyon](https://github.com/nical/lyon), [rstar](https://github.com/stoeoef/rstar), and the Rust/WASM ecosystem.

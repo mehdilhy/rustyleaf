@@ -1,6 +1,7 @@
 # Node / TypeScript
 node_modules/
 dist/
+coverage/
 *.log
 npm-debug.log*
 yarn-debug.log*
@@ -40,3 +41,12 @@ examples/**/main.js
 
 #claude
 .claude/
+
+# Unrelated local AI-tool config (not part of this project)
+opencode.json
+
+# E2E test artifacts (baselines ARE committed)
+e2e/artifacts/
+e2e/report/
+e2e/results.json
+e2e/node_modules/

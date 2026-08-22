@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rustyleaf — Overlays &amp; Tiles demo</title>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; font-family: system-ui, -apple-system, sans-serif; }
+    #map { width: 100%; height: 100%; }
+    .panel {
+      position: absolute; top: 12px; left: 12px; z-index: 20;
+      background: rgba(255, 255, 255, 0.95); border-radius: 8px;
+      box-shadow: 0 2px 12px rgba(0, 0, 0, 0.25); padding: 14px 16px; max-width: 340px;
+    }
+    .panel h1 { margin: 0 0 4px; font-size: 16px; }
+    .panel p { margin: 4px 0; font-size: 12.5px; color: #444; }
+    .panel code { background: #eef; padding: 1px 4px; border-radius: 4px; }
+    .buttons { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+    .buttons button {
+      border: 1px solid #ccc; background: #fff; border-radius: 6px;
+      padding: 5px 10px; font-size: 12.5px; cursor: pointer;
+    }
+    .buttons button:hover { background: #f0f4ff; }
+    .buttons button.on { background: #2a6fdb; color: #fff; border-color: #2a6fdb; }
+    .err {
+      position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+      background: #fff; z-index: 30; text-align: center; padding: 24px;
+    }
+    a { color: #2a6fdb; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div class="panel">
+    <h1>🍂 Rustyleaf — Overlays &amp; Tiles</h1>
+    <p><code>ImageOverlay</code> and <code>SVGOverlay</code> are pinned to
+       LatLng bounds and repositioned every frame. The debug
+       <code>GridLayer</code> draws a DOM tile per <code>z/x/y</code>, and the
+       <code>WMSTileLayer</code> requests GetMap tiles with a per-tile
+       EPSG:3857 bbox computed in the Rust core.</p>
+    <div class="buttons">
+      <button id="t-image" class="on">ImageOverlay</button>
+      <button id="t-svg" class="on">SVGOverlay</button>
+      <button id="t-grid">Debug grid</button>
+      <button id="t-wms">WMS basemap</button>
+      <button id="t-lines" class="on">Thick lines</button>
+    </div>
+    <p style="margin-top:10px">Demos:
+       <a href="index.html">points</a> · <a href="markers.html">markers</a> ·
+       <a href="shapes.html">shapes</a> · <a href="interactions.html">interactions</a></p>
+    <p><a href="https://github.com/mehdilhy/rustyleaf">GitHub</a> ·
+       <a href="https://www.npmjs.com/package/rustyleaf">npm</a> · pre-alpha v0.0.1</p>
+  </div>
+
+  <div class="err" id="err"><div><h2>WebGL2 not available</h2><p>Rustyleaf requires a browser with WebGL2 enabled.</p></div></div>
+
+  <script type="module">
+    import {
+      Map, TileLayer, WMSTileLayer, GridLayer,
+      ImageOverlay, SVGOverlay, LineLayer, ZoomControl,
+    } from '../dist/rustyleaf.bundle.js';
+
+    let map;
+    try {
+      map = new Map('map', { center: [48.8566, 2.3522], zoom: 13 });
+    } catch (e) {
+      document.getElementById('err').style.display = 'flex';
+      throw e;
+    }
+
+    const osm = new TileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+    });
+    osm.addTo(map);
+    new ZoomControl().addTo(map);
+
+    // ---- ImageOverlay: an inline SVG "heatmap blob" pinned over the Seine ----
+    const blob = 'data:image/svg+xml;utf8,' + encodeURIComponent(
+      '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="120">' +
+      '<defs><radialGradient id="g"><stop offset="0%" stop-color="#ff3b3b" stop-opacity=".85"/>' +
+      '<stop offset="100%" stop-color="#ff3b3b" stop-opacity="0"/></radialGradient></defs>' +
+      '<rect width="200" height="120" fill="url(#g)"/></svg>');
+    const image = new ImageOverlay(blob, [[48.845, 2.32], [48.868, 2.38]], { opacity: 0.9 });
+    image.addTo(map);
+
+    // ---- SVGOverlay: a live DOM <svg> with its own animation ----
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', '0 0 100 100');
+    svg.innerHTML =
+      '<circle cx="50" cy="50" r="42" fill="none" stroke="#2a6fdb" stroke-width="4" stroke-dasharray="10 6">' +
+      '<animateTransform attributeName="transform" type="rotate" from="0 50 50" to="360 50 50" dur="8s" repeatCount="indefinite"/></circle>' +
+      '<text x="50" y="55" text-anchor="middle" font-size="13" fill="#2a6fdb">SVG</text>';
+    const svgOverlay = new SVGOverlay(svg, [[48.868, 2.29], [48.882, 2.315]]);
+    svgOverlay.addTo(map);
+
+    // ---- GridLayer: subclass createTile for labeled debug tiles ----
+    class DebugGrid extends GridLayer {
+      createTile(coords) {
+        const el = document.createElement('div');
+        el.textContent = `${coords.z}/${coords.x}/${coords.y}`;
+        el.style.cssText =
+          'box-sizing:border-box;border:1px dashed rgba(42,111,219,.7);' +
+          'color:#2a6fdb;font:11px/1.4 ui-monospace,monospace;padding:2px 4px;';
+        return el;
+      }
+    }
+    const grid = new DebugGrid();
+
+    // ---- WMSTileLayer: OSM rendered by a public WMS (terrestris) ----
+    // The {bbox-epsg-3857} token in the template is substituted per tile by
+    // the Rust tile loader.
+    const wms = new WMSTileLayer('https://ows.terrestris.de/osm/service', {
+      layers: 'OSM-WMS',
+      format: 'image/png',
+      attribution: 'WMS &copy; <a href="https://www.terrestris.de/">terrestris</a> / OSM contributors',
+    });
+
+    // ---- Thick lines: same route at widths 2 / 8 / 16 ----
+    const lines = new LineLayer();
+    const route = (dLat, color, width) => ({
+      coords: [
+        { lat: 48.836 + dLat, lng: 2.30 }, { lat: 48.840 + dLat, lng: 2.33 },
+        { lat: 48.836 + dLat, lng: 2.36 }, { lat: 48.840 + dLat, lng: 2.39 },
+      ],
+      color, width,
+    });
+    lines.add([
+      route(0.000, '#12995f', 2),
+      route(-0.006, '#e0393e', 8),
+      route(-0.012, '#7b2fbf', 16),
+    ]);
+    lines.addTo(map);
+
+    // ---- toggle wiring ----
+    function toggle(btnId, layer, startOn) {
+      const btn = document.getElementById(btnId);
+      let on = startOn;
+      btn.addEventListener('click', () => {
+        on = !on;
+        btn.classList.toggle('on', on);
+        if (on) layer.addTo(map);
+        else layer.remove();
+      });
+    }
+    toggle('t-image', image, true);
+    toggle('t-svg', svgOverlay, true);
+    toggle('t-grid', grid, false);
+    toggle('t-lines', lines, true);
+
+    // WMS replaces the OSM raster basemap (one tile pipeline in the core)
+    const wmsBtn = document.getElementById('t-wms');
+    let wmsOn = false;
+    wmsBtn.addEventListener('click', () => {
+      wmsOn = !wmsOn;
+      wmsBtn.classList.toggle('on', wmsOn);
+      (wmsOn ? wms : osm).addTo(map);
+    });
+  </script>
+</body>
+</html>

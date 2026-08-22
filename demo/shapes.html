@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rustyleaf — Shapes &amp; Layer Groups demo</title>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; font-family: system-ui, -apple-system, sans-serif; }
+    #map { width: 100%; height: 100%; }
+    .panel {
+      position: absolute; top: 12px; left: 12px; z-index: 20;
+      background: rgba(255, 255, 255, 0.95); border-radius: 8px;
+      box-shadow: 0 2px 12px rgba(0, 0, 0, 0.25); padding: 14px 16px; max-width: 340px;
+    }
+    .panel h1 { margin: 0 0 4px; font-size: 16px; }
+    .panel p { margin: 4px 0; font-size: 12.5px; color: #444; }
+    .panel code { background: #eef; padding: 1px 4px; border-radius: 4px; }
+    .buttons { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+    .buttons button {
+      border: 1px solid #ccc; background: #fff; border-radius: 6px;
+      padding: 5px 10px; font-size: 12.5px; cursor: pointer;
+    }
+    .buttons button:hover { background: #f0f4ff; }
+    .err {
+      position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+      background: #fff; z-index: 30; text-align: center; padding: 24px;
+    }
+    a { color: #2a6fdb; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div class="panel">
+    <h1>🍂 Rustyleaf — Shapes &amp; Groups</h1>
+    <p><code>Circle</code> (geodesic meters), <code>CircleMarker</code> (pixel radius),
+       <code>Rectangle</code> (bounds) — all drawn by the WebGL core.
+       The <strong>LayersControl</strong> (top right) toggles two
+       <code>FeatureGroup</code>s on and off.</p>
+    <div class="buttons">
+      <button id="fit-districts">Fit districts</button>
+      <button id="fit-rings">Fit ring circles</button>
+      <button id="grow">Grow circles +100 m</button>
+    </div>
+    <p style="margin-top:10px">Demos:
+       <a href="index.html">points</a> · <a href="markers.html">markers</a> ·
+       <a href="interactions.html">interactions</a> · <a href="overlays.html">overlays</a></p>
+    <p><a href="https://github.com/mehdilhy/rustyleaf">GitHub</a> ·
+       <a href="https://www.npmjs.com/package/rustyleaf">npm</a> · pre-alpha v0.0.1</p>
+  </div>
+
+  <div class="err" id="err"><div><h2>WebGL2 not available</h2><p>Rustyleaf requires a browser with WebGL2 enabled.</p></div></div>
+
+  <script type="module">
+    import {
+      Map, TileLayer, Circle, CircleMarker, Rectangle,
+      FeatureGroup, LayersControl, ZoomControl, ScaleControl,
+    } from '../dist/rustyleaf.bundle.js';
+
+    let map;
+    try {
+      map = new Map('map', { center: [48.8566, 2.3522], zoom: 12 });
+    } catch (e) {
+      document.getElementById('err').style.display = 'flex';
+      throw e;
+    }
+
+    new TileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+    }).addTo(map);
+
+    // --- FeatureGroup #1: "districts" — rectangles + geodesic circles ---
+    const districts = new FeatureGroup([
+      new Rectangle([[48.850, 2.290], [48.876, 2.330]], { color: '#2a6fdb55' }),
+      new Rectangle([[48.838, 2.345], [48.858, 2.395]], { color: '#e0393e55' }),
+      new Circle([48.8738, 2.2950], { radius: 900, color: '#12995f66' }),  // Arc de Triomphe
+      new Circle([48.8530, 2.3499], { radius: 600, color: '#b8860b66' }),  // Notre-Dame
+    ]);
+    districts.addTo(map);
+
+    // --- FeatureGroup #2: a ring of CircleMarkers (fixed pixel size) ---
+    const rings = new FeatureGroup();
+    for (let i = 0; i < 40; i++) {
+      const ang = (i / 40) * Math.PI * 2;
+      rings.addLayer(new CircleMarker(
+        [48.8566 + Math.sin(ang) * 0.05, 2.3522 + Math.cos(ang) * 0.075],
+        { radius: 5 + (i % 4) * 2, color: i % 2 ? '#e0393e' : '#2a6fdb' }
+      ));
+    }
+    rings.addTo(map);
+
+    // --- LayersControl toggles the groups; standard controls too ---
+    new LayersControl(null, { 'Districts': districts, 'Ring markers': rings }).addTo(map);
+    new ZoomControl().addTo(map);
+    new ScaleControl().addTo(map);
+
+    // FeatureGroup.getBounds() unions all children.
+    document.getElementById('fit-districts').addEventListener('click', () => {
+      map.fitBounds(districts.getBounds());
+    });
+    document.getElementById('fit-rings').addEventListener('click', () => {
+      map.fitBounds(rings.getBounds());
+    });
+
+    // Circles keep state: setRadius(...).redraw() rebuilds the geometry.
+    const growable = new Circle([48.8566, 2.3522], { radius: 300, color: '#7b2fbf66' });
+    growable.addTo(map);
+    document.getElementById('grow').addEventListener('click', () => {
+      growable.setRadius(growable.getRadius() + 100).redraw();
+    });
+
+    map.on('layeradd', (e) => console.log('layeradd', e.layer));
+    map.on('layerremove', (e) => console.log('layerremove', e.layer));
+  </script>
+</body>
+</html>
