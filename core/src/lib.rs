@@ -1591,6 +1591,65 @@ impl RustyleafMap {
         self.polygon_layers.len() - 1
     }
 
+    /// Free a point layer's GPU buffer while keeping its data. The next
+    /// frame that renders the layer re-uploads automatically (gpu_dirty).
+    #[wasm_bindgen]
+    pub fn free_point_layer_gpu(&mut self, layer_index: usize) -> Result<(), JsValue> {
+        if layer_index >= self.point_layers.len() {
+            return Err(RustyleafError::LayerOutOfBounds { index: layer_index, len: self.point_layers.len() }.into());
+        }
+        let old = self.point_layers[layer_index].vertex_buffer.borrow_mut().take();
+        drop(old); // OwnedBuffer::Drop -> deleteBuffer
+        self.point_layers[layer_index].gpu_dirty.set(true);
+        self.needs_redraw = true;
+        Ok(())
+    }
+
+    /// Free a line layer's GPU instance buffer (data retained; auto-reupload).
+    #[wasm_bindgen]
+    pub fn free_line_layer_gpu(&mut self, layer_index: usize) -> Result<(), JsValue> {
+        if layer_index >= self.line_layers.len() {
+            return Err(RustyleafError::LayerOutOfBounds { index: layer_index, len: self.line_layers.len() }.into());
+        }
+        let old = self.line_layers[layer_index].vertex_buffer.borrow_mut().take();
+        drop(old);
+        self.line_layers[layer_index].instance_count.set(0);
+        self.line_layers[layer_index].gpu_dirty.set(true);
+        self.needs_redraw = true;
+        Ok(())
+    }
+
+    /// Free a polygon layer's GPU vertex buffer (data retained; auto-reupload).
+    #[wasm_bindgen]
+    pub fn free_polygon_layer_gpu(&mut self, layer_index: usize) -> Result<(), JsValue> {
+        if layer_index >= self.polygon_layers.len() {
+            return Err(RustyleafError::LayerOutOfBounds { index: layer_index, len: self.polygon_layers.len() }.into());
+        }
+        let old = self.polygon_layers[layer_index].vertex_buffer.borrow_mut().take();
+        drop(old);
+        self.polygon_layers[layer_index].vertex_count.set(0);
+        self.polygon_layers[layer_index].gpu_dirty.set(true);
+        self.needs_redraw = true;
+        Ok(())
+    }
+
+    /// Free a GeoJSON layer's cached GPU buffers (features retained;
+    /// caches rebuild on the next render that shows the layer).
+    #[wasm_bindgen]
+    pub fn free_geojson_layer_gpu(&mut self, layer_index: usize) -> Result<(), JsValue> {
+        if layer_index >= self.geojson_layers.len() {
+            return Err(RustyleafError::LayerOutOfBounds { index: layer_index, len: self.geojson_layers.len() }.into());
+        }
+        let poly = self.geojson_layers[layer_index].polygon_vertex_buffer.borrow_mut().take();
+        drop(poly);
+        let line = self.geojson_layers[layer_index].line_vertex_buffer.borrow_mut().take();
+        drop(line);
+        self.geojson_layers[layer_index].polygon_vertex_count.set(0);
+        self.geojson_layers[layer_index].line_vertex_count.set(0);
+        self.needs_redraw = true;
+        Ok(())
+    }
+
     #[wasm_bindgen]
     pub fn set_polygon_layer_visible(&mut self, layer_index: usize, visible: bool) {
         self.needs_redraw = true;

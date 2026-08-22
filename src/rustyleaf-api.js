@@ -918,9 +918,21 @@ class Map {
 
   // One-finger pan reuses the wasm mouse-drag pipeline (incl. momentum);
   // two-finger pinch reuses the wheel-zoom pipeline anchored at the midpoint.
+  // Double-tap zooms in one level at the tap point; tap-hold (~500ms) fires
+  // the contextmenu pipeline, mirroring Leaflet's mobile gesture handling.
   _setupTouchHandlers() {
     let touchMode = null; // 'pan' | 'pinch'
     let lastDist = 0;
+
+    // Double-tap + long-press state
+    let tapStart = null;      // { x, y, time } of current one-finger touch
+    let lastTap = null;       // { x, y, time } of previous completed quick tap
+    let longPressTimer = null;
+    let longPressFired = false;
+    const LONG_PRESS_MS = 500;
+    const DOUBLE_TAP_MS = 300;
+    const MOVE_SLOP_PX = 12;   // CSS px before a press counts as a drag
+    const TAP_MAX_MS = 250;    // quicker than this = tap, not long press
 
     const canvasPoint = (t) => {
       const rect = this.canvas.getBoundingClientRect();
@@ -930,13 +942,40 @@ class Map {
     };
     const dist = (a, b) => Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
 
+    // Helpers for double-tap / long-press
+    const clearLongPress = () => {
+      if (longPressTimer !== null) {
+        clearTimeout(longPressTimer);
+        longPressTimer = null;
+      }
+    };
+    // CSS-pixel distance between two touch positions (for tap-move slop)
+    const cssPoint = (t) => {
+      const rect = this.canvas.getBoundingClientRect();
+      return [t.clientX - rect.left, t.clientY - rect.top];
+    };
+
     this.canvas.addEventListener('touchstart', (e) => {
       e.preventDefault();
       if (e.touches.length === 1) {
         touchMode = 'pan';
+        longPressFired = false;
         const [x, y] = canvasPoint(e.touches[0]);
         this.wasmMap.handle_mouse_down(x, y);
+
+        // Arm long-press contextmenu (cancelled by movement, pinch, or lift)
+        const t = e.touches[0];
+        tapStart = { x: t.clientX, y: t.clientY, time: performance.now() };
+        clearLongPress();
+        longPressTimer = setTimeout(() => {
+          longPressTimer = null;
+          if (touchMode !== 'pan' || this._destroyed) return;
+          longPressFired = true;
+          const [cx, cy] = canvasPoint(t);
+          this.wasmMap.handle_contextmenu(cx, cy);
+        }, LONG_PRESS_MS);
       } else if (e.touches.length === 2) {
+        clearLongPress();
         if (touchMode === 'pan') {
           const [x, y] = canvasPoint(e.touches[0]);
           this.wasmMap.handle_mouse_up(x, y);
@@ -949,6 +988,13 @@ class Map {
     this.canvas.addEventListener('touchmove', (e) => {
       e.preventDefault();
       if (touchMode === 'pan' && e.touches.length === 1) {
+        // Cancel long-press once the finger moves beyond the tap slop
+        if (longPressTimer !== null && tapStart) {
+          const [sx, sy] = cssPoint(e.touches[0]);
+          if (Math.hypot(sx - tapStart.x, sy - tapStart.y) > MOVE_SLOP_PX) {
+            clearLongPress();
+          }
+        }
         const [x, y] = canvasPoint(e.touches[0]);
         this.wasmMap.on_mouse_move(x, y);
       } else if (touchMode === 'pinch' && e.touches.length === 2) {
@@ -969,13 +1015,52 @@ class Map {
       if (touchMode === 'pan' && e.changedTouches.length > 0) {
         const [x, y] = canvasPoint(e.changedTouches[0]);
         this.wasmMap.handle_mouse_up(x, y);
+
+        // Double-tap detection on a quick tap that stayed within slop
+        if (e.type === 'touchend') {
+          clearLongPress();
+          const t = e.changedTouches[0];
+          const now = performance.now();
+          const [sx, sy] = cssPoint(t);
+          if (!longPressFired && tapStart &&
+              Math.hypot(sx - tapStart.x, sy - tapStart.y) <= MOVE_SLOP_PX &&
+              now - tapStart.time <= TAP_MAX_MS) {
+            if (lastTap &&
+                now - lastTap.time <= DOUBLE_TAP_MS &&
+                Math.hypot(sx - lastTap.x, sy - lastTap.y) <= MOVE_SLOP_PX) {
+              // Double tap → zoom in one level at the tap point
+              this.wasmMap.on_wheel(-1, x, y);
+              lastTap = null;
+            } else {
+              lastTap = { x: sx, y: sy, time: now };
+            }
+          } else {
+            lastTap = null;
+          }
+        }
       }
-      if (e.touches.length === 0) touchMode = null;
+      if (e.touches.length === 0) {
+        touchMode = null;
+        tapStart = null;
+      }
       else if (e.touches.length === 1) {
         // dropped from pinch back to one finger — restart pan
         touchMode = 'pan';
+        longPressFired = false;
         const [x, y] = canvasPoint(e.touches[0]);
         this.wasmMap.handle_mouse_down(x, y);
+
+        // Re-arm long-press for the restarted pan
+        const t = e.touches[0];
+        tapStart = { x: t.clientX, y: t.clientY, time: performance.now() };
+        clearLongPress();
+        longPressTimer = setTimeout(() => {
+          longPressTimer = null;
+          if (touchMode !== 'pan' || this._destroyed) return;
+          longPressFired = true;
+          const [cx, cy] = canvasPoint(t);
+          this.wasmMap.handle_contextmenu(cx, cy);
+        }, LONG_PRESS_MS);
       }
     };
     this.canvas.addEventListener('touchend', endTouch, { passive: false });
@@ -1237,6 +1322,10 @@ class PointLayer {
   remove() {
     if (this._map && this._layerIndex !== undefined) {
       this._map.wasmMap.set_point_layer_visible(this._layerIndex, false);
+      // Release the GPU buffer now — re-add re-uploads automatically.
+      if (typeof this._map.wasmMap.free_point_layer_gpu === 'function') {
+        try { this._map.wasmMap.free_point_layer_gpu(this._layerIndex); } catch (e) { /* stale index */ }
+      }
       if (this._map._notifyLayerRemove) this._map._notifyLayerRemove(this);
     }
     return this;
@@ -1297,6 +1386,9 @@ class LineLayer {
   remove() {
     if (this.map && this._layerIndex !== undefined) {
       this.map.wasmMap.set_line_layer_visible(this._layerIndex, false);
+      if (typeof this.map.wasmMap.free_line_layer_gpu === 'function') {
+        try { this.map.wasmMap.free_line_layer_gpu(this._layerIndex); } catch (e) { /* stale index */ }
+      }
       if (this.map._notifyLayerRemove) this.map._notifyLayerRemove(this);
     }
     return this;
@@ -1779,6 +1871,9 @@ class PolygonLayer {
   remove() {
     if (this.map && this._layerIndex !== undefined) {
       this.map.wasmMap.set_polygon_layer_visible(this._layerIndex, false);
+      if (typeof this.map.wasmMap.free_polygon_layer_gpu === 'function') {
+        try { this.map.wasmMap.free_polygon_layer_gpu(this._layerIndex); } catch (e) { /* stale index */ }
+      }
       if (this.map._notifyLayerRemove) this.map._notifyLayerRemove(this);
     }
     return this;
@@ -2776,6 +2871,9 @@ class GeoJSONLayer {
   remove() {
     if (this.map && this.layerIndex !== undefined) {
       this.map.wasmMap.set_geojson_layer_visible(this.layerIndex, false);
+      if (typeof this.map.wasmMap.free_geojson_layer_gpu === 'function') {
+        try { this.map.wasmMap.free_geojson_layer_gpu(this.layerIndex); } catch (e) { /* stale index */ }
+      }
       if (this.map._notifyLayerRemove) this.map._notifyLayerRemove(this);
     }
     for (const layer of this._featureLayers) layer.remove();
