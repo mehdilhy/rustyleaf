@@ -358,7 +358,7 @@ describe('PolygonLayer', () => {
       
       expect(() => {
         polygonLayer.addTo(mockMap as any);
-      }).toThrow("Cannot read properties of undefined (reading 'add_polygon_layer')");
+      }).toThrow('Cannot read properties of undefined (reading \'add_polygon_layer\')');
     });
   });
 

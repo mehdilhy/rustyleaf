@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Rustyleaf — Memory Soak &amp; FPS Benchmark</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #111; display: flex; justify-content: center; align-items: center; height: 100vh; }
+  #map { width: 1000px; height: 700px; }
+  #status { position: absolute; top: 10px; left: 10px; color: #0f0; font: 12px monospace; display: none; }
+</style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="status"></div>
+  <script type="module">
+    import { Map, TileLayer, GeoJSONLayer } from "../../src/rustyleaf-api.js";
+
+    try {
+      const container = document.getElementById('map');
+      const map = new Map(container, { center: [46.0, 5.5], zoom: 7 });
+
+      window.__map = map;
+
+      const tiles = new TileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png');
+      tiles.addTo(map);
+
+      const geojsonLayer = new GeoJSONLayer(null, {
+        pointColor: '#ff0000',
+        pointSize: 6,
+        lineColor: '#ffffff',
+        lineWidth: 2,
+        polygonColor: '#ff6600ff',
+      });
+      geojsonLayer.addTo(map);
+
+      let readyFrames = 0;
+      function checkReady() {
+        readyFrames++;
+        if (readyFrames >= 10) {
+          window.__rustyleafReady = true;
+          document.getElementById('status').textContent = 'MAP READY';
+        } else {
+          requestAnimationFrame(checkReady);
+        }
+      }
+      requestAnimationFrame(checkReady);
+
+      geojsonLayer.loadUrl('../../geojson/arrondissements.geojson')
+        .then(() => {
+        const count = geojsonLayer.getFeatureCount();
+        document.getElementById('status').textContent = `Loaded ${count} features`;
+        window.__rustyleafGeoJSONReady = true;
+      }).catch(err => {
+        document.getElementById('status').textContent = 'GeoJSON load failed: ' + err.message;
+        document.getElementById('status').style.color = '#f00';
+      });
+    } catch (err) {
+      document.getElementById('status').textContent = 'ERROR: ' + err.message;
+      document.getElementById('status').style.display = 'block';
+      document.getElementById('status').style.color = '#f00';
+    }
+  </script>
+</body>
+</html>

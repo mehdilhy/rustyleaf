@@ -4,11 +4,11 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.0.x   | ❌ No support      |
-| 0.1.x   | ✅ Security fixes  |
-| 0.2.x   | ✅ Security fixes  |
+| 0.0.x   | ✅ Security fixes (latest pre-alpha) |
 
-> **Note**: This project is currently in pre-alpha development. No versions are currently supported for production use.
+> **Note**: This project is pre-alpha. Only the latest published version
+> receives fixes — there is no long-term support branch yet. Not intended
+> for production use.
 
 ## Reporting a Vulnerability
 
@@ -41,7 +41,7 @@ This project currently has:
 - Minimal input validation
 - No sanitization of external data
 - Experimental WebGL/WASM implementation
-- Memory management issues (being addressed)
+- No WebGL1/Canvas2D fallback — WebGL2 is required
 
 **Do not use in production environments.**
 

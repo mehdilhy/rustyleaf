@@ -1,0 +1,74 @@
+name: Deploy demo to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            core/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('core/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - run: cargo install wasm-pack
+      - run: npm ci
+      - run: npm run build
+
+      - name: Assemble site
+        run: |
+          mkdir -p _site/demo _site/benchmark
+          cp -r dist _site/dist
+          cp demo/index.html _site/demo/index.html
+          cp benchmark/index.html _site/benchmark/index.html
+          cat > _site/index.html <<'EOF'
+          <!DOCTYPE html><meta charset="utf-8">
+          <title>Rustyleaf</title>
+          <body style="font:16px system-ui;max-width:640px;margin:60px auto;padding:0 20px">
+          <h1>🍂 Rustyleaf</h1>
+          <p>Leaflet-style map API on a Rust + WebAssembly + WebGL2 core.</p>
+          <ul>
+            <li><a href="demo/">Live demo</a> — 1M points at 60fps</li>
+            <li><a href="benchmark/">Benchmark</a> — vs Leaflet &amp; MapLibre GL</li>
+            <li><a href="https://github.com/mehdilhy/rustyleaf">GitHub</a></li>
+          </ul>
+          EOF
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

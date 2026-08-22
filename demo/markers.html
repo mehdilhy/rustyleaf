@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rustyleaf — GPU Markers demo</title>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; font-family: system-ui, -apple-system, sans-serif; }
+    #map { width: 100%; height: 100%; }
+    .panel {
+      position: absolute; top: 12px; left: 12px; z-index: 20;
+      background: rgba(255, 255, 255, 0.95); border-radius: 8px;
+      box-shadow: 0 2px 12px rgba(0, 0, 0, 0.25); padding: 14px 16px; max-width: 320px;
+    }
+    .panel h1 { margin: 0 0 4px; font-size: 16px; }
+    .panel p { margin: 4px 0; font-size: 12.5px; color: #444; }
+    .panel code { background: #eef; padding: 1px 4px; border-radius: 4px; }
+    .buttons { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+    .buttons button {
+      border: 1px solid #ccc; background: #fff; border-radius: 6px;
+      padding: 5px 10px; font-size: 12.5px; cursor: pointer;
+    }
+    .buttons button:hover { background: #f0f4ff; }
+    .stats {
+      position: absolute; bottom: 24px; left: 12px; z-index: 20;
+      background: rgba(0, 0, 0, 0.75); color: #7CFC00; border-radius: 6px;
+      padding: 8px 12px; font: 13px/1.5 ui-monospace, monospace;
+    }
+    .err {
+      position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+      background: #fff; z-index: 30; text-align: center; padding: 24px;
+    }
+    a { color: #2a6fdb; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div class="panel">
+    <h1>🍂 Rustyleaf — Markers</h1>
+    <p>Markers are drawn on the <strong>GPU</strong> inside the Rust/WASM core
+       (round sprites via the shared point program) — not as DOM overlays.</p>
+    <p>Markers on screen: <strong id="count">0</strong></p>
+    <div class="buttons">
+      <button data-n="10">10</button>
+      <button data-n="100" class="active">100</button>
+      <button data-n="1000">1k</button>
+      <button data-n="10000">10k</button>
+      <button id="toggle">Toggle redraw</button>
+    </div>
+    <p style="margin-top:10px">Demos: <a href="index.html">points</a> · <a href="shapes.html">shapes</a> · <a href="interactions.html">interactions</a> · <a href="overlays.html">overlays</a></p>
+    <p><a href="https://github.com/mehdilhy/rustyleaf">GitHub</a> ·
+       <a href="https://www.npmjs.com/package/rustyleaf">npm</a> · pre-alpha v0.0.1</p>
+  </div>
+
+  <div class="stats"><span id="fps">–</span> fps</div>
+  <div class="err" id="err"><div><h2>WebGL2 not available</h2><p>Rustyleaf requires a browser with WebGL2 enabled.</p></div></div>
+
+  <script type="module">
+    import { Map, TileLayer, Marker, Icon, DivIcon, Popup } from '../dist/rustyleaf.bundle.js';
+
+    let map;
+    try {
+      map = new Map('map', { center: [48.8566, 2.3522], zoom: 12 });
+    } catch (e) {
+      document.getElementById('err').style.display = 'flex';
+      throw e;
+    }
+
+    new TileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+    }).addTo(map);
+
+    // A custom image icon (falls back to the default pin if the URL 404s).
+    const pinIcon = new Icon({
+      iconUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
+      iconSize: [25, 41],
+      iconAnchor: [12, 41],
+      popupAnchor: [0, -36],
+    });
+
+    const pinIcon2 = new Icon({
+      iconUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',
+      iconSize: [25, 41],
+      iconAnchor: [12, 41],
+      popupAnchor: [0, -36],
+    });
+
+    // A DivIcon (pure HTML) — handy for labels/badges.
+    const badge = new DivIcon({
+      html: '<div style="background:#2a6fdb;color:#fff;border-radius:50%;width:28px;height:28px;line-height:28px;text-align:center;font:12px sans-serif;box-shadow:0 1px 4px rgba(0,0,0,.4)">★</div>',
+      iconSize: [28, 28],
+      iconAnchor: [14, 14],
+    });
+
+    let markers = [];
+
+    function makeMarker(i, n) {
+      // Scatter in a ring around Paris.
+      const ring = 0.02 + (i / n) * 0.18;
+      const ang = (i * 2.39996323) % (Math.PI * 2); // golden-angle spread
+      const lat = 48.8566 + Math.sin(ang) * ring;
+      const lng = 2.3522 + Math.cos(ang) * ring;
+
+      let icon = pinIcon;
+      if (i % 7 === 0) icon = pinIcon2;
+      if (i % 11 === 0) icon = badge;
+
+      const m = new Marker([lat, lng], {
+        icon,
+        size: 14 + (i % 5) * 3,
+        color: i % 2 ? '#e0393e' : '#2a6fdb',
+        opacity: 1,
+        zIndexOffset: i,
+        draggable: i % 3 === 0,
+      });
+
+      // Bind a real Popup instance so it renders on click (auto-opens via the
+      // click handler below).
+      const popup = new Popup({ maxWidth: 240 });
+      popup.setContent(`<strong>Marker #${i}</strong><br>lat ${lat.toFixed(4)}, lng ${lng.toFixed(4)}`);
+      m.bindPopup(popup);
+      m.bindTooltip(`#${i}`);
+      m.on('click', (e) => {
+        console.log('marker click', e.latlng);
+        m.openPopup();
+      });
+      m.on('dragend', (e) => console.log('marker moved to', e.latlng));
+      return m;
+    }
+
+    function setCount(n) {
+      markers.forEach((m) => m.remove());
+      markers = [];
+      const frag = [];
+      for (let i = 0; i < n; i++) frag.push(makeMarker(i, n));
+      // addTo each (markers register with the WASM core and render on the GPU)
+      frag.forEach((m) => m.addTo(map));
+      markers = frag;
+      document.getElementById('count').textContent = n.toLocaleString();
+    }
+
+    document.querySelectorAll('.buttons button[data-n]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.buttons button[data-n]').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        setCount(Number(btn.dataset.n));
+      });
+    });
+
+    let redraw = true;
+    document.getElementById('toggle').addEventListener('click', () => {
+      redraw = !redraw;
+      if (redraw) {
+        markers.forEach((m) => m.addTo(map));
+      } else {
+        markers.forEach((m) => m.remove());
+      }
+    });
+
+    setCount(100);
+
+    // Exposed for debugging / e2e checks
+    window.__map = map;
+    window.__getMarkers = () => markers;
+
+    // ---- FPS meter ----
+    const fpsEl = document.getElementById('fps');
+    let frames = 0, last = performance.now();
+    function tick(now) {
+      frames++;
+      if (now - last >= 1000) {
+        fpsEl.textContent = String(frames);
+        frames = 0; last = now;
+      }
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  </script>
+</body>
+</html>
