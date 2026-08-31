@@ -1494,7 +1494,8 @@ impl RustyleafMap {
 
         let layer = &mut self.point_layers[layer_index];
         layer.points.reserve(points_data.len() / 7);
-        for point in points_data.chunks_exact(7) {
+        for i in (0..points_data.len()).step_by(7) {
+            let point = &points_data[i..i + 7];
             layer.points.push(PointFeature {
                 lat: point[0] as f64,
                 lng: point[1] as f64,
@@ -1577,7 +1578,8 @@ impl RustyleafMap {
         let mut min = layer.norm_min.get();
         let mut max = layer.norm_max.get();
         let mut area_sum = 0.0f64;
-        for point in points_data.chunks_exact(7) {
+        for i in (0..points_data.len()).step_by(7) {
+            let point = &points_data[i..i + 7];
             let lat = point[0] as f64;
             let lng = point[1] as f64;
             let size = point[2];
