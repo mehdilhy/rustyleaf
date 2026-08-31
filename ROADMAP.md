@@ -13,7 +13,8 @@ benchmarks.
 - [x] Published benchmark page: Rustyleaf vs Leaflet vs MapLibre GL, same data,
       same hardware, methodology + code in-repo ([`benchmark/`](benchmark/))
 - [x] GPU-resident point layers — 60fps at 1M points (see benchmark)
-- [ ] GitHub Pages demo + benchmark deployed from CI (workflow added; enable Pages)
+- [ ] Deploy demo + benchmark (needs a Pages-like host; Pages is not enabled on
+      this repo)
 
 ## 0.1.0 — performance that backs the pitch
 
