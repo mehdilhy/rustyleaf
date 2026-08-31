@@ -43,6 +43,3 @@ serde-wasm-bindgen = "0.6"
 rstar = "0.11"  # For spatial indexing and hit-testing
 lyon_tessellation = "1.0"
 lyon_path = "1.0"
-
-[dev-dependencies]
-wasm-bindgen-test = "0.3"
