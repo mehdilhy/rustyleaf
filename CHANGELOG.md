@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.0.3 - 2026-08-31
+
+### Added
+- `configureRustyleaf({ wasmUrl })` — lets consumers set the WASM core location
+  explicitly. Required when the consuming bundler does not emit the `.wasm` as a
+  fetchable asset (e.g. Turbopack/Next.js treats `.wasm` as a WebAssembly module
+  instead of `asset/resource`), so a copy of `rustyleaf_core_bg.wasm` in
+  `/public` + `configureRustyleaf({ wasmUrl: '/rustyleaf_core_bg.wasm' })` works.
+- Clearer error when the WASM URL can't be resolved (was: a cryptic
+  `new URL(...)` "Invalid base URL").
+
+### Fixed
+- The bundled `new URL('../dist/rustyleaf_core_bg.wasm', import.meta.url)` path
+  now skips `file://` bases (dev-time `node_modules` under Turbopack, Node SSR)
+  and reports a helpful error instead of failing with a confusing
+  "Failed to construct 'URL'" — making the failure mode actionable.
+
+### Changed
+- `configureRustyleaf` exported from the package (named + default + types).
+
 ## 0.0.1 - 2026-07-05
 
 First published release (pre-alpha). The engine is functional but under active

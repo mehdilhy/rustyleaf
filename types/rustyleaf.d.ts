@@ -537,9 +537,20 @@ export declare const Util: {
   template(str: string, data: Record<string, any>): string;
 };
 
+// ==================== WASM bootstrap ====================
+
+export interface RustyleafConfig {
+  /** Absolute URL to rustyleaf_core_bg.wasm. Required when the bundler does
+   * not emit the .wasm as a fetchable asset (e.g. Turbopack/Next.js). */
+  wasmUrl?: string;
+}
+
+export declare function configureRustyleaf(config: RustyleafConfig): void;
+
 // ==================== Default export ====================
 
 declare const _default: {
+  configureRustyleaf: typeof configureRustyleaf;
   Map: typeof Map;
   TileLayer: typeof TileLayer;
   PointLayer: typeof PointLayer;

@@ -7,7 +7,20 @@
 import * as RustyleafAPI from '../src/rustyleaf-api.js';
 import * as wasmMock from '../tests/__mocks__/wasmMock';
 const { Map, Popup, Tooltip, Marker, DivIcon, Icon, GeoJSONLayer, ImageOverlay,
-  VideoOverlay, SVGOverlay, WMSTileLayer, GridLayer, LayerGroup, CircleMarker } = RustyleafAPI as any;
+  VideoOverlay, SVGOverlay, WMSTileLayer, GridLayer, LayerGroup, CircleMarker,
+  configureRustyleaf } = RustyleafAPI as any;
+
+describe('configureRustyleaf / wasm bootstrap', () => {
+  test('is exported and accepts a wasmUrl override without throwing', () => {
+    expect(typeof configureRustyleaf).toBe('function');
+    expect(() => configureRustyleaf({ wasmUrl: '/rustyleaf_core_bg.wasm' })).not.toThrow();
+  });
+
+  test('ignores an empty config object', () => {
+    expect(() => configureRustyleaf({})).not.toThrow();
+    expect(() => configureRustyleaf()).not.toThrow();
+  });
+});
 
 function makeMap() {
   const el = document.createElement('div');
