@@ -9,6 +9,7 @@
  */
 
 import * as RustyleafAPI from '../src/rustyleaf-api.js';
+import * as wasmMock from './__mocks__/wasmMock';
 const { ImageOverlay, VideoOverlay, SVGOverlay, Map } = RustyleafAPI as any;
 
 const bounds = [[48.8, 2.2], [48.9, 2.5]]; // [[south, west], [north, east]]
@@ -52,7 +53,7 @@ describe('ImageOverlay', () => {
     const o = new ImageOverlay('/img.png', bounds).addTo(map);
     const img = map.containerElement.querySelector('img.rustyleaf-image-overlay');
     map.wasmMap.screen_xy.mockImplementation((lat: number, lng: number) => [lng * 100 + 50, -lat * 10 + 600]);
-    (map._events.move || []).forEach((cb: any) => cb({ type: 'move' }));
+    wasmMock.fire(map.wasmMap.ptr, 'move', { type: 'move' });
     await new Promise((r) => setTimeout(r, 0)); // reposition is deferred a microtask
     expect(img.style.left).toBe('270px');
   });

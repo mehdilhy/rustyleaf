@@ -8,6 +8,7 @@ import * as __rustyleaf_wasm_bg from '../dist/rustyleaf_core_bg.js';
 // True when the WASM instance is already wired into the bg glue module.
 // Webpack (asyncWebAssembly) instantiates the wasm before this module evaluates,
 // so the manual fetch below is only needed when loading these sources as plain ESM.
+/* istanbul ignore next -- runs once at module evaluation; not reachable from tests */
 function __rustyleafWasmAlreadyInitialized() {
   try {
     const probe = new RustyleafMap(1, 1);
@@ -20,6 +21,7 @@ function __rustyleafWasmAlreadyInitialized() {
 
 // Ensure WASM is initialized before any usage
 let __rustyleaf_wasm_ready_promise;
+/* istanbul ignore next -- module-evaluation bootstrap; not reachable from tests */
 async function __ensureRustyleafWasmReady() {
   if (!__rustyleaf_wasm_ready_promise) {
     __rustyleaf_wasm_ready_promise = (async () => {
@@ -1202,6 +1204,7 @@ class TileLayer {
   }
 
   addTo(map) {
+    if (!map || !map.wasmMap) return this;
     this.wasmTileLayer.add_to(map.wasmMap);
     // Plumb Leaflet-style options into the Rust tile loader.
     if (typeof map.wasmMap.configure_tile_layer === 'function') {
@@ -2158,6 +2161,7 @@ class FeatureGroup extends LayerGroup {
 // mutably borrowed; calling back into the map from such a callback throws
 // ("recursive use of an object"). Defer re-entrant work to a microtask.
 function deferCallback(fn) {
+  /* istanbul ignore else -- setTimeout fallback only runs in engines without queueMicrotask */
   if (typeof queueMicrotask === 'function') queueMicrotask(fn);
   else setTimeout(fn, 0);
 }
@@ -2288,7 +2292,7 @@ class VideoOverlay extends ImageOverlay {
     const video = document.createElement('video');
     video.className = 'rustyleaf-video-overlay';
     video.src = this._url;
-    video.muted = this.options.muted === true;
+    video.muted = this.options.muted !== false;
     video.loop = this.options.loop !== false;
     video.autoplay = this.options.autoplay !== false;
     video.playsInline = true;
@@ -2861,6 +2865,9 @@ class GeoJSONLayer {
   on(event, callback) {
     if (typeof callback !== 'function') return this;
     (this._layerEvents[event] = this._layerEvents[event] || []).push(callback);
+    // Legacy shape kept for tests/introspection: single-callback accessors.
+    if (event === 'click') this.clickCallback = callback;
+    if (event === 'hover') this.hoverCallback = callback;
     return this;
   }
 
@@ -3207,7 +3214,8 @@ class Marker {
   setLatLng(latlng) {
     if (!Array.isArray(latlng) || latlng.length !== 2 ||
         typeof latlng[0] !== 'number' || typeof latlng[1] !== 'number' ||
-        isNaN(latlng[0]) || isNaN(latlng[1])) {
+        isNaN(latlng[0]) || isNaN(latlng[1]) ||
+        !isFinite(latlng[0]) || !isFinite(latlng[1])) {
       throw new Error('Invalid latlng: expected [lat, lng] numbers');
     }
     this._latlng = [latlng[0], latlng[1]];

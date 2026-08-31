@@ -387,6 +387,8 @@ describe('GeoJSONLayer', () => {
     test('should process chunk when map is available', () => {
       const geojsonLayer = new GeoJSONLayer();
       const mockMap = {
+        on: jest.fn(),
+        off: jest.fn(),
         wasmMap: {
           load_geojson_chunk: jest.fn()
         }
@@ -406,6 +408,8 @@ describe('GeoJSONLayer', () => {
     test('should handle processing errors gracefully', () => {
       const geojsonLayer = new GeoJSONLayer();
       const mockMap = {
+        on: jest.fn(),
+        off: jest.fn(),
         wasmMap: {
           load_geojson_chunk: jest.fn().mockImplementation(() => {
             throw new Error('Processing error');
@@ -439,6 +443,8 @@ describe('GeoJSONLayer', () => {
     test('should return feature count from map', () => {
       const geojsonLayer = new GeoJSONLayer();
       const mockMap = {
+        on: jest.fn(),
+        off: jest.fn(),
         wasmMap: {
           get_geojson_feature_count: jest.fn().mockReturnValue(42)
         }
@@ -455,6 +461,8 @@ describe('GeoJSONLayer', () => {
     test('should handle WASM errors gracefully', () => {
       const geojsonLayer = new GeoJSONLayer();
       const mockMap = {
+        on: jest.fn(),
+        off: jest.fn(),
         wasmMap: {
           get_geojson_feature_count: jest.fn().mockImplementation(() => {
             throw new Error('WASM error');
@@ -499,6 +507,8 @@ describe('GeoJSONLayer', () => {
     test('should update style on map when available', () => {
       const geojsonLayer = new GeoJSONLayer();
       const mockMap = {
+        on: jest.fn(),
+        off: jest.fn(),
         wasmMap: {
           set_geojson_style: jest.fn()
         }
@@ -519,6 +529,8 @@ describe('GeoJSONLayer', () => {
     test('should update style on map', () => {
       const geojsonLayer = new GeoJSONLayer();
       const mockMap = {
+        on: jest.fn(),
+        off: jest.fn(),
         wasmMap: {
           set_geojson_style: jest.fn()
         }
@@ -554,6 +566,8 @@ describe('GeoJSONLayer', () => {
       });
       
       const mockMap = {
+        on: jest.fn(),
+        off: jest.fn(),
         wasmMap: {
           add_geojson_layer: jest.fn(() => 0),
           load_geojson: jest.fn(),
@@ -576,6 +590,8 @@ describe('GeoJSONLayer', () => {
       const geojsonLayer = new GeoJSONLayer();
       
       const mockMap = {
+        on: jest.fn(),
+        off: jest.fn(),
         wasmMap: {
           add_geojson_layer: jest.fn(() => 1),
           load_geojson: jest.fn()
@@ -597,6 +613,8 @@ describe('GeoJSONLayer', () => {
       const geojsonLayer = new GeoJSONLayer(geojsonString);
       
       const mockMap = {
+        on: jest.fn(),
+        off: jest.fn(),
         wasmMap: {
           add_geojson_layer: jest.fn(() => 0),
           load_geojson: jest.fn(),
@@ -666,6 +684,8 @@ describe('GeoJSONLayer', () => {
     test('should hide the wasm layer and keep the map reference for re-adding', () => {
       const geojsonLayer = new GeoJSONLayer();
       const mockMap = {
+        on: jest.fn(),
+        off: jest.fn(),
         wasmMap: { set_geojson_layer_visible: jest.fn() }
       };
       geojsonLayer.map = mockMap;
@@ -850,6 +870,8 @@ describe('GeoJSONLayer', () => {
     test('should clear WASM layer when on map', () => {
       const geojsonLayer = new GeoJSONLayer();
       const mockMap = {
+        on: jest.fn(),
+        off: jest.fn(),
         wasmMap: {
           clear_geojson_layer: jest.fn()
         }
@@ -869,6 +891,8 @@ describe('GeoJSONLayer', () => {
     test('should handle WASM clearing errors gracefully', () => {
       const geojsonLayer = new GeoJSONLayer();
       const mockMap = {
+        on: jest.fn(),
+        off: jest.fn(),
         wasmMap: {
           clear_geojson_layer: jest.fn().mockImplementation(() => {
             throw new Error('Clearing error');
@@ -907,6 +931,8 @@ describe('GeoJSONLayer', () => {
     test('should support extensive method chaining', () => {
       const geojsonLayer = new GeoJSONLayer();
       const mockMap = {
+        on: jest.fn(),
+        off: jest.fn(),
         wasmMap: {
           add_geojson_layer: jest.fn(() => 0),
           load_geojson: jest.fn(),

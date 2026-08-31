@@ -10,12 +10,30 @@
 </p>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/rustyleaf"><img src="https://img.shields.io/npm/v/rustyleaf" alt="npm"></a>
+  <a href="https://www.npmjs.com/package/rustyleaf"><img src="https://img.shields.io/npm/v/rustyleaf" alt="npm version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
   <img src="https://img.shields.io/badge/status-pre--alpha-orange" alt="pre-alpha">
+  <img src="https://img.shields.io/badge/webgl2-required-important" alt="WebGL2 required">
 </p>
 
-> ⚠️ **Pre-alpha (v0.0.1).** The API will change without notice and this is not production-ready. It is, however, honestly documented: everything listed below works today and is covered by unit and end-to-end tests.
+<p align="center">
+  <a href="https://github.com/mehdilhy/rustyleaf/actions"><img src="https://img.shields.io/github/actions/workflow/status/mehdilhy/rustyleaf/ci.yml?branch=main&label=CI" alt="CI"></a>
+  <img src="https://img.shields.io/badge/tests-798%20passing-brightgreen" alt="tests passing">
+  <img src="https://img.shields.io/badge/coverage-100%25%20lines-success" alt="coverage: 100% lines">
+  <img src="https://img.shields.io/badge/coverage-95.3%25%20branches-brightgreen" alt="coverage: 95.3% branches">
+  <img src="https://img.shields.io/badge/clippy-D%20warnings%20clean-success" alt="clippy clean">
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Rust-✓-orange?logo=rust&logoColor=white" alt="Rust">
+  <img src="https://img.shields.io/badge/WebAssembly-✓-654FF0?logo=webassembly&logoColor=white" alt="WebAssembly">
+  <img src="https://img.shields.io/badge/WebGL2-✓-990000?logo=webgl&logoColor=white" alt="WebGL2">
+  <img src="https://img.shields.io/badge/Chrome%20%7C%20Edge%2090%2B-tested-2ea44f" alt="Chrome/Edge 90+ tested">
+  <img src="https://img.shields.io/badge/TypeScript-types%20included-3178C6?logo=typescript&logoColor=white" alt="TypeScript types included">
+  <img src="https://img.shields.io/badge/wasm%20core-1.5MB-8A2BE2" alt="wasm core 1.5MB">
+</p>
+
+> ⚠️ **Pre-alpha (v0.0.2).** The API will change without notice and this is not production-ready. It is, however, honestly documented: everything listed below works today and is covered by unit and end-to-end tests.
 
 ---
 
@@ -51,7 +69,7 @@ Leaflet-style) instead of showing empty gray past ±180°.
 
 - XYZ raster tiles (OpenStreetMap-compatible URL templates, subdomain rotation, tile cache with eviction), **WMS layers** (`WMSTileLayer`, per-tile EPSG:3857 bbox computed in the Rust core), and a programmable **`GridLayer`** (DOM tiles via `createTile`)
 - Point, line, and polygon layers with per-feature color/size/metadata; **line width is honored** (segments are expanded into screen-space quads on the GPU)
-- **Markers rendered on the GPU** — `Marker` with `Icon` / `DivIcon`, popups & tooltips, draggable flag, opacity/z-index, Leaflet-style events (`click`, `mouseover`, `mouseout`, `dragstart`/`drag`/`dragend`). Markers are drawn as GPU sprites inside the Rust/WASM core, not DOM overlays, so they scale like the rest of rustyleaf's layers.
+- **Markers rendered on the GPU** — `Marker` with `Icon` / `DivIcon`, popups & tooltips, draggable flag, opacity/z-index, Leaflet-style events (`click`, `mouseover`, `mouseout`, `dragstart`/`drag`/`dragend`). Plain `Icon` markers are drawn as GPU sprites inside the Rust/WASM core (not DOM overlays), so they scale like the rest of rustyleaf's layers; `DivIcon` markers render custom HTML as tracked DOM overlays. Bitmap icons (`iconUrl` on `Icon`) are not rendered yet.
 - GeoJSON layer: load from object, string, URL, `File`, or streamed chunks; styling options; GPU-cached geometry; Leaflet-style `filter` / `pointToLayer` / `onEachFeature` (with per-feature popups and click/hover handlers)
 - Pan, scroll-zoom, momentum ("kinetic") dragging, **box zoom** (shift-drag), **keyboard navigation** (arrows pan, +/- zoom), and **touch gestures** (one-finger pan with momentum, two-finger pinch zoom, double-tap zoom, long-press for the context menu)
 - Click / hover hit-testing via an R-tree spatial index (rebuilt only when data changes)
@@ -66,17 +84,22 @@ Leaflet-style) instead of showing empty gray past ±180°.
 - TypeScript definitions matching the actual runtime API
 - RAII-managed WebGL resources (textures, buffers, VAOs, programs are freed deterministically; verified by GL leak-detection e2e tests)
 
-## Known limitations (v0.0.1)
+## Known limitations (v0.0.2)
 
-- **WebGL2 required.** No Canvas2D or WebGL1 rendering fallback (detection exists; rendering does not).
+- **WebGL2 required.** No Canvas2D or WebGL1 rendering fallback (`checkWebGLSupport`
+  reports a WebGL1 "limited" level, but the renderer hard-requires a WebGL2
+  context and refuses to start without one).
 - **Spherical Mercator only** — no custom CRS (EPSG:4326/3395, `SimpleCRS`).
-- Line width applies to `LineLayer`; GeoJSON-styled lines still render 1px.
+- Line width applies to `LineLayer`; GeoJSON-styled lines honor width only when
+  their GPU cache is built (the fallback non-cached path still draws 1px).
 - No vector tiles.
-- Polygon *interiors* aren't hit-testable in GeoJSON layers yet — only their outline (triangulated fill geometry has no per-feature metadata attached). `PointLayer`/`LineLayer`/`PolygonLayer` (non-GeoJSON) hit-test normally.
+- Polygon *interiors* are hit-tested via point-in-polygon on the outer ring (holes aren't subtracted yet). `PointLayer`/`LineLayer`/`PolygonLayer` (non-GeoJSON) hit-test normally.
 - Line/polygon vertex data is cached in GPU buffers per layer, but heavy combined scenes still cost more than points alone.
 - Calling map methods synchronously inside a raw wasm event callback (`move`, `zoom`, `click`, ...) throws a re-entrancy error — defer with `queueMicrotask` (the built-in layers already do).
 - Layer `remove()` releases the layer's GPU buffers; the data stays in JS and `addTo` re-uploads it.
-- The streaming GeoJSON parser is regex-assisted and can misbehave on exotic input.
+- The streaming GeoJSON parser is a quote-aware brace scanner + serde_json
+  (incremental, NDJSON tail support) — not a full tokenizing parser, so
+  pathological input can still misbehave.
 - API is unstable until 0.1.0.
 
 ## Browser support

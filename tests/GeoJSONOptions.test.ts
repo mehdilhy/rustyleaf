@@ -18,6 +18,7 @@
  */
 
 import * as RustyleafAPI from '../src/rustyleaf-api.js';
+import * as wasmMock from './__mocks__/wasmMock';
 const { GeoJSONLayer, CircleMarker, Map } = RustyleafAPI as any;
 
 function fc() {
@@ -90,7 +91,9 @@ describe('GeoJSONLayer options', () => {
     layer.addTo(map);
     // Simulate the real wasm feature-click event shape: hit-test meta wraps
     // the feature as { layer_type, layer_index, feature_index, original_meta }.
-    const clickHandlers = map._events.click || [];
+    const clickHandlers = wasmMock.rustyleafmap_on_click.mock.calls
+      .filter((c: any[]) => c[0] === map.wasmMap.ptr)
+      .map((c: any[]) => c[1]);
     expect(clickHandlers.length).toBeGreaterThan(0);
     clickHandlers.forEach((cb: any) => cb({
       type: 'click', latlng: [48.85, 2.35],
@@ -109,10 +112,12 @@ describe('GeoJSONLayer options', () => {
       onEachFeature: (f: any, l: any) => l.on('click', (e: any) => clicks.push(e.feature.properties.name)),
     });
     layer.addTo(map);
-    (map._events.click || []).forEach((cb: any) => cb({
-      type: 'click', latlng: [48.86, 2.36],
-      feature: { layer_type: 'geojson-point', layer_index: layer.layerIndex, feature_index: 1, original_meta: { name: 'b', __rl_fid: 1 } },
-    }));
+    wasmMock.rustyleafmap_on_click.mock.calls
+      .filter((c: any[]) => c[0] === map.wasmMap.ptr)
+      .forEach((c: any[]) => c[1]({
+        type: 'click', latlng: [48.86, 2.36],
+        feature: { layer_type: 'geojson-point', layer_index: layer.layerIndex, feature_index: 1, original_meta: { name: 'b', __rl_fid: 1 } },
+      }));
     await new Promise((r) => setTimeout(r, 0)); // dispatch is deferred a microtask
     expect(clicks).toEqual(['b']);
   });
@@ -125,11 +130,13 @@ describe('GeoJSONLayer options', () => {
     });
     layerA.addTo(map);
     const otherLayerIndex = layerA.layerIndex + 1; // simulate a second GeoJSONLayer
-    (map._events.click || []).forEach((cb: any) => cb({
-      type: 'click', latlng: [48.85, 2.35],
-      // Same fid (0) as layerA's feature 'a', but on a different layer_index
-      feature: { layer_type: 'geojson-point', layer_index: otherLayerIndex, feature_index: 0, original_meta: { name: 'a', __rl_fid: 0 } },
-    }));
+    wasmMock.rustyleafmap_on_click.mock.calls
+      .filter((c: any[]) => c[0] === map.wasmMap.ptr)
+      .forEach((c: any[]) => c[1]({
+        type: 'click', latlng: [48.85, 2.35],
+        // Same fid (0) as layerA's feature 'a', but on a different layer_index
+        feature: { layer_type: 'geojson-point', layer_index: otherLayerIndex, feature_index: 0, original_meta: { name: 'a', __rl_fid: 0 } },
+      }));
     await new Promise((r) => setTimeout(r, 0));
     expect(clicksA).toEqual([]);
   });

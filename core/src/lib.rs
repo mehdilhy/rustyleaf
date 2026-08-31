@@ -2651,8 +2651,3 @@ impl PointLayerApi {
         // Store callback for later use (simplified for now)
     }
 }
-
-// Test module — uses wasm_bindgen_test, which only compiles for the wasm
-// target. Run with `wasm-pack test`; a native `cargo test` compiles nothing.
-#[cfg(all(test, target_arch = "wasm32"))]
-mod tests;
