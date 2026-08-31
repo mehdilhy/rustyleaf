@@ -21,6 +21,45 @@ function __rustyleafWasmAlreadyInitialized() {
 
 // Ensure WASM is initialized before any usage
 let __rustyleaf_wasm_ready_promise;
+
+// Optional explicit location of the wasm binary. When this is set, it wins
+// over any bundler-derived URL. Useful when the default resolution (relative
+// to import.meta.url) fails — e.g. Turbopack/Next.js treats .wasm as a module
+// instead of emitting a fetchable asset, so consumers can copy the wasm into
+// /public and point this at it.
+let __rustyleaf_wasm_url = null;
+
+// Configures where rustyleaf fetches its WebAssembly core. Pass an absolute
+// URL (e.g. '/rustyleaf_core_bg.wasm' served from your public dir) when the
+// default bundler resolution doesn't produce a fetchable URL.
+function configureRustyleaf({ wasmUrl } = {}) {
+  if (wasmUrl) __rustyleaf_wasm_url = wasmUrl;
+}
+
+// Resolve the wasm URL. Order:
+//  1. explicit configureRustyleaf({ wasmUrl }) override
+//  2. `new URL('../dist/rustyleaf_core_bg.wasm', import.meta.url)` when the
+//     current module URL is a usable http(s)/blob URL (webpack asset/resource,
+//     plain static ESM serving)
+// Returns null when no usable URL can be derived (callers should throw a
+// helpful error instead of letting `new URL()` throw a confusing one).
+function __rustyleafResolveWasmUrl() {
+  if (__rustyleaf_wasm_url) return __rustyleaf_wasm_url;
+  try {
+    // The bundler rewrites `new URL(..., import.meta.url)` into an asset URL
+    // (webpack asset/resource, Vite) or leaves it as-is for static ESM.
+    const candidate = new URL('../dist/rustyleaf_core_bg.wasm', import.meta.url);
+    // file:// URLs (node_modules under dev-time bundlers, Node SSR) cannot be
+    // fetched by a browser; skip them so the caller can fall back / error.
+    if (!/^file:/i.test(candidate.protocol)) {
+      return candidate.href;
+    }
+  } catch (e) {
+    // fall through to the override/error path
+  }
+  return null;
+}
+
 /* istanbul ignore next -- module-evaluation bootstrap; not reachable from tests */
 async function __ensureRustyleafWasmReady() {
   if (!__rustyleaf_wasm_ready_promise) {
@@ -28,10 +67,15 @@ async function __ensureRustyleafWasmReady() {
       if (__rustyleafWasmAlreadyInitialized()) {
         return;
       }
-      // Fetch and instantiate the wasm. The `new URL(..., import.meta.url)`
-      // literal lets bundlers (webpack asset/resource, Vite) track and emit the
-      // .wasm file as an asset resolved relative to the deployed bundle.
-      const wasmUrl = new URL('../dist/rustyleaf_core_bg.wasm', import.meta.url);
+      const wasmUrl = __rustyleafResolveWasmUrl();
+      if (!wasmUrl) {
+        throw new Error(
+          'Rustyleaf: could not resolve the WebAssembly core URL. Set it explicitly ' +
+          'with configureRustyleaf({ wasmUrl: "/path/to/rustyleaf_core_bg.wasm" }) — ' +
+          'this is required when your bundler (e.g. Turbopack/Next.js) does not emit ' +
+          'the .wasm as a fetchable asset.'
+        );
+      }
       let lastError = null;
       try {
         const resp = await fetch(wasmUrl);
@@ -4226,7 +4270,7 @@ class LayersControl extends Control {
 }
 
 // Export classes
-export { Map, TileLayer, PointLayer, LineLayer, PolygonLayer, GeoJSONLayer, Popup, Marker, Icon, DivIcon, Tooltip, Control, ZoomControl, AttributionControl, ScaleControl, LayersControl, Circle, CircleMarker, Rectangle, LayerGroup, FeatureGroup, ImageOverlay, VideoOverlay, SVGOverlay, WMSTileLayer, GridLayer, Handler, Util };
+export { configureRustyleaf, Map, TileLayer, PointLayer, LineLayer, PolygonLayer, GeoJSONLayer, Popup, Marker, Icon, DivIcon, Tooltip, Control, ZoomControl, AttributionControl, ScaleControl, LayersControl, Circle, CircleMarker, Rectangle, LayerGroup, FeatureGroup, ImageOverlay, VideoOverlay, SVGOverlay, WMSTileLayer, GridLayer, Handler, Util };
 
 // Default export for compatibility
-export default { Map, TileLayer, PointLayer, LineLayer, PolygonLayer, GeoJSONLayer, Popup, Marker, Icon, DivIcon, Tooltip, Control, ZoomControl, AttributionControl, ScaleControl, LayersControl, Circle, CircleMarker, Rectangle, LayerGroup, FeatureGroup, ImageOverlay, VideoOverlay, SVGOverlay, WMSTileLayer, GridLayer, Handler, Util };
+export default { configureRustyleaf, Map, TileLayer, PointLayer, LineLayer, PolygonLayer, GeoJSONLayer, Popup, Marker, Icon, DivIcon, Tooltip, Control, ZoomControl, AttributionControl, ScaleControl, LayersControl, Circle, CircleMarker, Rectangle, LayerGroup, FeatureGroup, ImageOverlay, VideoOverlay, SVGOverlay, WMSTileLayer, GridLayer, Handler, Util };
