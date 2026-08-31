@@ -16,31 +16,36 @@ marker.addTo(map)
 
 ## Icons
 
+> ⚠️ **Bitmap icons (`iconUrl` etc.) are not rendered yet.** A plain `Icon`
+> creates the standard round GPU sprite — `iconUrl`, `iconRetinaUrl`,
+> `iconSize`, `iconAnchor`, `popupAnchor`, and `shadowUrl` are accepted but
+> **do not affect rendering**. Only `DivIcon` currently renders custom icon
+> content (as a DOM overlay). Bitmap-icon rendering is on the roadmap.
+
 ```js
-import { Marker, Icon } from 'rustyleaf'
+import { Marker, DivIcon } from 'rustyleaf'
 
 const marker = new Marker([48.8584, 2.2945], {
-  icon: new Icon({
-    iconUrl: '/pin.png',
-    iconSize: [24, 36],
-    iconAnchor: [12, 36],
-    popupAnchor: [0, -32],
+  icon: new DivIcon({
+    html: '<div style="font-size:20px">📍</div>',
+    className: 'my-div-icon',
+    iconSize: [24, 24],
+    iconAnchor: [12, 12],
   }),
   draggable: true,
   title: 'Eiffel Tower',
 }).addTo(map)
 ```
 
-`IconOptions`:
+`Icon` accepts `iconUrl`/`iconSize`/`iconAnchor`/`popupAnchor`/`className`
+for Leaflet API compatibility, but they are **no-ops on the GPU sprite** until
+bitmap-icon rendering ships. `DivIcon` options that do work:
 
 | Option | Type | Description |
 | --- | --- | --- |
-| `iconUrl` | `string` | Image URL (required) |
-| `iconRetinaUrl` | `string?` | 2× image for retina displays |
+| `html` | `string \| HTMLElement` | Content rendered inside the DOM overlay |
 | `iconSize` | `[number, number]?` | `[w, h]` in px |
 | `iconAnchor` | `[number, number]?` | Anchor point relative to top-left |
-| `popupAnchor` | `[number, number]?` | Where popups open |
-| `shadowUrl` / `shadowSize` / `shadowAnchor` | `string?` / `[number,number]?` | Drop-shadow image |
 | `className` | `string?` | CSS class on the icon element |
 
 ## `DivIcon` (HTML markers)

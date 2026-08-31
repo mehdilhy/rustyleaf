@@ -99,10 +99,11 @@ map.on('click', (e) => {
 ## 5. Add a marker, popup, and control
 
 ```js
-import { Marker, Icon, Popup, ZoomControl } from 'rustyleaf'
+import { Marker, Popup, ZoomControl } from 'rustyleaf'
 
+// Plain Icon creates the standard GPU sprite. Bitmap icons (iconUrl) are not
+// rendered yet — use DivIcon for custom icon content (see the markers guide).
 const marker = new Marker([48.8584, 2.2945], {
-  icon: new Icon({ iconUrl: '/pin.png', iconSize: [24, 36], iconAnchor: [12, 36] }),
   draggable: true,
 }).addTo(map)
 

@@ -69,6 +69,7 @@
   },
   "homepage": "https://github.com/mehdilhy/rustyleaf#readme",
   "devDependencies": {
+    "@swc/core": "^1.16.1",
     "@types/jest": "^29.0.0",
     "@types/node": "^20.0.0",
     "@typescript-eslint/eslint-plugin": "^6.0.0",
