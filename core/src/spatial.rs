@@ -242,7 +242,13 @@ pub fn hit_test(
     index: &RTree<SpatialFeature>,
     x: f64, y: f64,
 ) -> Option<serde_json::Value> {
-    let tolerance = 0.001; // degrees
+    // Zoom-aware tolerance: a fixed degree tolerance is sub-pixel at low zoom
+    // (world view) and city-sized at high zoom. Express it in screen pixels
+    // instead — a ~6px hit radius feels right at every zoom level.
+    const HIT_RADIUS_PX: f64 = 6.0;
+    let world_pixels = viewport.tile_size as f64 * (1u64 << viewport.zoom.round() as u32) as f64;
+    let deg_per_px = 360.0 / world_pixels;
+    let tolerance = HIT_RADIUS_PX * deg_per_px;
     let (lat, lng) = screen_to_latlng(viewport, x, y);
 
     let search_bounds = AABB::from_corners(

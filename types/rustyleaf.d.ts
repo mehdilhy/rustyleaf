@@ -146,6 +146,10 @@ export interface MarkerOptions {
   zIndexOffset?: number;
   autoPan?: boolean;
   keyboard?: boolean;
+  /** Sprite color for GPU-rendered markers (plain Icon only). */
+  color?: string;
+  /** Sprite size in px for GPU-rendered markers (plain Icon only). */
+  size?: number;
 }
 
 // ==================== Icon ====================
