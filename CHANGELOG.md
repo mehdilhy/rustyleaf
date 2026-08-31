@@ -2,6 +2,42 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.0.7 - 2026-08-31
+
+### Added
+- **Streaming point append** — `PointLayer.appendPacked(Float32Array)`. The Rust
+  core projects the batch and appends it to the existing GPU vertex buffer via
+  `bufferSubData` instead of re-uploading every accumulated point. O(new points)
+  per batch instead of O(total) — a continuous stream no longer costs O(n²) in
+  re-uploads.
+- `PointLayer.reservePacked(totalPoints)` — pre-allocates the GPU buffer for a
+  known-size streaming burst, so appends never trigger a growth reallocation.
+- `reserve_points_packed` wasm method; geometric (2×) buffer growth with a Rust
+  shadow copy of uploaded vertices for amortized O(n) reallocations.
+
+### Fixed
+- `add_points_packed` set `gpu_dirty` on every append, so each streaming batch
+  re-uploaded ALL accumulated points (O(n²) over a stream) — a live feed of
+  40k+ points collapsed to ~3fps. Now streams append incrementally.
+
+## 0.0.6 - 2026-08-31
+
+### Fixed
+- **Gray squares during zoom** — tile loading dropped all tiles that weren't
+  exactly the target zoom, leaving gray gaps mid-transition. The tile loader now
+  retains adjacent zoom levels and temporarily renders cached parent/child tiles
+  until the correct tiles arrive (bounded tile bookkeeping).
+
+## 0.0.5 - 2026-08-31
+
+### Fixed
+- **Multi-GB memory spike on large datasets** — parsing a large JSON dataset into
+  one object per feature, duplicating those objects in the JS wrapper, and
+  rebuilding the whole map on every count change ballooned the JS heap. The
+  packed (`Float32Array`) path avoids per-feature allocations and the map/layer
+  is reused across count changes.
+- Deterministic WASM/GPU/popup/tooltip/event resource release on teardown.
+
 ## 0.0.4 - 2026-08-31
 
 ### Fixed

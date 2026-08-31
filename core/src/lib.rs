@@ -302,6 +302,44 @@ pub struct RustyleafMap {
     events: EventSystem,
 }
 
+fn parse_point_features(points_data: &JsValue) -> Result<Vec<PointFeature>, JsValue> {
+    let points_array = js_sys::Array::from(points_data);
+    let mut points = Vec::with_capacity(points_array.length() as usize);
+
+    for i in 0..points_array.length() {
+        let point_obj = points_array.get(i);
+        let lat = js_sys::Reflect::get(&point_obj, &JsValue::from_str("lat"))?
+            .as_f64().unwrap_or(0.0);
+        let lng = js_sys::Reflect::get(&point_obj, &JsValue::from_str("lng"))?
+            .as_f64().unwrap_or(0.0);
+        let size = js_sys::Reflect::get(&point_obj, &JsValue::from_str("size"))?
+            .as_f64().unwrap_or(5.0) as f32;
+        let color_str = js_sys::Reflect::get(&point_obj, &JsValue::from_str("color"))?
+            .as_string().unwrap_or_else(|| "#0080ff".to_string());
+        let meta_val = js_sys::Reflect::get(&point_obj, &JsValue::from_str("meta"))?;
+        let meta = if meta_val.is_undefined() || meta_val.is_null() {
+            serde_json::Value::Null
+        } else if let Some(value) = meta_val.as_string() {
+            serde_json::from_str(&value).unwrap_or(serde_json::Value::Null)
+        } else {
+            js_sys::JSON::stringify(&meta_val).ok()
+                .and_then(|value| value.as_string())
+                .and_then(|value| serde_json::from_str(&value).ok())
+                .unwrap_or(serde_json::Value::Null)
+        };
+
+        points.push(PointFeature {
+            lat,
+            lng,
+            size,
+            color: parse_color(&color_str),
+            meta,
+        });
+    }
+
+    Ok(points)
+}
+
 #[wasm_bindgen]
 impl RustyleafMap {
     #[wasm_bindgen(constructor)]
@@ -436,6 +474,18 @@ impl RustyleafMap {
     #[wasm_bindgen]
     pub fn destroy(&mut self) {
         self.cleanup_gl_resources();
+        // `destroy()` is an explicit lifecycle boundary. Release CPU-side
+        // feature data and JS callbacks immediately instead of waiting for the
+        // wasm wrapper's FinalizationRegistry callback (which may run much
+        // later under memory pressure).
+        self.tile_layer = None;
+        self.point_layers.clear();
+        self.line_layers.clear();
+        self.polygon_layers.clear();
+        self.geojson_layers.clear();
+        self.markers.clear();
+        self.spatial_index = RTree::new();
+        self.events = EventSystem::new();
     }
 
     #[wasm_bindgen]
@@ -642,7 +692,9 @@ impl RustyleafMap {
         }
 
         // Clear the canvas
-        context.clear_color(0.9, 0.9, 0.9, 1.0); // Light gray background
+        // Match the basemap's ocean color so areas outside Web Mercator's
+        // vertical world bounds do not appear as gray squares when zoomed out.
+        context.clear_color(0.6667, 0.8275, 0.8745, 1.0);
         context.clear(WebGl2RenderingContext::COLOR_BUFFER_BIT);
 
         // Set viewport
@@ -1403,46 +1455,232 @@ impl RustyleafMap {
             return Err(RustyleafError::LayerOutOfBounds { index: layer_index, len: self.point_layers.len() }.into());
         }
 
-        let points_array = js_sys::Array::from(points_data);
-        let mut points = Vec::new();
+        self.point_layers[layer_index].points = parse_point_features(points_data)?;
+        self.point_layers[layer_index].gpu_dirty.set(true);
+        self.spatial_index_dirty = true;
+        Ok(())
+    }
 
-        for i in 0..points_array.length() {
-            let point_obj = points_array.get(i);
-            let lat = js_sys::Reflect::get(&point_obj, &JsValue::from_str("lat"))?
-                .as_f64().unwrap_or(0.0);
-            let lng = js_sys::Reflect::get(&point_obj, &JsValue::from_str("lng"))?
-                .as_f64().unwrap_or(0.0);
-            let size = js_sys::Reflect::get(&point_obj, &JsValue::from_str("size"))?
-                .as_f64().unwrap_or(5.0) as f32;
-            let color_str = js_sys::Reflect::get(&point_obj, &JsValue::from_str("color"))?
-                .as_string().unwrap_or_else(|| "#0080ff".to_string());
-            let color = parse_color(&color_str);
+    /// Append object-shaped points without replacing the layer. The public JS
+    /// PointLayer uses this after mounting so it does not have to retain and
+    /// resend every previously uploaded point.
+    #[wasm_bindgen]
+    pub fn append_points(&mut self, layer_index: usize, points_data: &JsValue) -> Result<(), JsValue> {
+        self.needs_redraw = true;
+        if layer_index >= self.point_layers.len() {
+            return Err(RustyleafError::LayerOutOfBounds { index: layer_index, len: self.point_layers.len() }.into());
+        }
 
-            // meta may be a JSON string or a plain JS object
-            let meta_val = js_sys::Reflect::get(&point_obj, &JsValue::from_str("meta"))?;
-            let meta_json: serde_json::Value = if meta_val.is_undefined() || meta_val.is_null() {
-                serde_json::json!({})
-            } else if let Some(s) = meta_val.as_string() {
-                serde_json::from_str(&s).unwrap_or(serde_json::json!({}))
-            } else {
-                js_sys::JSON::stringify(&meta_val).ok()
-                    .and_then(|js| js.as_string())
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or(serde_json::json!({}))
-            };
+        let parsed_points = parse_point_features(points_data)?;
+        let layer = &mut self.point_layers[layer_index];
+        layer.points.extend(parsed_points);
 
-            let point = PointFeature {
+        layer.gpu_dirty.set(true);
+        self.spatial_index_dirty = true;
+        Ok(())
+    }
+
+    /// Append tightly packed points: [lat, lng, size, r, g, b, a] per point.
+    /// This avoids creating millions of temporary JS objects for large layers.
+    #[wasm_bindgen]
+    pub fn add_points_packed(&mut self, layer_index: usize, points_data: &[f32]) -> Result<(), JsValue> {
+        self.needs_redraw = true;
+        if layer_index >= self.point_layers.len() {
+            return Err(RustyleafError::LayerOutOfBounds { index: layer_index, len: self.point_layers.len() }.into());
+        }
+        if !points_data.len().is_multiple_of(7) {
+            return Err(JsValue::from_str("Packed point data length must be divisible by 7"));
+        }
+
+        let layer = &mut self.point_layers[layer_index];
+        layer.points.reserve(points_data.len() / 7);
+        for point in points_data.chunks_exact(7) {
+            layer.points.push(PointFeature {
+                lat: point[0] as f64,
+                lng: point[1] as f64,
+                size: point[2],
+                color: [point[3], point[4], point[5], point[6]],
+                meta: serde_json::Value::Null,
+            });
+        }
+
+        layer.gpu_dirty.set(true);
+        self.spatial_index_dirty = true;
+        Ok(())
+    }
+
+    /// Pre-allocate the layer's GPU buffer to hold `total_points` points (each
+    /// 7 floats). Call this once before a streaming `append_points_packed`
+    /// burst whose final size is known, so appends never trigger a growth
+    /// reallocation (which copies all accumulated vertices).
+    #[wasm_bindgen]
+    pub fn reserve_points_packed(&mut self, layer_index: usize, total_points: usize) -> Result<(), JsValue> {
+        if layer_index >= self.point_layers.len() {
+            return Err(RustyleafError::LayerOutOfBounds { index: layer_index, len: self.point_layers.len() }.into());
+        }
+        let gl_state = match self.gl_state.as_ref() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        let layer = &self.point_layers[layer_index];
+        let mut b = layer.vertex_buffer.borrow_mut();
+        if b.is_none() {
+            let buf = gl_state
+                .context
+                .create_buffer()
+                .ok_or_else(|| RustyleafError::BufferCreation("Failed to create point layer buffer".into()))?;
+            *b = Some(OwnedBuffer::new(&gl_state.context, buf));
+        }
+        drop(b);
+        let borrow = layer.vertex_buffer.borrow();
+        let buffer = match borrow.as_ref() {
+            Some(b) => b.inner(),
+            None => return Ok(()),
+        };
+        let gl = &gl_state.context;
+        gl.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(buffer));
+        let bytes = total_points * 7 * 4;
+        // Zero-initialized capacity so bufferSubData can fill it in later.
+        gl.buffer_data_with_i32(WebGl2RenderingContext::ARRAY_BUFFER, bytes as i32, WebGl2RenderingContext::DYNAMIC_DRAW);
+        Ok(())
+    }
+
+    /// Append tightly packed points WITHOUT rebuilding the GPU buffer. The new
+    /// points are projected and appended to the end of the existing vertex
+    /// buffer via `bufferSubData`, so a continuous stream of batches costs
+    /// O(new points) per batch instead of O(total) per batch (a full re-upload
+    /// of every accumulated point, which is O(n²) over a stream).
+    ///
+    /// Note: appended points are NOT folded into the pre-shuffled overdraw
+    /// order — under extreme overdraw (zoomed way out) the fair-sample prefix
+    /// favors older points. That bias is acceptable for streaming workloads.
+    #[wasm_bindgen]
+    pub fn append_points_packed(&mut self, layer_index: usize, points_data: &[f32]) -> Result<(), JsValue> {
+        self.needs_redraw = true;
+        if layer_index >= self.point_layers.len() {
+            return Err(RustyleafError::LayerOutOfBounds { index: layer_index, len: self.point_layers.len() }.into());
+        }
+        if points_data.is_empty() {
+            return Ok(());
+        }
+        if !points_data.len().is_multiple_of(7) {
+            return Err(JsValue::from_str("Packed point data length must be divisible by 7"));
+        }
+
+        let new_count = points_data.len() / 7;
+        let viewport = self.viewport();
+        let layer = &mut self.point_layers[layer_index];
+        layer.points.reserve(new_count);
+
+        // Project the new batch into normalized mercator coordinates.
+        let mut vertex_data: Vec<f32> = Vec::with_capacity(points_data.len());
+        let mut min = layer.norm_min.get();
+        let mut max = layer.norm_max.get();
+        let mut area_sum = 0.0f64;
+        for point in points_data.chunks_exact(7) {
+            let lat = point[0] as f64;
+            let lng = point[1] as f64;
+            let size = point[2];
+            let (nx, ny) = viewport.lat_lng_to_normalized(lat, lng);
+            let (nx, ny) = (nx as f32, ny as f32);
+            min.0 = min.0.min(nx);
+            min.1 = min.1.min(ny);
+            max.0 = max.0.max(nx);
+            max.1 = max.1.max(ny);
+            area_sum += (size as f64) * (size as f64);
+            vertex_data.extend_from_slice(&[
+                nx, ny,
+                size,
+                point[3], point[4], point[5], point[6],
+            ]);
+            layer.points.push(PointFeature {
                 lat,
                 lng,
                 size,
-                color,
-                meta: meta_json,
+                color: [point[3], point[4], point[5], point[6]],
+                meta: serde_json::Value::Null,
+            });
+        }
+        layer.norm_min.set(min);
+        layer.norm_max.set(max);
+        let prev_total = layer.vertex_count.get();
+        let new_total = prev_total + new_count;
+        let prev_area = layer.avg_point_area.get() as f64 * prev_total as f64;
+        layer.avg_point_area.set(((prev_area + area_sum) / new_total.max(1) as f64) as f32);
+
+        let gl_state = match self.gl_state.as_ref() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        let gl = &gl_state.context;
+        let stride = 7 * 4;
+        // Append to the shadow copy; if the GPU buffer is too small to hold the
+        // new total, re-upload the whole shadow (amortized growth, like Vec).
+        let mut shadow = layer.gpu_shadow.borrow_mut();
+        shadow.extend_from_slice(&vertex_data);
+        let shadow_len = shadow.len();
+        {
+            let mut b = layer.vertex_buffer.borrow_mut();
+            if b.is_none() {
+                let buf = gl
+                    .create_buffer()
+                    .ok_or_else(|| RustyleafError::BufferCreation("Failed to create point layer buffer".into()))?;
+                *b = Some(OwnedBuffer::new(gl, buf));
+            }
+            drop(b);
+            let borrow = layer.vertex_buffer.borrow();
+            let buffer = match borrow.as_ref() {
+                Some(b) => b.inner(),
+                None => return Ok(()),
             };
-            points.push(point);
+            gl.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(buffer));
+            let existing_size = gl.get_buffer_parameter(WebGl2RenderingContext::ARRAY_BUFFER, WebGl2RenderingContext::BUFFER_SIZE).as_f64().unwrap_or(0.0) as usize;
+            let needed = shadow_len * 4;
+            if existing_size < needed {
+                // Grow GEOMETRICALLY (2× the needed size) so a streaming batch
+                // only reallocates O(log n) times total, never per batch.
+                // bufferSubData cannot resize, so a grow = full re-upload of
+                // the shadow padded to the new capacity; geometric growth keeps
+                // that amortized O(n) and lets later appends use bufferSubData.
+                let new_floats = (needed / 4) * 2;
+                let mut grown: Vec<f32> = Vec::with_capacity(new_floats);
+                grown.extend_from_slice(&shadow);
+                grown.resize(new_floats, 0.0);
+                let vertices = Float32Array::from(&grown[..]);
+                gl.buffer_data_with_array_buffer_view(
+                    WebGl2RenderingContext::ARRAY_BUFFER,
+                    &vertices,
+                    WebGl2RenderingContext::DYNAMIC_DRAW,
+                );
+            } else if !vertex_data.is_empty() {
+                let vertices = Float32Array::from(&vertex_data[..]);
+                gl.buffer_sub_data_with_i32_and_array_buffer_view(
+                    WebGl2RenderingContext::ARRAY_BUFFER,
+                    (prev_total * stride) as i32,
+                    &vertices,
+                );
+            }
+        }
+        layer.vertex_count.set(new_total);
+        self.spatial_index_dirty = true;
+        Ok(())
+    }
+
+    #[wasm_bindgen]
+    pub fn clear_points(&mut self, layer_index: usize) -> Result<(), JsValue> {
+        self.needs_redraw = true;
+        if layer_index >= self.point_layers.len() {
+            return Err(RustyleafError::LayerOutOfBounds { index: layer_index, len: self.point_layers.len() }.into());
         }
 
-        self.point_layers[layer_index].points = points;
-        self.point_layers[layer_index].gpu_dirty.set(true);
+        let layer = &mut self.point_layers[layer_index];
+        layer.points.clear();
+        layer.points.shrink_to_fit();
+        layer.vertex_buffer.borrow_mut().take();
+        layer.gpu_shadow.borrow_mut().clear();
+        layer.vertex_count.set(0);
+        layer.gpu_dirty.set(true);
         self.spatial_index_dirty = true;
         Ok(())
     }

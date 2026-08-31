@@ -1,6 +1,6 @@
 {
   "name": "rustyleaf",
-  "version": "0.0.4",
+  "version": "0.0.7",
   "description": "A high-performance Rust-based map visualization engine powered by WebAssembly and WebGL2",
   "main": "dist/rustyleaf.bundle.js",
   "exports": {

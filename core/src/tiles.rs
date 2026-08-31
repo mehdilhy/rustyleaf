@@ -80,7 +80,27 @@ impl TileLoader {
     pub fn cleanup_old_tiles(&mut self, viewport: &Viewport) {
         let current_zoom = viewport.zoom.round() as u32;
         let visible_keys = visible_tile_keys(viewport, current_zoom);
-        let max_cache_size = (visible_keys.len() * 3).max(20);
+        // Keep one adjacent zoom level so render_tiles can use it as a visual
+        // fallback while the current tiles are in flight.
+        let keep_key = |key: &str| {
+            key.split('/').next()
+                .and_then(|zoom| zoom.parse::<u32>().ok())
+                .is_some_and(|zoom| zoom.abs_diff(current_zoom) <= 1)
+        };
+        let max_cache_size = (visible_keys.len() * 6).max(24);
+
+        // Cancel stale in-flight images before dropping their closures.
+        let stale_loads: Vec<String> = self.closures.keys()
+            .filter(|key| !keep_key(key))
+            .cloned()
+            .collect();
+        for key in stale_loads {
+            if let Some((image, _closure)) = self.closures.remove(&key) {
+                image.set_onload(None);
+                image.set_onerror(None);
+                image.set_src("");
+            }
+        }
 
         let mut textures = self.textures.borrow_mut();
 
@@ -101,20 +121,9 @@ impl TileLoader {
         }
 
         let keys_to_remove: Vec<String> = textures
-            .iter()
-            .filter(|(key, _)| {
-                let parts: Vec<&str> = key.split('/').collect();
-                if parts.len() == 3 {
-                    if let Ok(zoom) = parts[0].parse::<u32>() {
-                        zoom != current_zoom
-                    } else {
-                        true
-                    }
-                } else {
-                    true
-                }
-            })
-            .map(|(key, _)| key.clone())
+            .keys()
+            .filter(|key| !keep_key(key))
+            .cloned()
             .collect();
 
         // OwnedTexture::Drop deletes the GL texture when removed from the map.
@@ -135,20 +144,9 @@ impl TileLoader {
             }
         }
 
-        if self.requested.len() > 50 {
-            self.requested.retain(|key| {
-                let parts: Vec<&str> = key.split('/').collect();
-                if parts.len() == 3 {
-                    if let Ok(zoom) = parts[0].parse::<u32>() {
-                        zoom == current_zoom
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            });
-        }
+        self.requested.retain(|key| keep_key(key));
+        self.tiles.retain(|key, _| keep_key(key));
+        self.failed.borrow_mut().retain(|key| keep_key(key));
     }
 
     pub fn load_visible_tiles(
