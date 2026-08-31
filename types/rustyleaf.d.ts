@@ -541,7 +541,11 @@ export declare const Util: {
 
 export interface RustyleafConfig {
   /** Absolute URL to rustyleaf_core_bg.wasm. Required when the bundler does
-   * not emit the .wasm as a fetchable asset (e.g. Turbopack/Next.js). */
+   * not emit the .wasm as a fetchable asset (e.g. Turbopack/Next.js).
+   *
+   * Note: the wasm fetch starts during module evaluation, so prefer setting
+   * `globalThis.__rustyleafWasmUrl` BEFORE importing rustyleaf. This function
+   * is a fallback for callers that can reach the module before use. */
   wasmUrl?: string;
 }
 
