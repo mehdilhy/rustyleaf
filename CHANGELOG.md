@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.0.4 - 2026-08-31
+
+### Fixed
+- `configureRustyleaf({ wasmUrl })` ran at import time, but the wasm fetch
+  starts during module evaluation — so it was too late for consumers. Added a
+  **pre-import global hook**: set `globalThis.__rustyleafWasmUrl` BEFORE
+  importing rustyleaf (the reliable path for Turbopack/Next.js, which doesn't
+  emit the `.wasm` as a fetchable asset). `configureRustyleaf` remains as a
+  fallback for callers that reach the module before first use.
+
 ## 0.0.3 - 2026-08-31
 
 ### Added

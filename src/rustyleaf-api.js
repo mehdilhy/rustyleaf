@@ -22,11 +22,14 @@ function __rustyleafWasmAlreadyInitialized() {
 // Ensure WASM is initialized before any usage
 let __rustyleaf_wasm_ready_promise;
 
-// Optional explicit location of the wasm binary. When this is set, it wins
-// over any bundler-derived URL. Useful when the default resolution (relative
-// to import.meta.url) fails — e.g. Turbopack/Next.js treats .wasm as a module
-// instead of emitting a fetchable asset, so consumers can copy the wasm into
-// /public and point this at it.
+// Optional explicit location of the wasm binary. When set, it wins over any
+// bundler-derived URL. Two ways to set it:
+//  1. configureRustyleaf({ wasmUrl }) — but this runs at import time, so the
+//     wasm fetch (which starts during module evaluation) has already begun by
+//     the time a caller can invoke it.
+//  2. globalThis.__rustyleafWasmUrl BEFORE importing rustyleaf — the reliable
+//     pre-import hook for bundlers that don't emit the .wasm as a fetchable
+//     asset (e.g. Turbopack/Next.js). The resolver reads it as a fallback.
 let __rustyleaf_wasm_url = null;
 
 // Configures where rustyleaf fetches its WebAssembly core. Pass an absolute
@@ -45,6 +48,11 @@ function configureRustyleaf({ wasmUrl } = {}) {
 // helpful error instead of letting `new URL()` throw a confusing one).
 function __rustyleafResolveWasmUrl() {
   if (__rustyleaf_wasm_url) return __rustyleaf_wasm_url;
+  // Pre-import global hook: lets consumers set the URL before the module
+  // evaluates (when the top-level wasm fetch would otherwise start too early).
+  if (typeof globalThis !== 'undefined' && globalThis.__rustyleafWasmUrl) {
+    return globalThis.__rustyleafWasmUrl;
+  }
   try {
     // The bundler rewrites `new URL(..., import.meta.url)` into an asset URL
     // (webpack asset/resource, Vite) or leaves it as-is for static ESM.
@@ -70,10 +78,11 @@ async function __ensureRustyleafWasmReady() {
       const wasmUrl = __rustyleafResolveWasmUrl();
       if (!wasmUrl) {
         throw new Error(
-          'Rustyleaf: could not resolve the WebAssembly core URL. Set it explicitly ' +
-          'with configureRustyleaf({ wasmUrl: "/path/to/rustyleaf_core_bg.wasm" }) — ' +
-          'this is required when your bundler (e.g. Turbopack/Next.js) does not emit ' +
-          'the .wasm as a fetchable asset.'
+          'Rustyleaf: could not resolve the WebAssembly core URL. Set it before ' +
+          'importing rustyleaf with globalThis.__rustyleafWasmUrl = "/path/to/' +
+          'rustyleaf_core_bg.wasm" (or call configureRustyleaf({ wasmUrl }) — ' +
+          'this is required when your bundler (e.g. Turbopack/Next.js) does not ' +
+          'emit the .wasm as a fetchable asset.'
         );
       }
       let lastError = null;
