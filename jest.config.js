@@ -1,16 +1,16 @@
 module.exports = {
   testEnvironment: 'jsdom',
-  roots: ['<rootDir>/tests'],
+  roots: ['<rootDir>/tests', '<rootDir>/tests-real'],
   testMatch: [
     '**/?(*.)+(spec|test).ts',
     '**/?(*.)+(spec|test).js'
   ],
   transform: {
-    '^.+\\.tsx?$': 'ts-jest',
-    'tests[/\\\\].*\\.js$': 'ts-jest',
+    '^.+\\.tsx?$': ['ts-jest', { isolatedModules: true }],
+    '^.+\\.m?js$': require.resolve('./jest-transform-cjs-tla.cjs')
   },
   moduleNameMapper: {
-    '../src/rustyleaf-api': '<rootDir>/tests/__mocks__/rustyleaf-api-mock.cjs',
+    // Only the WASM glue is mocked; src/rustyleaf-api.js is exercised for real.
     'rustyleaf_core_bg\\.js$': '<rootDir>/tests/__mocks__/wasmMock.js',
     '^@/(.*)$': '<rootDir>/src/$1',
     '\\.(css|less|sass|scss)$': '<rootDir>/tests/__mocks__/styleMock.js',

@@ -30,7 +30,18 @@ const getMapState = (ptr) => {
 export const resetMockState = () => {
   mapStates.clear();
   nextPtr = 1;
+  eventCallbacks.clear();
 };
+
+// Per-map registered event callbacks (ptr -> {event: [callbacks]}), so tests
+// can drive wasm-side events: wasmMock.fire(ptr, 'move', {...}).
+const eventCallbacks = new Map();
+
+export const fire = (ptr, event, payload) => {
+  const cbs = (eventCallbacks.get(ptr) || {})[event] || [];
+  for (const cb of [...cbs]) cb(payload);
+};
+
 
 export const rustyleafmap_set_view = jest.fn((ptr, lat, lng, zoom) => {
   const state = getMapState(ptr);
@@ -46,14 +57,16 @@ export const rustyleafmap_get_zoom = jest.fn((ptr) => {
   const state = getMapState(ptr);
   return state.zoom;
 });
-export const rustyleafmap_pan = jest.fn();
+export const rustyleafmap_pan = jest.fn((ptr) => fire(ptr, 'move', { type: 'move' }));
 export const rustyleafmap_zoom_in = jest.fn((ptr) => {
   const state = getMapState(ptr);
   state.zoom += 1;
+  fire(ptr, 'zoom', { type: 'zoom' });
 });
 export const rustyleafmap_zoom_out = jest.fn((ptr) => {
   const state = getMapState(ptr);
   state.zoom -= 1;
+  fire(ptr, 'zoom', { type: 'zoom' });
 });
 export const rustyleafmap_set_min_zoom = jest.fn();
 export const rustyleafmap_set_max_zoom = jest.fn();
@@ -209,15 +222,24 @@ export class RustyleafMap {
     return rustyleafmap_screen_xy(this.ptr, lat, lng);
   }
 
+  _registerEvent(event, callback) {
+    const per = eventCallbacks.get(this.ptr) || {};
+    (per[event] = per[event] || []).push(callback);
+    eventCallbacks.set(this.ptr, per);
+  }
+
   on_move(callback) {
+    this._registerEvent('move', callback);
     rustyleafmap_on_move(this.ptr, callback);
   }
 
   on_zoom(callback) {
+    this._registerEvent('zoom', callback);
     rustyleafmap_on_zoom(this.ptr, callback);
   }
 
   on_click(callback) {
+    this._registerEvent('click', callback);
     rustyleafmap_on_click(this.ptr, callback);
   }
 
@@ -408,6 +430,10 @@ export class TileLayerApi {
     return tilelayerapi_add_to(this.ptr, map);
   }
 }
+
+// Stand-in for the real TileLayerApi's wasm tile-loader plumbing: the JS side
+// probes configure_tile_layer before calling it, so expose a jest.fn().
+TileLayerApi.prototype.configure_tile_layer = jest.fn();
 
 export class PointLayerApi {
   constructor() {

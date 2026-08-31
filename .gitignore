@@ -50,3 +50,6 @@ e2e/artifacts/
 e2e/report/
 e2e/results.json
 e2e/node_modules/
+
+# Jest scratch output
+test-results/

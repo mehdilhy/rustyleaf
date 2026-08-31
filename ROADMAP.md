@@ -36,8 +36,6 @@ benchmarks.
 - [ ] Thick lines via triangle strips (`width` finally honored)
 - [ ] Keyboard events wired from the Rust core (`keydown`/`keyup` currently
       registered but never triggered)
-- [x] Touch/mobile gestures (pan, pinch zoom, double-tap zoom, long-press
-      context menu)
 - [ ] Marker icons / image sprites for points
 
 ## Later / help wanted

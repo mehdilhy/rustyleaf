@@ -175,13 +175,16 @@ development — expect API churn and missing features.
   consumer install
 
 ### Known limitations
-- WebGL2 required; no Canvas2D/WebGL1 rendering fallback
+- WebGL2 required; `checkWebGLSupport` reports a WebGL1 "limited" level, but the
+  renderer hard-requires WebGL2 and there is no Canvas2D/WebGL1 rendering fallback
 - Spherical Mercator only — no custom CRS
-- Line width honored for `LineLayer`; GeoJSON-styled lines still 1px
-- Streaming GeoJSON parser is regex-assisted and fragile on exotic input
+- Line width honored for `LineLayer`; GeoJSON-styled lines honor width only via
+  the GPU-cached path (non-cached fallback still 1px)
+- Streaming GeoJSON parser is a quote-aware brace scanner + serde_json (not a
+  full tokenizer); exotic input can still misbehave
 - Normalized-coordinate precision degrades at very high zoom (z≈18+)
 
-## Unreleased
+## 0.0.2 - 2026-08-31
 
 ### Added
 - Touch gestures: double-tap zoom (+1 level at the tap point) and long-press
@@ -189,10 +192,32 @@ development — expect API churn and missing features.
 - GPU buffer freeing: `free_point_layer_gpu` / `free_line_layer_gpu` /
   `free_polygon_layer_gpu` / `free_geojson_layer_gpu` wasm methods, wired into
   every layer's `remove()` — data is retained in JS and re-uploads on `addTo()`
+- VitePress docs site (`docs/`) with API, guide, FAQ, examples, performance,
+  changelog, and development pages
+
+### Changed
+- **Unit tests now run against the real `src/rustyleaf-api.js`, not a hand-written
+  mock.** The `rustyleaf-api-mock.cjs` layer is deleted; the default jest config
+  exercises the actual source (only the WASM glue is mocked), folding the
+  `tests-real/` coverage suite into `npm test`. `npm test` is now 798 tests
+  against real source (was 405 against a mock). Removed `jest.real.config.js`
+  and the `rustyleaf_core_bg`-only mock split.
+- Docs accuracy fixes: README/CHANGELOG no longer claim GeoJSON lines are always
+  1px (width is honored via the GPU-cached path), the streaming parser is no
+  longer described as "regex-assisted" (it is a quote-aware brace scanner +
+  serde_json with NDJSON tail support), and the WebGL1 "detection exists"
+  phrasing is clarified — the renderer hard-requires WebGL2.
+- Dropped the dead `regex` dependency from `core/Cargo.toml` (declared, never
+  used; the streaming parser is regex-free).
 
 ### Updated
 - README/FAQ/guide no longer claim line/polygon layers rebuild vertex data on
   the CPU each frame (they are GPU-cached as of this release cycle)
+- `GAP_ANALYSIS.md` reconciled (headers/narratives that said "entirely absent"
+  while tables showed ✅ done); ROADMAP duplicate touch-gestures item removed
+- Various robustness fixes: `TileLayer.addTo(null)` is a silent no-op,
+  `VideoOverlay` is muted by default, `Marker.setLatLng` rejects non-finite
+  values
 
 ## Pre-history - 2025-09-11
 - Initial experiment: WebGL2 tile and point rendering, basic WASM bindings

@@ -75,11 +75,11 @@ describe('TileLayer', () => {
     test('should handle null map', () => {
       const urlTemplate = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
       const tileLayer = new TileLayer(urlTemplate);
-      
-      // The current implementation will throw an error when trying to access wasmMap on null
+
+      // Guarded: addTo(null) is a silent no-op (same as a wasmMap-less map)
       expect(() => {
         tileLayer.addTo(null as any);
-      }).toThrow('Cannot read properties of null (reading \'wasmMap\')');
+      }).not.toThrow();
     });
   });
 

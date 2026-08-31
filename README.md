@@ -15,7 +15,7 @@
   <img src="https://img.shields.io/badge/status-pre--alpha-orange" alt="pre-alpha">
 </p>
 
-> ⚠️ **Pre-alpha (v0.0.1).** The API will change without notice and this is not production-ready. It is, however, honestly documented: everything listed below works today and is covered by unit and end-to-end tests.
+> ⚠️ **Pre-alpha (v0.0.2).** The API will change without notice and this is not production-ready. It is, however, honestly documented: everything listed below works today and is covered by unit and end-to-end tests.
 
 ---
 
@@ -66,17 +66,22 @@ Leaflet-style) instead of showing empty gray past ±180°.
 - TypeScript definitions matching the actual runtime API
 - RAII-managed WebGL resources (textures, buffers, VAOs, programs are freed deterministically; verified by GL leak-detection e2e tests)
 
-## Known limitations (v0.0.1)
+## Known limitations (v0.0.2)
 
-- **WebGL2 required.** No Canvas2D or WebGL1 rendering fallback (detection exists; rendering does not).
+- **WebGL2 required.** No Canvas2D or WebGL1 rendering fallback (`checkWebGLSupport`
+  reports a WebGL1 "limited" level, but the renderer hard-requires a WebGL2
+  context and refuses to start without one).
 - **Spherical Mercator only** — no custom CRS (EPSG:4326/3395, `SimpleCRS`).
-- Line width applies to `LineLayer`; GeoJSON-styled lines still render 1px.
+- Line width applies to `LineLayer`; GeoJSON-styled lines honor width only when
+  their GPU cache is built (the fallback non-cached path still draws 1px).
 - No vector tiles.
 - Polygon *interiors* are hit-tested via point-in-polygon on the outer ring (holes aren't subtracted yet). `PointLayer`/`LineLayer`/`PolygonLayer` (non-GeoJSON) hit-test normally.
 - Line/polygon vertex data is cached in GPU buffers per layer, but heavy combined scenes still cost more than points alone.
 - Calling map methods synchronously inside a raw wasm event callback (`move`, `zoom`, `click`, ...) throws a re-entrancy error — defer with `queueMicrotask` (the built-in layers already do).
 - Layer `remove()` releases the layer's GPU buffers; the data stays in JS and `addTo` re-uploads it.
-- The streaming GeoJSON parser is regex-assisted and can misbehave on exotic input.
+- The streaming GeoJSON parser is a quote-aware brace scanner + serde_json
+  (incremental, NDJSON tail support) — not a full tokenizing parser, so
+  pathological input can still misbehave.
 - API is unstable until 0.1.0.
 
 ## Browser support
