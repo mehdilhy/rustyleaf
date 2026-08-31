@@ -10,9 +10,27 @@
 </p>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/rustyleaf"><img src="https://img.shields.io/npm/v/rustyleaf" alt="npm"></a>
+  <a href="https://www.npmjs.com/package/rustyleaf"><img src="https://img.shields.io/npm/v/rustyleaf" alt="npm version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
   <img src="https://img.shields.io/badge/status-pre--alpha-orange" alt="pre-alpha">
+  <img src="https://img.shields.io/badge/webgl2-required-important" alt="WebGL2 required">
+</p>
+
+<p align="center">
+  <a href="https://github.com/mehdilhy/rustyleaf/actions"><img src="https://img.shields.io/github/actions/workflow/status/mehdilhy/rustyleaf/ci.yml?branch=main&label=CI" alt="CI"></a>
+  <img src="https://img.shields.io/badge/tests-798%20passing-brightgreen" alt="tests passing">
+  <img src="https://img.shields.io/badge/coverage-100%25%20lines-success" alt="coverage: 100% lines">
+  <img src="https://img.shields.io/badge/coverage-95.3%25%20branches-brightgreen" alt="coverage: 95.3% branches">
+  <img src="https://img.shields.io/badge/clippy-D%20warnings%20clean-success" alt="clippy clean">
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Rust-✓-orange?logo=rust&logoColor=white" alt="Rust">
+  <img src="https://img.shields.io/badge/WebAssembly-✓-654FF0?logo=webassembly&logoColor=white" alt="WebAssembly">
+  <img src="https://img.shields.io/badge/WebGL2-✓-990000?logo=webgl&logoColor=white" alt="WebGL2">
+  <img src="https://img.shields.io/badge/Chrome%20%7C%20Edge%2090%2B-tested-2ea44f" alt="Chrome/Edge 90+ tested">
+  <img src="https://img.shields.io/badge/TypeScript-types%20included-3178C6?logo=typescript&logoColor=white" alt="TypeScript types included">
+  <img src="https://img.shields.io/badge/wasm%20core-1.5MB-8A2BE2" alt="wasm core 1.5MB">
 </p>
 
 > ⚠️ **Pre-alpha (v0.0.2).** The API will change without notice and this is not production-ready. It is, however, honestly documented: everything listed below works today and is covered by unit and end-to-end tests.
