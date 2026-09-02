@@ -1491,13 +1491,21 @@ class LineLayer {
       width: line.width || 2,
       meta: line.meta || null
     }));
-    
-    for (const l of linesData) this.lines.push(l);
+
+    if (this.map && this._layerIndex !== undefined) {
+      // Mounted: forward straight to the wasm layer (append semantics).
+      this.map.wasmMap.append_lines(this._layerIndex, linesData);
+    } else {
+      for (const l of linesData) this.lines.push(l);
+    }
     return this;
   }
-  
+
   clear() {
     this.lines = [];
+    if (this.map && this._layerIndex !== undefined) {
+      this.map.wasmMap.clear_lines(this._layerIndex);
+    }
     return this;
   }
   
@@ -2703,7 +2711,6 @@ class GeoJSONLayer {
       if (this.map && this.layerIndex !== undefined) {
         console.log('GeoJSONLayer: Data loaded, triggering immediate parsing');
         this.map.wasmMap.load_geojson(this.layerIndex, jsonText);
-        this.updateStyle();
         this._pendingGeoJSONText = null;
       } else {
         console.log('GeoJSONLayer: Data stored but layer not yet on map');
@@ -2714,7 +2721,6 @@ class GeoJSONLayer {
             if (this.map && this.layerIndex !== undefined && this._pendingGeoJSONText) {
               try {
                 this.map.wasmMap.load_geojson(this.layerIndex, this._pendingGeoJSONText);
-                this.updateStyle();
               } finally {
                 this._pendingGeoJSONText = null;
                 clearInterval(this._pendingTimer);
@@ -2939,7 +2945,8 @@ class GeoJSONLayer {
 
   // Update style on the map
   updateStyle() {
-    if (this.map && this.layerIndex !== undefined) {
+    if (this.map && this.layerIndex !== undefined &&
+        typeof this.map.wasmMap.set_geojson_style === 'function') {
       const styleData = {
         pointColor: this.options.pointColor,
         pointSize: this.options.pointSize,
@@ -2967,11 +2974,15 @@ class GeoJSONLayer {
     }
     map._geojsonLayerCount += 1;
 
+    // Apply style while the layer is empty. `set_geojson_style` rebuilds the
+    // render cache, so doing this after load_geojson tessellates large polygon
+    // datasets twice and blocks the browser's main thread unnecessarily.
+    this.updateStyle();
+
     if (this._pendingGeoJSONText) {
       console.log('GeoJSONLayer: Applying deferred data after adding to map');
       try {
         map.wasmMap.load_geojson(this.layerIndex, this._pendingGeoJSONText);
-        this.updateStyle();
       } finally {
         this._pendingGeoJSONText = null;
         if (this._pendingTimer) {
@@ -2995,7 +3006,6 @@ class GeoJSONLayer {
         // Unparseable string — pass through and let the wasm parser report it
         map.wasmMap.load_geojson(this.layerIndex, this.geojson);
       }
-      this.updateStyle();
     }
 
     this._mountFeatureExtras(map);

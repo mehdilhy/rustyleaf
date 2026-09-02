@@ -394,6 +394,14 @@ export class RustyleafMap {
     rustyleafmap_add_lines(this.ptr, layerIndex, lines);
   }
 
+  append_lines(layerIndex, lines) {
+    rustyleafmap_add_lines(this.ptr, layerIndex, lines);
+  }
+
+  clear_lines(layerIndex) {
+    rustyleafmap_add_lines(this.ptr, layerIndex, layerIndex);
+  }
+
   add_polygons(layerIndex, polygons) {
     rustyleafmap_add_polygons(this.ptr, layerIndex, polygons);
   }

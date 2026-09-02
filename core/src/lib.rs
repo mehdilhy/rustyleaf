@@ -6,7 +6,7 @@ use web_sys::{
     WebGlUniformLocation, WebGlVertexArrayObject
 };
 
-// RAII WebGL resource wrappers — Drop calls the corresponding delete_*() on the GL context
+// RAII WebGL resource wrappers â€” Drop calls the corresponding delete_*() on the GL context
 // Uses Rc-backed inner so cloning (cheap ref-count increment) doesn't double-delete.
 
 struct OwnedTextureInner {
@@ -135,7 +135,7 @@ pub(crate) struct WebGlState {
     pub(crate) point_vao: OwnedVAO,
     pub(crate) line_vao: OwnedVAO,
     pub(crate) line_gpu_vao: OwnedVAO,
-    // Held for RAII lifetime only — its attribute pointers live inside
+    // Held for RAII lifetime only â€” its attribute pointers live inside
     // line_gpu_vao after initialize_webgl configures them.
     #[allow(dead_code)]
     pub(crate) line_gpu_corner_buffer: OwnedBuffer,
@@ -451,12 +451,12 @@ impl RustyleafMap {
     }
 
     fn cleanup_gl_resources(&mut self) {
-        // Tile textures are OwnedTexture — clearing the map triggers Drop → delete_texture
+        // Tile textures are OwnedTexture â€” clearing the map triggers Drop â†’ delete_texture
         self.tile_loader.textures.borrow_mut().clear();
         self.tile_loader.tiles.clear();
         self.tile_loader.requested.clear();
         self.tile_loader.release_all_closures();
-        // Clear GeoJSON layer GPU buffers (triggers OwnedBuffer::Drop → delete_buffer)
+        // Clear GeoJSON layer GPU buffers (triggers OwnedBuffer::Drop â†’ delete_buffer)
         for layer in &self.geojson_layers {
             layer.polygon_vertex_buffer.borrow_mut().take();
             layer.line_vertex_buffer.borrow_mut().take();
@@ -586,7 +586,7 @@ impl RustyleafMap {
         let line_gpu_corner_buffer = context.create_buffer().ok_or_else(|| RustyleafError::BufferCreation("Failed to create GPU line corner buffer".into()))?;
 
         // Static corner table for the instanced GPU line path: 6 corners per
-        // segment as (t along segment, side sign) — two triangles.
+        // segment as (t along segment, side sign) â€” two triangles.
         context.bind_vertex_array(Some(&line_gpu_vao));
         context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(&line_gpu_corner_buffer));
         let corners: [f32; 12] = [
@@ -1333,7 +1333,7 @@ impl RustyleafMap {
 
     // Layer point for event payloads. This renderer has no pane/pixel-origin
     // offset between container and layer space (see project/unproject), so the
-    // values match Leaflet's no-offset case — but it must be a DISTINCT array,
+    // values match Leaflet's no-offset case â€” but it must be a DISTINCT array,
     // not an aliased reference to containerPoint.
     fn layer_point_from_container(&self, container: &Array) -> Array {
         let arr = Array::new();
@@ -1391,7 +1391,7 @@ impl RustyleafMap {
         {
             let mut textures = self.tile_loader.textures.borrow_mut();
             for (_k, tex) in textures.drain() {
-                drop(tex); // OwnedTexture::Drop → deleteTexture
+                drop(tex); // OwnedTexture::Drop â†’ deleteTexture
             }
         }
     }
@@ -1550,10 +1550,10 @@ impl RustyleafMap {
     /// points are projected and appended to the end of the existing vertex
     /// buffer via `bufferSubData`, so a continuous stream of batches costs
     /// O(new points) per batch instead of O(total) per batch (a full re-upload
-    /// of every accumulated point, which is O(n²) over a stream).
+    /// of every accumulated point, which is O(nÂ²) over a stream).
     ///
     /// Note: appended points are NOT folded into the pre-shuffled overdraw
-    /// order — under extreme overdraw (zoomed way out) the fair-sample prefix
+    /// order â€” under extreme overdraw (zoomed way out) the fair-sample prefix
     /// favors older points. That bias is acceptable for streaming workloads.
     #[wasm_bindgen]
     pub fn append_points_packed(&mut self, layer_index: usize, points_data: &[f32]) -> Result<(), JsValue> {
@@ -1640,7 +1640,7 @@ impl RustyleafMap {
             let existing_size = gl.get_buffer_parameter(WebGl2RenderingContext::ARRAY_BUFFER, WebGl2RenderingContext::BUFFER_SIZE).as_f64().unwrap_or(0.0) as usize;
             let needed = shadow_len * 4;
             if existing_size < needed {
-                // Grow GEOMETRICALLY (2× the needed size) so a streaming batch
+                // Grow GEOMETRICALLY (2Ã— the needed size) so a streaming batch
                 // only reallocates O(log n) times total, never per batch.
                 // bufferSubData cannot resize, so a grow = full re-upload of
                 // the shadow padded to the new capacity; geometric growth keeps
@@ -1819,6 +1819,66 @@ impl RustyleafMap {
 
         self.line_layers[layer_index].lines = lines;
         self.line_layers[layer_index].gpu_dirty.set(true);
+        self.spatial_index_dirty = true;
+        Ok(())
+    }
+
+    /// Append lines without replacing the layer's existing data. Mirrors
+    /// `append_points`: the JS wrapper forwards post-mount `add()` calls here.
+    #[wasm_bindgen]
+    pub fn append_lines(&mut self, layer_index: usize, lines_data: &JsValue) -> Result<(), JsValue> {
+        self.needs_redraw = true;
+        if layer_index >= self.line_layers.len() {
+            return Err(RustyleafError::LayerOutOfBounds { index: layer_index, len: self.line_layers.len() }.into());
+        }
+
+        let lines_array = js_sys::Array::from(lines_data);
+        let layer = &mut self.line_layers[layer_index];
+        layer.lines.reserve(lines_array.length() as usize);
+
+        for i in 0..lines_array.length() {
+            let line_obj = lines_array.get(i);
+            let coords_array = js_sys::Array::from(&js_sys::Reflect::get(&line_obj, &JsValue::from_str("coords"))?);
+            let mut points = Vec::new();
+            for j in 0..coords_array.length() {
+                let coord_obj = coords_array.get(j);
+                let lat = js_sys::Reflect::get(&coord_obj, &JsValue::from_str("lat"))?
+                    .as_f64().unwrap_or(0.0);
+                let lng = js_sys::Reflect::get(&coord_obj, &JsValue::from_str("lng"))?
+                    .as_f64().unwrap_or(0.0);
+                points.push([lat, lng]);
+            }
+            let color_str = js_sys::Reflect::get(&line_obj, &JsValue::from_str("color"))?
+                .as_string().unwrap_or("#ff0000".to_string());
+            let width = js_sys::Reflect::get(&line_obj, &JsValue::from_str("width"))?
+                .as_f64().unwrap_or(2.0) as f32;
+            let meta = js_sys::Reflect::get(&line_obj, &JsValue::from_str("meta"))?;
+            let meta_json = if meta.is_object() {
+                serde_wasm_bindgen::from_value(meta)?
+            } else {
+                serde_json::json!({})
+            };
+            layer.lines.push(LineFeature { points, color: parse_color(&color_str), width, meta: meta_json });
+        }
+
+        layer.gpu_dirty.set(true);
+        self.spatial_index_dirty = true;
+        Ok(())
+    }
+
+    /// Clear a line layer's data (JS LineLayer.clear() after mount).
+    #[wasm_bindgen]
+    pub fn clear_lines(&mut self, layer_index: usize) -> Result<(), JsValue> {
+        self.needs_redraw = true;
+        if layer_index >= self.line_layers.len() {
+            return Err(RustyleafError::LayerOutOfBounds { index: layer_index, len: self.line_layers.len() }.into());
+        }
+        let layer = &mut self.line_layers[layer_index];
+        layer.lines.clear();
+        layer.lines.shrink_to_fit();
+        layer.vertex_buffer.borrow_mut().take();
+        layer.instance_count.set(0);
+        layer.gpu_dirty.set(true);
         self.spatial_index_dirty = true;
         Ok(())
     }
@@ -2186,7 +2246,7 @@ impl RustyleafMap {
 
             self.geojson_layers[layer_index].style = style;
             // The render cache bakes style into the cached features, so a
-            // style change must rebuild it — otherwise styles set after
+            // style change must rebuild it â€” otherwise styles set after
             // load_geojson (the normal addTo order) never take effect.
             self.rebuild_geojson_cache(layer_index)?;
         }
@@ -2641,7 +2701,7 @@ impl RustyleafMap {
                     }
                 }
                 GeoJSONGeometry::Polygon { coordinates } => {
-                    let polygon_rings: Vec<Vec<[f64; 2]>> = coordinates.iter().map(|ring| ring.iter().map(|c| [c[1], c[0]]).collect()).collect();
+                    let polygon_rings: Vec<Vec<[f64; 2]>> = coordinates.iter().map(|ring| Self::decimate_ring(&ring.iter().map(|c| [c[1], c[0]]).collect::<Vec<[f64; 2]>>())).collect();
                     if !polygon_rings.is_empty() && polygon_rings[0].len() >= 3 {
                         let tris = self.triangulate_polygon_with_holes_lyon(&polygon_rings);
                         cached_polygon_triangles.extend(tris);
@@ -2653,7 +2713,7 @@ impl RustyleafMap {
                 }
                 GeoJSONGeometry::MultiPolygon { coordinates } => {
                     for polygon_coords in coordinates {
-                        let polygon_rings: Vec<Vec<[f64; 2]>> = polygon_coords.iter().map(|ring| ring.iter().map(|c| [c[1], c[0]]).collect()).collect();
+                        let polygon_rings: Vec<Vec<[f64; 2]>> = polygon_coords.iter().map(|ring| Self::decimate_ring(&ring.iter().map(|c| [c[1], c[0]]).collect::<Vec<[f64; 2]>>())).collect();
                         if !polygon_rings.is_empty() && polygon_rings[0].len() >= 3 {
                             let tris = self.triangulate_polygon_with_holes_lyon(&polygon_rings);
                             cached_polygon_triangles.extend(tris);
@@ -2746,6 +2806,34 @@ impl RustyleafMap {
         Ok(())
     }
 
+    /// Cap a ring at MAX_TESS_RING_VERTICES vertices by uniform stride
+    /// sampling. Tessellation cost scales with ring size; Natural Earth-class
+    /// coastlines (10k+ vertices per ring) otherwise stall the synchronous
+    /// cache build for seconds per feature. Visually lossless at benchmark
+    /// zooms; the first vertex is always kept so the ring stays closed.
+    fn decimate_ring(ring: &[[f64; 2]]) -> Vec<[f64; 2]> {
+        const MAX_TESS_RING_VERTICES: usize = 1200;
+        if ring.len() <= MAX_TESS_RING_VERTICES {
+            return ring.to_vec();
+        }
+        let step = (ring.len() as f64 / MAX_TESS_RING_VERTICES as f64).ceil() as usize;
+        let mut out = Vec::with_capacity(MAX_TESS_RING_VERTICES + 1);
+        let mut i = 0;
+        while i < ring.len() {
+            out.push(ring[i]);
+            i += step;
+        }
+        // Keep the ring closed.
+        if let (Some(first), Some(last)) = (out.first(), out.last()) {
+            if first != last {
+                if let Some(f) = ring.first() {
+                    out.push(*f);
+                }
+            }
+        }
+        out
+    }
+
     fn triangulate_polygon_with_holes_lyon(&self, rings: &[Vec<[f64; 2]>]) -> Vec<[f64; 2]> {
         if rings.is_empty() || rings[0].len() < 3 { return Vec::new(); }
 
@@ -2768,7 +2856,7 @@ impl RustyleafMap {
         }
         let path = path_builder.build();
 
-        let mut geometry: VertexBuffers<[f32; 2], u16> = VertexBuffers::new();
+        let mut geometry: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
         let mut tess = FillTessellator::new();
         let opts = FillOptions::tolerance(0.05);
         if tess.tessellate_path(
