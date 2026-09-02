@@ -2,6 +2,40 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.0.8 - 2026-09-03
+
+### Fixed
+- **Map froze the whole tab on the first mouse hover over a large GeoJSON
+  layer** (e.g. Natural Earth 50m world polygons: ~3+ minutes blocked, then a
+  renderer OOM crash in some browsers). The spatial index is rebuilt lazily on
+  the first hover/click, and rebuilding indexed every cached line *segment*
+  while deep-cloning the feature's full `properties` object per segment — for
+  world-50m that was 97,812 segments × a 168-key properties object ≈ 0.3 GB of
+  serde_json churn plus ~100k sequential R-tree inserts, all on the main
+  thread. The index now stores typed payload fields and serializes hit meta
+  only when a hit is actually returned, shares each feature's metadata via
+  `Arc` across its segments, and bulk-loads the R-tree once instead of
+  inserting sequentially. Measured on the world-50m benchmark page: first
+  hover 204s → 0.22s; steady-state hover stays sub-millisecond. Hit payload
+  shape is unchanged, so `onEachFeature` handlers and map-level
+  `click`/`hover` events behave exactly as before.
+
+### Added
+- **Line append/clear after mount** — `LineLayer.add()` on a mounted layer
+  forwards to the new `append_lines` wasm method (append semantics, no full
+  replace) and `LineLayer.clear()` frees the layer's wasm data via
+  `clear_lines`.
+- **Polygon ring decimation for tessellation** — GeoJSON rings are capped at
+  1200 vertices by uniform stride sampling before Lyon triangulation; Natural
+  Earth-class coastlines (10k+ vertices per ring) previously stalled the
+  synchronous cache build for seconds per feature. Visually lossless at
+  benchmark zooms; the ring stays closed.
+- **Throttled tile retries** — failed tile loads are recorded with a
+  timestamp and retried at most every 5s instead of every animation frame
+  while the camera moves (previously an unbounded image/request storm at
+  60fps on offline tile servers). Both onload and onerror closures are now
+  kept alive until the request completes or is cancelled.
+
 ## 0.0.7 - 2026-08-31
 
 ### Added
