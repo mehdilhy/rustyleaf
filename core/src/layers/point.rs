@@ -8,6 +8,10 @@ pub struct PointLayer {
     // uploaded once and reused across frames (projection happens in the shader).
     pub(crate) vertex_buffer: RefCell<Option<OwnedBuffer>>,
     pub(crate) vertex_count: Cell<usize>,
+    // Shadow copy of every float uploaded to the GPU buffer. Used to re-grow
+    // the buffer on streaming appends (bufferSubData can't resize), so a
+    // growing stream reallocates amortized-O(n) instead of O(n) per batch.
+    pub(crate) gpu_shadow: RefCell<Vec<f32>>,
     // Set when `points` changes so the render pass re-uploads the GPU buffer.
     pub(crate) gpu_dirty: Cell<bool>,
     // Normalized-mercator bounding box of the uploaded points and their mean
@@ -26,6 +30,7 @@ impl PointLayer {
             visible: true,
             vertex_buffer: RefCell::new(None),
             vertex_count: Cell::new(0),
+            gpu_shadow: RefCell::new(Vec::new()),
             gpu_dirty: Cell::new(true),
             norm_min: Cell::new((0.0, 0.0)),
             norm_max: Cell::new((1.0, 1.0)),

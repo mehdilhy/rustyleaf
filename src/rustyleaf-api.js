@@ -292,6 +292,11 @@ class Map {
     // Layers currently attached to this map (drives layeradd/layerremove)
     this._attachedLayers = new Set();
 
+    // DOM overlays are not regular layers, but they own window/map listeners
+    // and must be closed deterministically when the map is removed.
+    this._openPopups = new Set();
+    this._openTooltips = new Set();
+
     // Constructor options, kept for handlers/plugins (map.addHandler)
     this.options = options;
   }
@@ -659,12 +664,12 @@ class Map {
   }
 
   on(event, callback, context) {
-    if (typeof callback !== 'function') return this;
+    if (typeof callback !== 'function' || this._destroyed) return this;
     this._listeners = this._listeners || {};
     this._localEvents = this._localEvents || {};
 
     const wasmMethod = Map._WASM_EVENT_MAP[event];
-    const isWasmEvent = wasmMethod && typeof this.wasmMap[wasmMethod] === 'function';
+    const isWasmEvent = wasmMethod && this.wasmMap && typeof this.wasmMap[wasmMethod] === 'function';
 
     if (isWasmEvent) {
       // WASM events fire while the Rust map is mutably borrowed; any handler
@@ -702,7 +707,7 @@ class Map {
 
   off(event, callback) {
     const offMethod = Map._WASM_OFF_MAP[event];
-    const hasWasm = offMethod && typeof this.wasmMap[offMethod] === 'function';
+    const hasWasm = offMethod && this.wasmMap && typeof this.wasmMap[offMethod] === 'function';
     this._listeners = this._listeners || {};
     this._localEvents = this._localEvents || {};
 
@@ -1205,6 +1210,11 @@ class Map {
     if (this._destroyed) return this;
     this._destroyed = true;
 
+    if (this._flyTimer) {
+      clearInterval(this._flyTimer);
+      this._flyTimer = null;
+    }
+
     if (this._rafId !== undefined) {
       cancelAnimationFrame(this._rafId);
       this._rafId = undefined;
@@ -1215,9 +1225,36 @@ class Map {
       this._resizeHandler = null;
     }
 
-    if (this.wasmMap && typeof this.wasmMap.destroy === 'function') {
-      this.wasmMap.destroy();
+    // Popups/tooltips are DOM overlays rather than layers. Close every open
+    // instance before freeing wasm so their deferred registrations, resize
+    // handlers, and Map references cannot outlive this map.
+    for (const popup of Array.from(this._openPopups || [])) popup.close();
+    for (const tooltip of Array.from(this._openTooltips || [])) tooltip.close();
+    if (this._openPopups) this._openPopups.clear();
+    if (this._openTooltips) this._openTooltips.clear();
+
+    // Detach layers first to break JS Map ↔ Layer reference cycles and let
+    // each layer release its GPU allocation while the core is still alive.
+    if (this._attachedLayers) {
+      for (const layer of Array.from(this._attachedLayers)) {
+        try { layer.remove(); } catch (e) { /* best-effort teardown */ }
+        if (layer._map === this) layer._map = null;
+        if (layer.map === this) layer.map = null;
+      }
+      this._attachedLayers.clear();
     }
+
+    if (this.wasmMap) {
+      if (typeof this.wasmMap.destroy === 'function') this.wasmMap.destroy();
+      // wasm-bindgen finalizers are intentionally nondeterministic. Free the
+      // Rust object now so million-point CPU buffers do not survive until GC.
+      if (typeof this.wasmMap.free === 'function') this.wasmMap.free();
+      this.wasmMap = null;
+    }
+
+    this._markerRegistry = [];
+    this._controls = [];
+    this._localEvents = {};
 
     if (this.canvas && this.canvas.parentNode) {
       this.canvas.parentNode.removeChild(this.canvas);
@@ -1330,25 +1367,73 @@ class PointLayer {
   }
   
   add(points) {
-    // Convert points to expected format
-    const pointsData = points.map(p => ({
-      lat: p.lat,
-      lng: p.lng,
-      size: p.size || 5,
-      color: p.color || '#ff0000',
-      meta: p.meta || null
-    }));
-    
-    this.wasmPointLayer.add(pointsData);
-    // Avoid spread — it overflows the call stack for very large arrays (1M+ points)
-    for (const p of points) this.points.push(p);
+    if (!Array.isArray(points)) {
+      throw new TypeError('PointLayer.add expects an array of points');
+    }
+    if (this._map && this._layerIndex !== undefined) {
+      // Append only the new batch. The old implementation retained every JS
+      // object and resent the entire layer, causing multi-GB spikes at 1M.
+      this._map.wasmMap.append_points(this._layerIndex, points);
+    } else {
+      // Before mounting, keep the original references once. addTo() transfers
+      // them to Rust and immediately releases this array.
+      for (const point of points) this.points.push(point);
+    }
+    return this;
+  }
+
+  // High-volume ingestion format: [lat, lng, size, r, g, b, a] per point.
+  // A typed array avoids allocating one JavaScript object per feature.
+  addPacked(points) {
+    if (!(points instanceof Float32Array)) {
+      throw new TypeError('PointLayer.addPacked expects a Float32Array');
+    }
+    if (points.length % 7 !== 0) {
+      throw new RangeError('Packed point data length must be divisible by 7');
+    }
+    if (!this._map || this._layerIndex === undefined) {
+      throw new Error('PointLayer.addPacked requires the layer to be added to a map first');
+    }
+    this._map.wasmMap.add_points_packed(this._layerIndex, points);
+    return this;
+  }
+
+  // Streaming append: like addPacked, but the Rust core appends the batch to
+  // the existing GPU buffer (bufferSubData) instead of re-uploading every
+  // accumulated point. O(new points) per batch instead of O(total) — keeps a
+  // continuous stream of batches smooth without O(n²) re-uploads.
+  appendPacked(points) {
+    if (!(points instanceof Float32Array)) {
+      throw new TypeError('PointLayer.appendPacked expects a Float32Array');
+    }
+    if (points.length % 7 !== 0) {
+      throw new RangeError('Packed point data length must be divisible by 7');
+    }
+    if (!this._map || this._layerIndex === undefined) {
+      throw new Error('PointLayer.appendPacked requires the layer to be added to a map first');
+    }
+    this._map.wasmMap.append_points_packed(this._layerIndex, points);
+    return this;
+  }
+
+  // Pre-allocate the GPU buffer for `totalPoints` before a streaming burst
+  // (appendPacked) whose final size is known — avoids growth reallocations.
+  reservePacked(totalPoints) {
+    if (!this._map || this._layerIndex === undefined) {
+      throw new Error('PointLayer.reservePacked requires the layer to be added to a map first');
+    }
+    this._map.wasmMap.reserve_points_packed(this._layerIndex, totalPoints);
     return this;
   }
   
   clear() {
     this.points = [];
-    // Reset WASM layer
-    this.wasmPointLayer = new PointLayerApi();
+    if (this._map && this._layerIndex !== undefined) {
+      this._map.wasmMap.clear_points(this._layerIndex);
+    } else {
+      // Reset the detached helper used before the layer is mounted.
+      this.wasmPointLayer = new PointLayerApi();
+    }
     return this;
   }
   
@@ -1371,6 +1456,7 @@ class PointLayer {
     this._map = map;
     this._layerIndex = map.wasmMap.add_point_layer();
     map.wasmMap.add_points(this._layerIndex, this.points);
+    this.points = [];
     if (map._notifyLayerAdd) map._notifyLayerAdd(this);
     return this;
   }
@@ -1405,13 +1491,21 @@ class LineLayer {
       width: line.width || 2,
       meta: line.meta || null
     }));
-    
-    for (const l of linesData) this.lines.push(l);
+
+    if (this.map && this._layerIndex !== undefined) {
+      // Mounted: forward straight to the wasm layer (append semantics).
+      this.map.wasmMap.append_lines(this._layerIndex, linesData);
+    } else {
+      for (const l of linesData) this.lines.push(l);
+    }
     return this;
   }
-  
+
   clear() {
     this.lines = [];
+    if (this.map && this._layerIndex !== undefined) {
+      this.map.wasmMap.clear_lines(this._layerIndex);
+    }
     return this;
   }
   
@@ -1542,7 +1636,10 @@ class Popup {
     this._addEventListeners();
 
     // Track the active popup so Map.closePopup() works (Leaflet parity).
-    if (map) map._activePopup = this;
+    if (map) {
+      map._activePopup = this;
+      if (map._openPopups) map._openPopups.add(this);
+    }
 
     if (map._fireLocalEvent) map._fireLocalEvent('popupopen', { type: 'popupopen', popup: this });
     return this;
@@ -1560,6 +1657,7 @@ class Popup {
     this._removeEventListeners();
     this.isOpen = false;
     if (this.map && this.map._activePopup === this) this.map._activePopup = null;
+    if (this.map && this.map._openPopups) this.map._openPopups.delete(this);
     if (this.map && this.map._fireLocalEvent) this.map._fireLocalEvent('popupclose', { type: 'popupclose', popup: this });
     this.map = null;
     
@@ -2613,7 +2711,6 @@ class GeoJSONLayer {
       if (this.map && this.layerIndex !== undefined) {
         console.log('GeoJSONLayer: Data loaded, triggering immediate parsing');
         this.map.wasmMap.load_geojson(this.layerIndex, jsonText);
-        this.updateStyle();
         this._pendingGeoJSONText = null;
       } else {
         console.log('GeoJSONLayer: Data stored but layer not yet on map');
@@ -2624,7 +2721,6 @@ class GeoJSONLayer {
             if (this.map && this.layerIndex !== undefined && this._pendingGeoJSONText) {
               try {
                 this.map.wasmMap.load_geojson(this.layerIndex, this._pendingGeoJSONText);
-                this.updateStyle();
               } finally {
                 this._pendingGeoJSONText = null;
                 clearInterval(this._pendingTimer);
@@ -2849,7 +2945,8 @@ class GeoJSONLayer {
 
   // Update style on the map
   updateStyle() {
-    if (this.map && this.layerIndex !== undefined) {
+    if (this.map && this.layerIndex !== undefined &&
+        typeof this.map.wasmMap.set_geojson_style === 'function') {
       const styleData = {
         pointColor: this.options.pointColor,
         pointSize: this.options.pointSize,
@@ -2877,11 +2974,15 @@ class GeoJSONLayer {
     }
     map._geojsonLayerCount += 1;
 
+    // Apply style while the layer is empty. `set_geojson_style` rebuilds the
+    // render cache, so doing this after load_geojson tessellates large polygon
+    // datasets twice and blocks the browser's main thread unnecessarily.
+    this.updateStyle();
+
     if (this._pendingGeoJSONText) {
       console.log('GeoJSONLayer: Applying deferred data after adding to map');
       try {
         map.wasmMap.load_geojson(this.layerIndex, this._pendingGeoJSONText);
-        this.updateStyle();
       } finally {
         this._pendingGeoJSONText = null;
         if (this._pendingTimer) {
@@ -2905,7 +3006,6 @@ class GeoJSONLayer {
         // Unparseable string — pass through and let the wasm parser report it
         map.wasmMap.load_geojson(this.layerIndex, this.geojson);
       }
-      this.updateStyle();
     }
 
     this._mountFeatureExtras(map);
@@ -3600,7 +3700,10 @@ class Tooltip {
         }
       });
     }
-    if (map) map._activeTooltip = this;
+    if (map) {
+      map._activeTooltip = this;
+      if (map._openTooltips) map._openTooltips.add(this);
+    }
     if (map._fireLocalEvent) map._fireLocalEvent('tooltipopen', { type: 'tooltipopen', tooltip: this });
     return this;
   }
@@ -3616,6 +3719,7 @@ class Tooltip {
       this.map.off('zoom', this._boundFns.zoom);
     }
     if (this.map && this.map._activeTooltip === this) this.map._activeTooltip = null;
+    if (this.map && this.map._openTooltips) this.map._openTooltips.delete(this);
     if (this.map && this.map._fireLocalEvent) this.map._fireLocalEvent('tooltipclose', { type: 'tooltipclose', tooltip: this });
     this.map = null;
     return this;

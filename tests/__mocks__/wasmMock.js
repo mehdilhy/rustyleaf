@@ -115,6 +115,9 @@ export const rustyleafmap_set_line_layer_visible = jest.fn();
 export const rustyleafmap_set_polygon_layer_visible = jest.fn();
 export const rustyleafmap_set_geojson_layer_visible = jest.fn();
 export const rustyleafmap_add_points = jest.fn();
+export const rustyleafmap_append_points = jest.fn();
+export const rustyleafmap_add_points_packed = jest.fn();
+export const rustyleafmap_clear_points = jest.fn();
 export const rustyleafmap_add_lines = jest.fn();
 export const rustyleafmap_add_polygons = jest.fn();
 export const rustyleafmap_load_geojson = jest.fn();
@@ -367,8 +370,36 @@ export class RustyleafMap {
     rustyleafmap_add_points(this.ptr, layerIndex, points);
   }
 
+  append_points(layerIndex, points) {
+    rustyleafmap_append_points(this.ptr, layerIndex, points);
+  }
+
+  add_points_packed(layerIndex, points) {
+    rustyleafmap_add_points_packed(this.ptr, layerIndex, points);
+  }
+
+  append_points_packed(layerIndex, points) {
+    rustyleafmap_add_points_packed(this.ptr, layerIndex, points);
+  }
+
+  reserve_points_packed(layerIndex, totalPoints) {
+    rustyleafmap_add_points_packed(this.ptr, layerIndex, totalPoints);
+  }
+
+  clear_points(layerIndex) {
+    rustyleafmap_clear_points(this.ptr, layerIndex);
+  }
+
   add_lines(layerIndex, lines) {
     rustyleafmap_add_lines(this.ptr, layerIndex, lines);
+  }
+
+  append_lines(layerIndex, lines) {
+    rustyleafmap_add_lines(this.ptr, layerIndex, lines);
+  }
+
+  clear_lines(layerIndex) {
+    rustyleafmap_add_lines(this.ptr, layerIndex, layerIndex);
   }
 
   add_polygons(layerIndex, polygons) {
@@ -519,6 +550,9 @@ export default {
   rustyleafmap_set_polygon_layer_visible,
   rustyleafmap_set_geojson_layer_visible,
   rustyleafmap_add_points,
+  rustyleafmap_append_points,
+  rustyleafmap_add_points_packed,
+  rustyleafmap_clear_points,
   rustyleafmap_add_lines,
   rustyleafmap_add_polygons,
   rustyleafmap_load_geojson,

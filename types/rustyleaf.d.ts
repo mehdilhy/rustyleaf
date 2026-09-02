@@ -146,6 +146,10 @@ export interface MarkerOptions {
   zIndexOffset?: number;
   autoPan?: boolean;
   keyboard?: boolean;
+  /** Sprite color for GPU-rendered markers (plain Icon only). */
+  color?: string;
+  /** Sprite size in px for GPU-rendered markers (plain Icon only). */
+  size?: number;
 }
 
 // ==================== Icon ====================
@@ -276,6 +280,16 @@ export declare class PointLayer {
   constructor();
 
   add(points: PointFeature[]): this;
+  /** Append packed [lat, lng, size, r, g, b, a] float tuples. The layer must
+   * already be attached to a map. Intended for very large datasets. */
+  addPacked(points: Float32Array): this;
+  /** Streaming append: like addPacked, but appends to the existing GPU buffer
+   * (O(new points) per batch) instead of re-uploading all accumulated points.
+   * Keeps continuous streams smooth without O(n²) re-uploads. */
+  appendPacked(points: Float32Array): this;
+  /** Pre-allocate the GPU buffer for a known-size streaming burst before
+   * appendPacked, avoiding growth reallocations. */
+  reservePacked(totalPoints: number): this;
   clear(): this;
   on(event: 'click' | 'hover', callback: (...args: any[]) => void): this;
   addTo(map: Map): this;

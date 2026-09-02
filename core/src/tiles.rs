@@ -45,7 +45,9 @@ pub struct TileLoader {
     pub texture_generation: Rc<Cell<u64>>,
     // Shared handle so the onerror closure can record failed tiles. Same
     // Rc-sharing pattern as `textures`.
-    pub failed: Rc<RefCell<HashSet<String>>>,
+    // Failure timestamp by tile key. A timestamped map prevents a failed tile
+    // from being retried on every animation frame while the camera is moving.
+    pub failed: Rc<RefCell<HashMap<String, f64>>>,
     // Keyed by tile key so completed loads can be released in cleanup_old_tiles.
     // The image is kept alongside its closure so handlers can be detached
     // before the closure is dropped — otherwise a still-loading image fires
@@ -53,8 +55,14 @@ pub struct TileLoader {
     pub closures: HashMap<String, TileLoadHandler>,
 }
 
-// An in-flight tile load: the image and the onload/onerror closure bound to it.
-pub type TileLoadHandler = (HtmlImageElement, Closure<dyn FnMut()>);
+// An in-flight tile load: keep the image and BOTH event closures alive until
+// the request completes or is cancelled. Dropping either closure while the
+// image still references it makes a later browser event call freed WASM state.
+pub type TileLoadHandler = (
+    HtmlImageElement,
+    Closure<dyn FnMut()>,
+    Closure<dyn FnMut()>,
+);
 
 impl TileLoader {
     pub fn new() -> Self {
@@ -62,7 +70,7 @@ impl TileLoader {
             textures: Rc::new(RefCell::new(HashMap::new())),
             tiles: HashMap::new(),
             requested: HashSet::new(),
-            failed: Rc::new(RefCell::new(HashSet::new())),
+            failed: Rc::new(RefCell::new(HashMap::new())),
             texture_generation: Rc::new(Cell::new(0)),
             closures: HashMap::new(),
         }
@@ -71,7 +79,7 @@ impl TileLoader {
     // Detach handlers before dropping, so in-flight images can never invoke
     // a dropped closure (used on destroy/context-loss).
     pub fn release_all_closures(&mut self) {
-        for (_key, (image, _closure)) in self.closures.drain() {
+        for (_key, (image, _onload, _onerror)) in self.closures.drain() {
             image.set_onload(None);
             image.set_onerror(None);
         }
@@ -80,7 +88,27 @@ impl TileLoader {
     pub fn cleanup_old_tiles(&mut self, viewport: &Viewport) {
         let current_zoom = viewport.zoom.round() as u32;
         let visible_keys = visible_tile_keys(viewport, current_zoom);
-        let max_cache_size = (visible_keys.len() * 3).max(20);
+        // Keep one adjacent zoom level so render_tiles can use it as a visual
+        // fallback while the current tiles are in flight.
+        let keep_key = |key: &str| {
+            key.split('/').next()
+                .and_then(|zoom| zoom.parse::<u32>().ok())
+                .is_some_and(|zoom| zoom.abs_diff(current_zoom) <= 1)
+        };
+        let max_cache_size = (visible_keys.len() * 6).max(24);
+
+        // Cancel stale in-flight images before dropping their closures.
+        let stale_loads: Vec<String> = self.closures.keys()
+            .filter(|key| !keep_key(key))
+            .cloned()
+            .collect();
+        for key in stale_loads {
+            if let Some((image, _onload, _onerror)) = self.closures.remove(&key) {
+                image.set_onload(None);
+                image.set_onerror(None);
+                image.set_src("");
+            }
+        }
 
         let mut textures = self.textures.borrow_mut();
 
@@ -94,27 +122,16 @@ impl TileLoader {
             .cloned()
             .collect();
         for key in done {
-            if let Some((image, _closure)) = self.closures.remove(&key) {
+            if let Some((image, _onload, _onerror)) = self.closures.remove(&key) {
                 image.set_onload(None);
                 image.set_onerror(None);
             }
         }
 
         let keys_to_remove: Vec<String> = textures
-            .iter()
-            .filter(|(key, _)| {
-                let parts: Vec<&str> = key.split('/').collect();
-                if parts.len() == 3 {
-                    if let Ok(zoom) = parts[0].parse::<u32>() {
-                        zoom != current_zoom
-                    } else {
-                        true
-                    }
-                } else {
-                    true
-                }
-            })
-            .map(|(key, _)| key.clone())
+            .keys()
+            .filter(|key| !keep_key(key))
+            .cloned()
             .collect();
 
         // OwnedTexture::Drop deletes the GL texture when removed from the map.
@@ -135,20 +152,9 @@ impl TileLoader {
             }
         }
 
-        if self.requested.len() > 50 {
-            self.requested.retain(|key| {
-                let parts: Vec<&str> = key.split('/').collect();
-                if parts.len() == 3 {
-                    if let Ok(zoom) = parts[0].parse::<u32>() {
-                        zoom == current_zoom
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            });
-        }
+        self.requested.retain(|key| keep_key(key));
+        self.tiles.retain(|key, _| keep_key(key));
+        self.failed.borrow_mut().retain(|key, _failed_at| keep_key(key));
     }
 
     pub fn load_visible_tiles(
@@ -185,13 +191,26 @@ impl TileLoader {
                     let tile_key = format!("{}/{}/{}", zoom, wrapped_x, y);
                     let already_requested = self.requested.contains(&tile_key);
                     let already_cached = self.textures.borrow().contains_key(&tile_key);
-                    // A previously failed tile is eligible for a retry: clear
-                    // its bookkeeping so the load below is issued again.
-                    let failed_retry = self.failed.borrow_mut().remove(&tile_key);
+                    // Retry transient failures with a delay. `pan()` calls this
+                    // method every frame, so immediate retries otherwise create
+                    // an unbounded image/request allocation storm at 60 fps.
+                    let failed_retry = {
+                        let mut failed = self.failed.borrow_mut();
+                        let retry_due = failed
+                            .get(&tile_key)
+                            .is_some_and(|failed_at| js_sys::Date::now() - failed_at >= 5_000.0);
+                        if retry_due {
+                            failed.remove(&tile_key);
+                        }
+                        retry_due
+                    };
                     if failed_retry {
                         self.requested.remove(&tile_key);
                         self.tiles.remove(&tile_key);
-                        self.closures.remove(&tile_key);
+                        if let Some((image, _onload, _onerror)) = self.closures.remove(&tile_key) {
+                            image.set_onload(None);
+                            image.set_onerror(None);
+                        }
                     }
 
                     if (!already_requested || failed_retry) && !already_cached && load_count < max_load_per_frame {
@@ -336,13 +355,15 @@ impl TileLoader {
                 "Tile request failed, will retry: {}",
                 tile_key_err
             )));
-            failed_set.borrow_mut().insert(tile_key_err.clone());
+            failed_set
+                .borrow_mut()
+                .insert(tile_key_err.clone(), js_sys::Date::now());
         }) as Box<dyn FnMut()>);
 
         image.set_onload(Some(onload_closure.as_ref().unchecked_ref()));
         image.set_onerror(Some(onerror_closure.as_ref().unchecked_ref()));
         self.closures
-            .insert(tile_key, (image.clone(), onload_closure));
+            .insert(tile_key, (image.clone(), onload_closure, onerror_closure));
 
         image.set_src(&url);
     }

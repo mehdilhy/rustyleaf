@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use rstar::{RTree, RTreeObject, AABB};
 use crate::layers::point::PointLayer;
 use crate::layers::line::LineLayer;
@@ -5,15 +6,45 @@ use crate::layers::polygon::PolygonLayer;
 use crate::layers::geojson::GeoJSONLayer;
 use crate::projection::Viewport;
 
+/// One indexable unit (a point, a line segment, or a polygon bbox+ring).
+///
+/// The hit payload is stored as typed fields and only serialized to JSON when
+/// a hit is actually returned. Every indexable shares its feature's
+/// `original_meta` via `Arc` — a Natural Earth-class dataset has ~100k line
+/// segments per GeoJSON layer, and deep-cloning a 168-key properties object
+/// per segment cost ~0.3GB of allocations and minutes of main-thread time on
+/// the first hover.
 #[derive(Clone, Debug)]
 pub(crate) struct SpatialFeature {
     #[allow(dead_code)] // reserved for stable feature identity across index rebuilds
     pub(crate) id: u32,
     pub(crate) bounds: AABB<[f64; 2]>,
-    pub(crate) meta: serde_json::Value,
+    pub(crate) layer_type: &'static str,
+    pub(crate) layer_index: usize,
+    pub(crate) feature_index: usize,
+    // Present for line features: which segment of the line was indexed.
+    pub(crate) segment_index: Option<usize>,
+    // Shared, not cloned: the feature's own meta/properties object.
+    pub(crate) original_meta: Arc<serde_json::Value>,
     // When present, the feature is an area (polygon): a cursor only "hits"
     // it when point-in-ring passes — not merely by touching its bbox.
-    pub(crate) ring: Option<Vec<[f64; 2]>>,
+    pub(crate) ring: Option<Arc<Vec<[f64; 2]>>>,
+}
+
+impl SpatialFeature {
+    /// The hit payload consumed by the JS dispatcher — same shape as before:
+    /// `{ layer_type, layer_index, feature_index[, segment_index], original_meta }`.
+    fn meta_json(&self) -> serde_json::Value {
+        let mut meta = serde_json::Map::new();
+        meta.insert("layer_type".into(), self.layer_type.into());
+        meta.insert("layer_index".into(), self.layer_index.into());
+        meta.insert("feature_index".into(), self.feature_index.into());
+        if let Some(seg) = self.segment_index {
+            meta.insert("segment_index".into(), seg.into());
+        }
+        meta.insert("original_meta".into(), (*self.original_meta).clone());
+        serde_json::Value::Object(meta)
+    }
 }
 
 /// Ray-casting point-in-polygon on the [lat, lng] plane.
@@ -60,8 +91,8 @@ pub fn rebuild_spatial_index(
         return;
     }
 
-    let mut new_index = RTree::new();
-    let mut feature_id = 0;
+    let mut features: Vec<SpatialFeature> = Vec::new();
+    let mut feature_id: u32 = 0;
     let tolerance = 0.001; // degrees — ~111m at equator
 
     // Index point features
@@ -72,20 +103,16 @@ pub fn rebuild_spatial_index(
                 [point.lng + tolerance, point.lat + tolerance]
             );
 
-            let mut meta = serde_json::json!({});
-            meta["layer_type"] = "point".into();
-            meta["layer_index"] = layer_idx.into();
-            meta["feature_index"] = point_idx.into();
-            meta["original_meta"] = point.meta.clone();
-
-            let feature = SpatialFeature {
+            features.push(SpatialFeature {
                 id: feature_id,
                 bounds,
-                meta,
+                layer_type: "point",
+                layer_index: layer_idx,
+                feature_index: point_idx,
+                segment_index: None,
+                original_meta: Arc::new(point.meta.clone()),
                 ring: None,
-            };
-
-            new_index.insert(feature);
+            });
             feature_id += 1;
         }
     }
@@ -93,6 +120,8 @@ pub fn rebuild_spatial_index(
     // Index line features (simplified - index line segments)
     for (layer_idx, layer) in line_layers.iter().enumerate() {
         for (line_idx, line) in layer.lines.iter().enumerate() {
+            // One shared meta per line — segments must not deep-clone it.
+            let meta = Arc::new(line.meta.clone());
             // Index each line segment with tolerance
             for i in 0..line.points.len().saturating_sub(1) {
                 let start = line.points[i];
@@ -105,21 +134,16 @@ pub fn rebuild_spatial_index(
 
                 let bounds = AABB::from_corners([min_x, min_y], [max_x, max_y]);
 
-                let mut meta = serde_json::json!({});
-                meta["layer_type"] = "line".into();
-                meta["layer_index"] = layer_idx.into();
-                meta["feature_index"] = line_idx.into();
-                meta["segment_index"] = i.into();
-                meta["original_meta"] = line.meta.clone();
-
-                let feature = SpatialFeature {
+                features.push(SpatialFeature {
                     id: feature_id,
                     bounds,
-                    meta,
+                    layer_type: "line",
+                    layer_index: layer_idx,
+                    feature_index: line_idx,
+                    segment_index: Some(i),
+                    original_meta: Arc::clone(&meta),
                     ring: None,
-                };
-
-                new_index.insert(feature);
+                });
                 feature_id += 1;
             }
         }
@@ -140,16 +164,15 @@ pub fn rebuild_spatial_index(
                         [min_lng - tolerance, min_lat - tolerance],
                         [max_lng + tolerance, max_lat + tolerance]
                     );
-                    let mut meta = serde_json::json!({});
-                    meta["layer_type"] = "polygon".into();
-                    meta["layer_index"] = layer_idx.into();
-                    meta["feature_index"] = poly_idx.into();
-                    meta["original_meta"] = poly.meta.clone();
-                    new_index.insert(SpatialFeature {
+                    features.push(SpatialFeature {
                         id: feature_id,
                         bounds,
-                        meta,
-                        ring: Some(ring.clone()),
+                        layer_type: "polygon",
+                        layer_index: layer_idx,
+                        feature_index: poly_idx,
+                        segment_index: None,
+                        original_meta: Arc::new(poly.meta.clone()),
+                        ring: Some(Arc::new(ring.clone())),
                     });
                     feature_id += 1;
                 }
@@ -168,16 +191,23 @@ pub fn rebuild_spatial_index(
                 [point.lng - tolerance, point.lat - tolerance],
                 [point.lng + tolerance, point.lat + tolerance]
             );
-            let mut meta = serde_json::json!({});
-            meta["layer_type"] = "geojson-point".into();
-            meta["layer_index"] = layer_idx.into();
-            meta["feature_index"] = point_idx.into();
-            meta["original_meta"] = point.meta.clone();
-            new_index.insert(SpatialFeature { id: feature_id, bounds, meta, ring: None });
+            features.push(SpatialFeature {
+                id: feature_id,
+                bounds,
+                layer_type: "geojson-point",
+                layer_index: layer_idx,
+                feature_index: point_idx,
+                segment_index: None,
+                original_meta: Arc::new(point.meta.clone()),
+                ring: None,
+            });
             feature_id += 1;
         }
 
         for (line_idx, line) in layer.cached_lines.iter().enumerate() {
+            // One shared meta per line feature — ~100k segments on a
+            // world-class dataset each used to deep-clone the properties.
+            let meta = Arc::new(line.meta.clone());
             for i in 0..line.points.len().saturating_sub(1) {
                 let start = line.points[i];
                 let end = line.points[i + 1];
@@ -186,13 +216,16 @@ pub fn rebuild_spatial_index(
                 let min_y = start[0].min(end[0]) - tolerance;
                 let max_y = start[0].max(end[0]) + tolerance;
                 let bounds = AABB::from_corners([min_x, min_y], [max_x, max_y]);
-                let mut meta = serde_json::json!({});
-                meta["layer_type"] = "geojson-line".into();
-                meta["layer_index"] = layer_idx.into();
-                meta["feature_index"] = line_idx.into();
-                meta["segment_index"] = i.into();
-                meta["original_meta"] = line.meta.clone();
-                new_index.insert(SpatialFeature { id: feature_id, bounds, meta, ring: None });
+                features.push(SpatialFeature {
+                    id: feature_id,
+                    bounds,
+                    layer_type: "geojson-line",
+                    layer_index: layer_idx,
+                    feature_index: line_idx,
+                    segment_index: Some(i),
+                    original_meta: Arc::clone(&meta),
+                    ring: None,
+                });
                 feature_id += 1;
             }
         }
@@ -210,22 +243,24 @@ pub fn rebuild_spatial_index(
                 [min_lng - tolerance, min_lat - tolerance],
                 [max_lng + tolerance, max_lat + tolerance]
             );
-            let mut meta = serde_json::json!({});
-            meta["layer_type"] = "geojson-polygon".into();
-            meta["layer_index"] = layer_idx.into();
-            meta["feature_index"] = poly_idx.into();
-            meta["original_meta"] = hit.meta.clone();
-            new_index.insert(SpatialFeature {
+            features.push(SpatialFeature {
                 id: feature_id,
                 bounds,
-                meta,
-                ring: Some(hit.outer_ring.clone()),
+                layer_type: "geojson-polygon",
+                layer_index: layer_idx,
+                feature_index: poly_idx,
+                segment_index: None,
+                original_meta: Arc::new(hit.meta.clone()),
+                ring: Some(Arc::new(hit.outer_ring.clone())),
             });
             feature_id += 1;
         }
     }
 
-    *index = new_index;
+    // Bulk-load once: sequential `insert()` over ~100k features cost minutes
+    // (pathological node splitting under allocator churn); `bulk_load` is
+    // orders of magnitude faster and produces a better-packed tree.
+    *index = RTree::bulk_load(features);
     *dirty = false;
 }
 
@@ -242,7 +277,13 @@ pub fn hit_test(
     index: &RTree<SpatialFeature>,
     x: f64, y: f64,
 ) -> Option<serde_json::Value> {
-    let tolerance = 0.001; // degrees
+    // Zoom-aware tolerance: a fixed degree tolerance is sub-pixel at low zoom
+    // (world view) and city-sized at high zoom. Express it in screen pixels
+    // instead — a ~6px hit radius feels right at every zoom level.
+    const HIT_RADIUS_PX: f64 = 6.0;
+    let world_pixels = viewport.tile_size as f64 * (1u64 << viewport.zoom.round() as u32) as f64;
+    let deg_per_px = 360.0 / world_pixels;
+    let tolerance = HIT_RADIUS_PX * deg_per_px;
     let (lat, lng) = screen_to_latlng(viewport, x, y);
 
     let search_bounds = AABB::from_corners(
@@ -271,11 +312,11 @@ pub fn hit_test(
             }
             Some(ring) => {
                 if point_in_ring(lat, lng, ring) {
-                    return Some(feature.meta.clone());
+                    return Some(feature.meta_json());
                 }
             }
         }
     }
 
-    fallback.map(|feature| feature.meta.clone())
+    fallback.map(|feature| feature.meta_json())
 }
