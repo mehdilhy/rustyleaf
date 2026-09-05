@@ -92,6 +92,9 @@
       "optional": true
     }
   },
+  "overrides": {
+    "browserslist": "4.28.7"
+  },
   "publishConfig": {
     "access": "public"
   },
