@@ -173,8 +173,10 @@ describe('Popup', () => {
         project: jest.fn(() => [400, 300]),
         unproject: jest.fn(() => [40.7128, -74.0060]),
         panTo: jest.fn(),
+        flyTo: jest.fn(),
         on: jest.fn(),
-        off: jest.fn()
+        off: jest.fn(),
+        flyTo: jest.fn()
       };
       
       popup.setLatLng([40.7128, -74.0060] as any);
@@ -200,8 +202,10 @@ describe('Popup', () => {
         project: jest.fn(() => [400, 300]),
         unproject: jest.fn(() => [40.7128, -74.0060]),
         panTo: jest.fn(),
+        flyTo: jest.fn(),
         on: jest.fn(),
-        off: jest.fn()
+        off: jest.fn(),
+        flyTo: jest.fn()
       };
       const mockMap2 = {
         containerElement: document.createElement('div'),
@@ -212,8 +216,10 @@ describe('Popup', () => {
         project: jest.fn(() => [400, 300]),
         unproject: jest.fn(() => [40.7128, -74.0060]),
         panTo: jest.fn(),
+        flyTo: jest.fn(),
         on: jest.fn(),
-        off: jest.fn()
+        off: jest.fn(),
+        flyTo: jest.fn()
       };
       
       popup.setLatLng([40.7128, -74.0060] as any);
@@ -240,8 +246,10 @@ describe('Popup', () => {
         project: jest.fn(() => [400, 300]),
         unproject: jest.fn(() => [40.7128, -74.0060]),
         panTo: jest.fn(),
+        flyTo: jest.fn(),
         on: jest.fn(),
-        off: jest.fn()
+        off: jest.fn(),
+        flyTo: jest.fn()
       };
       
       popup.setLatLng([40.7128, -74.0060] as any);
@@ -268,8 +276,10 @@ describe('Popup', () => {
         project: jest.fn(() => [400, 300]),
         unproject: jest.fn(() => [40.7128, -74.0060]),
         panTo: jest.fn(),
+        flyTo: jest.fn(),
         on: jest.fn(),
-        off: jest.fn()
+        off: jest.fn(),
+        flyTo: jest.fn()
       };
       
       popup.setLatLng([40.7128, -74.0060] as any);
@@ -308,8 +318,10 @@ describe('Popup', () => {
         project: jest.fn(() => [400, 300]),
         unproject: jest.fn(() => [40.7128, -74.0060]),
         panTo: jest.fn(),
+        flyTo: jest.fn(),
         on: jest.fn(),
-        off: jest.fn()
+        off: jest.fn(),
+        flyTo: jest.fn()
       };
       
       popup.setLatLng([40.7128, -74.0060] as any);
@@ -332,8 +344,10 @@ describe('Popup', () => {
         project: jest.fn(() => [400, 300]),
         unproject: jest.fn(() => [40.7128, -74.0060]),
         panTo: jest.fn(),
+        flyTo: jest.fn(),
         on: jest.fn(),
-        off: jest.fn()
+        off: jest.fn(),
+        flyTo: jest.fn()
       };
       
       popup.setLatLng([40.7128, -74.0060] as any);
@@ -361,8 +375,10 @@ describe('Popup', () => {
         project: jest.fn(() => [400, 300]),
         unproject: jest.fn(() => [40.7128, -74.0060]),
         panTo: jest.fn(),
+        flyTo: jest.fn(),
         on: jest.fn(),
-        off: jest.fn()
+        off: jest.fn(),
+        flyTo: jest.fn()
       };
       
       popup.setLatLng([40.7128, -74.0060] as any);
@@ -418,8 +434,10 @@ describe('Popup', () => {
         project: jest.fn(() => [400, 300]),
         unproject: jest.fn(() => [40.7128, -74.0060]),
         panTo: jest.fn(),
+        flyTo: jest.fn(),
         on: jest.fn(),
-        off: jest.fn()
+        off: jest.fn(),
+        flyTo: jest.fn()
       };
       
       popup.setLatLng([40.7128, -74.0060] as any);
@@ -502,6 +520,7 @@ describe('Popup', () => {
           project: jest.fn(() => [400, 300]),
           unproject: jest.fn(() => [40.7128, -74.0060]),
           panTo: jest.fn(),
+          flyTo: jest.fn(),
           on: jest.fn(),
           off: jest.fn()
         },
@@ -559,10 +578,13 @@ describe('Popup', () => {
         project: jest.fn(() => [400, 300]),
         unproject: jest.fn(() => [40.7128, -74.0060]),
         panTo: jest.fn(),
+        flyTo: jest.fn(),
         on: jest.fn(),
         off: jest.fn(),
+        flyTo: jest.fn(),
         on: jest.fn(),
-        off: jest.fn()
+        off: jest.fn(),
+        flyTo: jest.fn()
       };
       const mockLayer = {};
       

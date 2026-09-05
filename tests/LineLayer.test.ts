@@ -251,7 +251,7 @@ describe('LineLayer', () => {
       
       expect(() => {
         lineLayer.addTo(mockMap as any);
-      }).toThrow("Cannot read properties of undefined (reading 'add_line_layer')");
+      }).toThrow('Cannot read properties of undefined (reading \'add_line_layer\')');
     });
   });
 
@@ -379,10 +379,12 @@ describe('LineLayer', () => {
       const mockMap = {
         wasmMap: {
           add_line_layer: jest.fn(() => 0),
-          add_lines: jest.fn()
+          add_lines: jest.fn(),
+          append_lines: jest.fn(),
+          clear_lines: jest.fn()
         }
       };
-      
+
       const result = lineLayer
         .add(lines)
         .on('click', jest.fn())

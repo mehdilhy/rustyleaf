@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>smoke</title>
+<style>html,body{margin:0}#map{width:800px;height:600px}</style>
+</head>
+<body>
+<div id="map"></div>
+<script type="module">
+  import * as R from "../../src/rustyleaf-api.js";
+  window.R = R;
+  const map = new R.Map('map', { center: [48.8566, 2.3522], zoom: 12 });
+  window.__map = map;
+  window.__rustyleafReady = true;
+</script>
+</body>
+</html>

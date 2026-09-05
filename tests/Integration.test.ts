@@ -131,7 +131,7 @@ describe('Browser Integration Tests', () => {
       // This test simulates WebGL context loss scenarios
       
       const map = new Map(container);
-      const originalSupport = map.getWebGLSupport();
+      map.getWebGLSupport();
       
       // Mock a context loss scenario
       const originalGetContext = HTMLCanvasElement.prototype.getContext;
@@ -250,10 +250,8 @@ describe('Browser Integration Tests', () => {
 
   describe('Memory Management', () => {
     test('should clean up resources properly', () => {
-      let map: Map;
-      
       expect(() => {
-        map = new Map(container);
+        new Map(container);
       }).not.toThrow();
 
       // Simulate cleanup - in a real scenario, this would be handled by garbage collection
@@ -262,9 +260,6 @@ describe('Browser Integration Tests', () => {
         if (container.parentNode) {
           container.parentNode.removeChild(container);
         }
-        
-        // Clear references
-        map = null as any;
       }).not.toThrow();
     });
 

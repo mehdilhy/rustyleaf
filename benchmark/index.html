@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rustyleaf Benchmark — vs Leaflet vs MapLibre GL</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font: 14px/1.5 system-ui, -apple-system, sans-serif;
+    background: #f6f7f9; color: #1a1a1a; padding: 24px;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { background: #14161a; color: #e6e6e6; }
+    .card { background: #1d2026 !important; border-color: #2a2e37 !important; }
+    th { background: #23272f !important; }
+    tr:nth-child(even) td { background: #1a1d23 !important; }
+    .muted { color: #9aa0aa !important; }
+    button { background: #23272f; color: #e6e6e6; border-color: #333; }
+    button.primary { background: #2a6fdb; color: #fff; }
+    select, input { background: #23272f; color: #e6e6e6; border-color: #333; }
+    code { background: #23272f; }
+  }
+  .wrap { max-width: 1000px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 16px; margin: 24px 0 8px; }
+  .muted { color: #666; }
+  .card { background: #fff; border: 1px solid #e2e5ea; border-radius: 10px; padding: 16px 18px; margin: 14px 0; }
+  .controls { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+  label { display: block; font-size: 12px; font-weight: 600; margin-bottom: 4px; }
+  select, input { padding: 6px 8px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; }
+  button { padding: 8px 14px; border: 1px solid #ccc; border-radius: 6px; background: #fff; cursor: pointer; font-size: 14px; font-weight: 600; }
+  button.primary { background: #2a6fdb; color: #fff; border-color: #2a6fdb; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  #stage { width: 800px; max-width: 100%; height: 500px; border: 1px solid #ccc; border-radius: 8px; overflow: hidden; position: relative; background: #e8e8e8; margin-top: 12px; }
+  #stage > div { width: 100%; height: 100%; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 6px 10px; border-bottom: 1px solid #e2e5ea; white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  th { background: #f0f2f5; font-size: 12px; }
+  .lib-rustyleaf { color: #e0393e; font-weight: 700; }
+  .lib-leaflet { color: #199900; font-weight: 700; }
+  .lib-maplibre { color: #2a6fdb; font-weight: 700; }
+  .status { font-family: ui-monospace, monospace; font-size: 13px; }
+  code { background: #eef1f4; padding: 1px 5px; border-radius: 4px; font-size: 12.5px; }
+  .win { font-weight: 700; }
+  ul { margin: 6px 0; padding-left: 20px; }
+  li { margin: 3px 0; }
+  a { color: #2a6fdb; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🍂 Rustyleaf benchmark</h1>
+  <p class="muted">Point-rendering throughput vs <span class="lib-leaflet">Leaflet</span> (canvas renderer) and
+     <span class="lib-maplibre">MapLibre GL</span>. Same points, same viewport, same scripted camera. Runs entirely in your browser.</p>
+
+  <div class="card">
+    <div class="controls">
+      <div>
+        <label>Points</label>
+        <select id="count">
+          <option>1000</option>
+          <option>10000</option>
+          <option selected>100000</option>
+          <option>500000</option>
+          <option>1000000</option>
+        </select>
+      </div>
+      <div>
+        <label>Library</label>
+        <select id="lib">
+          <option value="rustyleaf">Rustyleaf</option>
+          <option value="leaflet">Leaflet (canvas)</option>
+          <option value="maplibre">MapLibre GL</option>
+        </select>
+      </div>
+      <button id="run" class="primary">Run one</button>
+      <button id="runall">Run all (this count)</button>
+      <button id="sweep">Full sweep</button>
+      <button id="export">Export JSON</button>
+      <span id="status" class="status muted"></span>
+    </div>
+    <div id="stage"></div>
+  </div>
+
+  <h2>Results <span class="muted" style="font-weight:400">— best avg-FPS per row in bold. Higher FPS / lower ms is better.</span></h2>
+  <div class="card" style="overflow-x:auto">
+    <table id="results">
+      <thead>
+        <tr>
+          <th>Library</th><th>Points</th><th>Setup (ms)</th>
+          <th>Avg FPS</th><th>p95 frame (ms)</th><th>Worst frame (ms)</th><th>Frames</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">Methodology (so you can reproduce or challenge it)</h2>
+    <ul>
+      <li><strong>Same data:</strong> points are generated from a fixed seed (mulberry32), so every library renders the identical set at a given count.</li>
+      <li><strong>No basemap:</strong> tiles are disabled for all three, isolating point-rendering cost from network/tile work.</li>
+      <li><strong>Same viewport:</strong> 800×500 for every run.</li>
+      <li><strong>Same styling:</strong> filled circles, radius 3px, color <code>#e0393e</code>, no stroke.</li>
+      <li><strong>Scripted camera:</strong> continuous circular pan at fixed zoom 11 (~0.5&nbsp;Hz, ±0.015°), forcing a full redraw every frame.</li>
+      <li><strong>Measurement:</strong> 1s warmup (discarded) then a 5s window; FPS = 1000 / mean(frame interval). Frame-time percentiles come from the same interval samples.</li>
+      <li><strong>Leaflet</strong> uses <code>L.canvas()</code> + <code>L.circleMarker</code> (the fastest honest Leaflet approach; SVG is slower). Markers are inserted in async chunks with a 25s setup budget — if exceeded, the run is recorded as a setup timeout.</li>
+      <li><strong>MapLibre</strong> uses a GeoJSON source + a <code>circle</code> layer on a blank style.</li>
+      <li><strong>Rustyleaf</strong> uses <code>PointLayer.add()</code>.</li>
+    </ul>
+    <p class="muted">Numbers are hardware/browser specific — run it yourself. rAF caps FPS at your display's refresh rate (usually 60), so at light load libraries tie at ~60 and differentiate on <em>p95 / worst frame time</em>; at heavy load average FPS drops and separates them. This harness measures rendering throughput only — not features, ecosystem, or vector-tile support, where MapLibre and Leaflet are far more mature.</p>
+  </div>
+  <p class="muted" style="font-size:12px">Rustyleaf is pre-alpha v0.0.1 · <a href="../demo/">Demo</a> · <a href="https://github.com/mehdilhy/rustyleaf">GitHub</a></p>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script type="module">
+import { Map as RLMap, PointLayer } from '../dist/rustyleaf.bundle.js';
+
+const BASE_LAT = 48.8566, BASE_LNG = 2.3522, ZOOM = 11;
+const W = 800, H = 500;
+const WARMUP_MS = 1000, MEASURE_MS = 5000;
+const COLOR = '#e0393e', RADIUS = 3;
+
+const $ = (id) => document.getElementById(id);
+const stage = $('stage');
+const statusEl = $('status');
+const results = [];
+
+function setStatus(t) { statusEl.textContent = t; }
+
+// Deterministic RNG so every library renders identical points
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function generatePoints(n) {
+  const rnd = mulberry32(0x1234 ^ n);
+  const pts = new Array(n);
+  for (let i = 0; i < n; i++) {
+    // clustered scatter around Paris, kept mostly on-screen at zoom 11
+    const r = Math.pow(rnd(), 2) * 0.35;
+    const a = rnd() * Math.PI * 2;
+    pts[i] = { lat: BASE_LAT + Math.sin(a) * r * 0.6, lng: BASE_LNG + Math.cos(a) * r };
+  }
+  return pts;
+}
+
+// Camera path shared by all adapters
+function cameraAt(tMs) {
+  const ang = (tMs / 1000) * Math.PI; // 0.5 Hz
+  return { lat: BASE_LAT + Math.sin(ang) * 0.015, lng: BASE_LNG + Math.cos(ang) * 0.015 };
+}
+
+function makeStageChild() {
+  stage.innerHTML = '';
+  const d = document.createElement('div');
+  stage.appendChild(d);
+  return d;
+}
+
+function percentile(sorted, p) {
+  if (!sorted.length) return 0;
+  const idx = Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length));
+  return sorted[idx];
+}
+
+// ---------- adapters ----------
+const adapters = {
+  async rustyleaf(points) {
+    const el = makeStageChild();
+    const t0 = performance.now();
+    const map = new RLMap(el, { center: [BASE_LAT, BASE_LNG], zoom: ZOOM });
+    const layer = new PointLayer();
+    layer.add(points.map(p => ({ lat: p.lat, lng: p.lng, size: RADIUS * 2, color: COLOR })));
+    layer.addTo(map);
+    const setupMs = performance.now() - t0;
+    return {
+      setupMs,
+      setCamera(t) { const c = cameraAt(t); map.setView([c.lat, c.lng], ZOOM); },
+      teardown() { try { map.destroy(); } catch (e) {} el.remove(); },
+    };
+  },
+
+  async leaflet(points) {
+    const el = makeStageChild();
+    const t0 = performance.now();
+    const map = L.map(el, { renderer: L.canvas(), preferCanvas: true, zoomControl: false,
+      attributionControl: false, fadeAnimation: false, zoomAnimation: false, markerZoomAnimation: false })
+      .setView([BASE_LAT, BASE_LNG], ZOOM);
+    const group = L.layerGroup().addTo(map);
+
+    // Chunked insert with a wall-clock budget so the tab stays responsive and
+    // "Leaflet can't practically do this" is recorded honestly rather than hanging.
+    const BUDGET_MS = 25000, CHUNK = 20000;
+    let i = 0, timedOut = false;
+    await new Promise((resolve) => {
+      function step() {
+        const end = Math.min(points.length, i + CHUNK);
+        for (; i < end; i++) {
+          L.circleMarker([points[i].lat, points[i].lng],
+            { radius: RADIUS, color: COLOR, fillColor: COLOR, fillOpacity: 0.85, stroke: false, weight: 0 }).addTo(group);
+        }
+        if (i >= points.length) return resolve();
+        if (performance.now() - t0 > BUDGET_MS) { timedOut = true; return resolve(); }
+        setTimeout(step, 0);
+      }
+      step();
+    });
+    const setupMs = performance.now() - t0;
+    return {
+      setupMs, timedOut, inserted: i, total: points.length,
+      setCamera(t) { const c = cameraAt(t); map.setView([c.lat, c.lng], ZOOM, { animate: false }); },
+      teardown() { try { map.remove(); } catch (e) {} el.remove(); },
+    };
+  },
+
+  async maplibre(points) {
+    const el = makeStageChild();
+    const t0 = performance.now();
+    const geojson = {
+      type: 'FeatureCollection',
+      features: points.map(p => ({ type: 'Feature', geometry: { type: 'Point', coordinates: [p.lng, p.lat] }, properties: {} })),
+    };
+    const map = new maplibregl.Map({
+      container: el, center: [BASE_LNG, BASE_LAT], zoom: ZOOM, attributionControl: false, fadeDuration: 0,
+      style: { version: 8, sources: {}, layers: [{ id: 'bg', type: 'background', paint: { 'background-color': '#e8e8e8' } }] },
+    });
+    await new Promise((res) => map.on('load', res));
+    map.addSource('pts', { type: 'geojson', data: geojson });
+    map.addLayer({ id: 'pts', type: 'circle', source: 'pts',
+      paint: { 'circle-radius': RADIUS, 'circle-color': COLOR } });
+    await new Promise((res) => map.once('idle', res));
+    const setupMs = performance.now() - t0;
+    return {
+      setupMs,
+      setCamera(t) { const c = cameraAt(t); map.jumpTo({ center: [c.lng, c.lat], zoom: ZOOM }); },
+      teardown() { try { map.remove(); } catch (e) {} el.remove(); },
+    };
+  },
+};
+
+async function measure(adapter) {
+  return new Promise((resolve) => {
+    const intervals = [];
+    let last = performance.now();
+    const start = last;
+    function frame(now) {
+      const dt = now - last; last = now;
+      const t = now - start;
+      adapter.setCamera(t);
+      if (t > WARMUP_MS) intervals.push(dt);
+      if (t < WARMUP_MS + MEASURE_MS) requestAnimationFrame(frame);
+      else {
+        const sorted = [...intervals].sort((a, b) => a - b);
+        const mean = intervals.reduce((s, x) => s + x, 0) / (intervals.length || 1);
+        resolve({
+          avgFps: 1000 / mean,
+          p95Frame: percentile(sorted, 95),
+          worstFrame: sorted.length ? sorted[sorted.length - 1] : 0,
+          frames: intervals.length,
+        });
+      }
+    }
+    requestAnimationFrame(frame);
+  });
+}
+
+function addResult(row) {
+  results.push(row);
+  const tbody = $('results').querySelector('tbody');
+  const tr = document.createElement('tr');
+  // Built with textContent (never innerHTML): benchmark labels/notes flow
+  // into the DOM as text so markup in them cannot execute (CodeQL xss-through-dom).
+  const textCell = (value) => {
+    const td = document.createElement('td');
+    td.textContent = value;
+    return td;
+  };
+  const libCell = document.createElement('td');
+  const libBadge = document.createElement('span');
+  libBadge.className = `lib-${String(row.lib).replace(/[^a-z]/gi, '')}`;
+  libBadge.textContent = row.libLabel;
+  libCell.appendChild(libBadge);
+  tr.appendChild(libCell);
+  tr.appendChild(textCell(row.count.toLocaleString()));
+  const setupCell = document.createElement('td');
+  setupCell.textContent = String(Math.round(row.setupMs).toLocaleString());
+  if (row.note) {
+    const noteSpan = document.createElement('span');
+    noteSpan.className = 'muted';
+    noteSpan.textContent = ` (${row.note})`;
+    setupCell.appendChild(noteSpan);
+  }
+  tr.appendChild(setupCell);
+  tr.appendChild(textCell(row.avgFps != null ? row.avgFps.toFixed(1) : '—'));
+  tr.appendChild(textCell(row.p95Frame != null ? row.p95Frame.toFixed(1) : '—'));
+  tr.appendChild(textCell(row.worstFrame != null ? row.worstFrame.toFixed(1) : '—'));
+  tr.appendChild(textCell(row.frames == null ? '—' : String(row.frames)));
+  tbody.appendChild(tr);
+  highlightWinners();
+}
+
+function highlightWinners() {
+  // bold the best avg FPS among rows sharing the same count
+  const rows = $('results').querySelectorAll('tbody tr');
+  const byCount = {};
+  results.forEach((r, i) => { (byCount[r.count] ||= []).push(i); });
+  results.forEach((r) => { r._win = false; });
+  Object.values(byCount).forEach((idxs) => {
+    let best = -1, bestVal = -1;
+    idxs.forEach((i) => { if ((results[i].avgFps ?? -1) > bestVal) { bestVal = results[i].avgFps ?? -1; best = i; } });
+    if (best >= 0) results[best]._win = true;
+  });
+  rows.forEach((tr, i) => { tr.children[3].classList.toggle('win', !!results[i]?._win); });
+}
+
+const LABELS = { rustyleaf: 'Rustyleaf', leaflet: 'Leaflet', maplibre: 'MapLibre' };
+
+async function runOne(lib, count) {
+  setStatus(`${LABELS[lib]} @ ${count.toLocaleString()} — generating…`);
+  await new Promise(r => setTimeout(r, 30));
+  const points = generatePoints(count);
+  setStatus(`${LABELS[lib]} @ ${count.toLocaleString()} — setup…`);
+  let adapter;
+  try {
+    adapter = await adapters[lib](points);
+  } catch (e) {
+    addResult({ lib, libLabel: LABELS[lib], count, setupMs: 0, note: 'error: ' + e.message });
+    setStatus('error: ' + e.message);
+    return;
+  }
+  let note = null, stats = null;
+  if (adapter.timedOut) {
+    note = `setup budget exceeded — inserted ${adapter.inserted.toLocaleString()}/${adapter.total.toLocaleString()}`;
+  }
+  setStatus(`${LABELS[lib]} @ ${count.toLocaleString()} — measuring…`);
+  stats = await measure(adapter);
+  addResult({ lib, libLabel: LABELS[lib], count, setupMs: adapter.setupMs, note, ...stats });
+  adapter.teardown();
+  setStatus('done');
+  await new Promise(r => setTimeout(r, 200));
+}
+
+async function withButtonsDisabled(fn) {
+  const btns = document.querySelectorAll('button');
+  btns.forEach(b => b.disabled = true);
+  try { await fn(); } finally { btns.forEach(b => b.disabled = false); }
+}
+
+$('run').onclick = () => withButtonsDisabled(() => runOne($('lib').value, Number($('count').value)));
+$('runall').onclick = () => withButtonsDisabled(async () => {
+  const count = Number($('count').value);
+  for (const lib of ['rustyleaf', 'leaflet', 'maplibre']) await runOne(lib, count);
+});
+$('sweep').onclick = () => withButtonsDisabled(async () => {
+  for (const count of [1000, 10000, 100000, 500000, 1000000]) {
+    for (const lib of ['rustyleaf', 'leaflet', 'maplibre']) await runOne(lib, count);
+  }
+});
+$('export').onclick = () => {
+  const blob = new Blob([JSON.stringify({ ua: navigator.userAgent, when: new Date().toISOString(), results }, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = 'rustyleaf-benchmark.json'; a.click();
+};
+
+window.__runOne = runOne;      // for automated harness
+window.__results = results;
+setStatus('ready');
+</script>
+</body>
+</html>

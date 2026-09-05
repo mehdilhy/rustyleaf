@@ -19,13 +19,19 @@ module.exports = {
   module: {
     rules: [
       {
+        // The wasm is fetched at runtime via `new URL(..., import.meta.url)`
+        // in rustyleaf-api.js. Emit it as a plain asset with a stable name so
+        // exactly one WASM instance exists (webassembly/async would create a
+        // second, racing instance).
         test: /\.wasm$/,
-        type: 'webassembly/async',
+        type: 'asset/resource',
+        generator: {
+          filename: 'rustyleaf_core_bg.wasm',
+        },
       },
     ],
   },
   experiments: {
-    asyncWebAssembly: true,
     outputModule: true,
   },
 };

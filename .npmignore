@@ -1,0 +1,3 @@
+# npmignore fallback — when present, .gitignore is NOT used as npm fallback.
+# The whitelist is controlled by "files" in package.json.
+# We only need this file to exist so npm stops falling back to .gitignore.

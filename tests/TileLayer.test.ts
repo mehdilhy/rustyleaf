@@ -75,11 +75,11 @@ describe('TileLayer', () => {
     test('should handle null map', () => {
       const urlTemplate = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
       const tileLayer = new TileLayer(urlTemplate);
-      
-      // The current implementation will throw an error when trying to access wasmMap on null
+
+      // Guarded: addTo(null) is a silent no-op (same as a wasmMap-less map)
       expect(() => {
         tileLayer.addTo(null as any);
-      }).toThrow("Cannot read properties of null (reading 'wasmMap')");
+      }).not.toThrow();
     });
   });
 
@@ -183,7 +183,7 @@ describe('TileLayer', () => {
       const urlTemplate = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
       
       // Mock the WASM module to throw an error
-      const { TileLayerApi } = require('../dist/rustyleaf_core_bg.js');
+      require('../dist/rustyleaf_core_bg.js');
       
       // Since we're using mocked WASM, this test should validate that the mock works
       // The actual error handling is tested by the fact that we can create a TileLayer

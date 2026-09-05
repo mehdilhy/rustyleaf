@@ -127,9 +127,10 @@ describe('GeoJSONLayer', () => {
       const geojsonString = '{"type":"FeatureCollection","features":[]}';
       
       const result = geojsonLayer.loadData(geojsonString);
-      
+
       expect(result).toBe(geojsonLayer);
-      expect(geojsonLayer.geojson).toBe(geojsonString);
+      // String input is normalized to a parsed object (the string goes to WASM)
+      expect(geojsonLayer.geojson).toEqual(JSON.parse(geojsonString));
     });
 
     test('should replace existing GeoJSON data', () => {
@@ -386,6 +387,8 @@ describe('GeoJSONLayer', () => {
     test('should process chunk when map is available', () => {
       const geojsonLayer = new GeoJSONLayer();
       const mockMap = {
+        on: jest.fn(),
+        off: jest.fn(),
         wasmMap: {
           load_geojson_chunk: jest.fn()
         }
@@ -405,6 +408,8 @@ describe('GeoJSONLayer', () => {
     test('should handle processing errors gracefully', () => {
       const geojsonLayer = new GeoJSONLayer();
       const mockMap = {
+        on: jest.fn(),
+        off: jest.fn(),
         wasmMap: {
           load_geojson_chunk: jest.fn().mockImplementation(() => {
             throw new Error('Processing error');
@@ -438,6 +443,8 @@ describe('GeoJSONLayer', () => {
     test('should return feature count from map', () => {
       const geojsonLayer = new GeoJSONLayer();
       const mockMap = {
+        on: jest.fn(),
+        off: jest.fn(),
         wasmMap: {
           get_geojson_feature_count: jest.fn().mockReturnValue(42)
         }
@@ -454,6 +461,8 @@ describe('GeoJSONLayer', () => {
     test('should handle WASM errors gracefully', () => {
       const geojsonLayer = new GeoJSONLayer();
       const mockMap = {
+        on: jest.fn(),
+        off: jest.fn(),
         wasmMap: {
           get_geojson_feature_count: jest.fn().mockImplementation(() => {
             throw new Error('WASM error');
@@ -498,6 +507,8 @@ describe('GeoJSONLayer', () => {
     test('should update style on map when available', () => {
       const geojsonLayer = new GeoJSONLayer();
       const mockMap = {
+        on: jest.fn(),
+        off: jest.fn(),
         wasmMap: {
           set_geojson_style: jest.fn()
         }
@@ -518,6 +529,8 @@ describe('GeoJSONLayer', () => {
     test('should update style on map', () => {
       const geojsonLayer = new GeoJSONLayer();
       const mockMap = {
+        on: jest.fn(),
+        off: jest.fn(),
         wasmMap: {
           set_geojson_style: jest.fn()
         }
@@ -553,6 +566,8 @@ describe('GeoJSONLayer', () => {
       });
       
       const mockMap = {
+        on: jest.fn(),
+        off: jest.fn(),
         wasmMap: {
           add_geojson_layer: jest.fn(() => 0),
           load_geojson: jest.fn(),
@@ -575,6 +590,8 @@ describe('GeoJSONLayer', () => {
       const geojsonLayer = new GeoJSONLayer();
       
       const mockMap = {
+        on: jest.fn(),
+        off: jest.fn(),
         wasmMap: {
           add_geojson_layer: jest.fn(() => 1),
           load_geojson: jest.fn()
@@ -582,9 +599,10 @@ describe('GeoJSONLayer', () => {
       };
       
       const result = geojsonLayer.addTo(mockMap as any);
-      
+
       expect(result).toBe(geojsonLayer);
       expect(geojsonLayer.map).toBe(mockMap);
+      // The layer index comes from the WASM core's add_geojson_layer return value
       expect(geojsonLayer.layerIndex).toBe(1);
       expect(mockMap.wasmMap.add_geojson_layer).toHaveBeenCalled();
       expect(mockMap.wasmMap.load_geojson).not.toHaveBeenCalled();
@@ -595,6 +613,8 @@ describe('GeoJSONLayer', () => {
       const geojsonLayer = new GeoJSONLayer(geojsonString);
       
       const mockMap = {
+        on: jest.fn(),
+        off: jest.fn(),
         wasmMap: {
           add_geojson_layer: jest.fn(() => 0),
           load_geojson: jest.fn(),
@@ -613,7 +633,7 @@ describe('GeoJSONLayer', () => {
       
       expect(() => {
         geojsonLayer.addTo(mockMap as any);
-      }).toThrow("Cannot read properties of undefined (reading 'add_geojson_layer')");
+      }).toThrow('Cannot read properties of undefined (reading \'add_geojson_layer\')');
     });
   });
 
@@ -661,15 +681,21 @@ describe('GeoJSONLayer', () => {
   });
 
   describe('remove method', () => {
-    test('should remove layer from map', () => {
+    test('should hide the wasm layer and keep the map reference for re-adding', () => {
       const geojsonLayer = new GeoJSONLayer();
-      const mockMap = {};
+      const mockMap = {
+        on: jest.fn(),
+        off: jest.fn(),
+        wasmMap: { set_geojson_layer_visible: jest.fn() }
+      };
       geojsonLayer.map = mockMap;
-      
+      geojsonLayer.layerIndex = 3;
+
       const result = geojsonLayer.remove();
-      
+
       expect(result).toBe(geojsonLayer); // Method chaining
-      expect(geojsonLayer.map).toBeNull();
+      expect(mockMap.wasmMap.set_geojson_layer_visible).toHaveBeenCalledWith(3, false);
+      expect(geojsonLayer.map).toBe(mockMap); // kept so addTo() can re-show
     });
 
     test('should handle remove when not on map', () => {
@@ -801,7 +827,7 @@ describe('GeoJSONLayer', () => {
           type: 'MultiPolygon',
           coordinates: [[
             [[-74.0060, 40.7128], [-73.9851, 40.7589],
-             [-74.0445, 40.6892], [-74.0060, 40.7128]]
+              [-74.0445, 40.6892], [-74.0060, 40.7128]]
           ]]
         }
       ];
@@ -844,6 +870,8 @@ describe('GeoJSONLayer', () => {
     test('should clear WASM layer when on map', () => {
       const geojsonLayer = new GeoJSONLayer();
       const mockMap = {
+        on: jest.fn(),
+        off: jest.fn(),
         wasmMap: {
           clear_geojson_layer: jest.fn()
         }
@@ -863,6 +891,8 @@ describe('GeoJSONLayer', () => {
     test('should handle WASM clearing errors gracefully', () => {
       const geojsonLayer = new GeoJSONLayer();
       const mockMap = {
+        on: jest.fn(),
+        off: jest.fn(),
         wasmMap: {
           clear_geojson_layer: jest.fn().mockImplementation(() => {
             throw new Error('Clearing error');
@@ -901,6 +931,8 @@ describe('GeoJSONLayer', () => {
     test('should support extensive method chaining', () => {
       const geojsonLayer = new GeoJSONLayer();
       const mockMap = {
+        on: jest.fn(),
+        off: jest.fn(),
         wasmMap: {
           add_geojson_layer: jest.fn(() => 0),
           load_geojson: jest.fn(),

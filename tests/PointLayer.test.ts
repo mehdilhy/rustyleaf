@@ -73,11 +73,11 @@ describe('PointLayer', () => {
       
       expect(() => {
         pointLayer.add(null as any);
-      }).toThrow("Cannot read properties of null (reading 'map')");
+      }).toThrow('PointLayer.add expects an array of points');
       
       expect(() => {
         pointLayer.add(undefined as any);
-      }).toThrow("Cannot read properties of undefined (reading 'map')");
+      }).toThrow('PointLayer.add expects an array of points');
     });
   });
 
@@ -169,7 +169,8 @@ describe('PointLayer', () => {
       const mockMap = {
         wasmMap: {
           add_point_layer: jest.fn(() => 0),
-          add_points: jest.fn()
+          add_points: jest.fn(),
+          clear_points: jest.fn()
         }
       };
       
@@ -202,7 +203,7 @@ describe('PointLayer', () => {
       
       expect(() => {
         pointLayer.addTo(mockMap as any);
-      }).toThrow("Cannot read properties of undefined (reading 'add_point_layer')");
+      }).toThrow('Cannot read properties of undefined (reading \'add_point_layer\')');
     });
   });
 
@@ -268,7 +269,8 @@ describe('PointLayer', () => {
       const mockMap = {
         wasmMap: {
           add_point_layer: jest.fn(() => 0),
-          add_points: jest.fn()
+          add_points: jest.fn(),
+          clear_points: jest.fn()
         }
       };
       
@@ -302,19 +304,80 @@ describe('PointLayer', () => {
     test('should handle WASM method call errors', () => {
       const pointLayer = new PointLayer();
       const points = [{ lat: 40.7128, lng: -74.0060 }];
-      
-      // Mock WASM method error
-      const originalAdd = pointLayer.wasmPointLayer.add;
-      pointLayer.wasmPointLayer.add = jest.fn(() => {
-        throw new Error('WASM add failed');
-      });
-      
+      const mockMap = {
+        wasmMap: {
+          add_point_layer: jest.fn(() => 0),
+          add_points: jest.fn(),
+          append_points: jest.fn(() => { throw new Error('WASM add failed'); })
+        }
+      };
+      pointLayer.addTo(mockMap as any);
+
       expect(() => {
         pointLayer.add(points);
       }).toThrow('WASM add failed');
-      
-      // Restore original
-      pointLayer.wasmPointLayer.add = originalAdd;
+    });
+
+    test('should release JS point references after mounting', () => {
+      const pointLayer = new PointLayer();
+      pointLayer.add([{ lat: 40.7128, lng: -74.0060 }]);
+      const mockMap = {
+        wasmMap: {
+          add_point_layer: jest.fn(() => 0),
+          add_points: jest.fn(),
+          append_points: jest.fn()
+        }
+      };
+
+      pointLayer.addTo(mockMap as any);
+      expect(pointLayer.points).toHaveLength(0);
+      pointLayer.add([{ lat: 40.7589, lng: -73.9851 }]);
+      expect(pointLayer.points).toHaveLength(0);
+      expect(mockMap.wasmMap.append_points).toHaveBeenCalledTimes(1);
+    });
+
+    test('should validate and upload packed point data', () => {
+      const pointLayer = new PointLayer();
+      const mockMap = {
+        wasmMap: {
+          add_point_layer: jest.fn(() => 0),
+          add_points: jest.fn(),
+          add_points_packed: jest.fn()
+        }
+      };
+      pointLayer.addTo(mockMap as any);
+      const packed = new Float32Array([40.7128, -74.0060, 3, 1, 0, 0, 1]);
+
+      expect(pointLayer.addPacked(packed)).toBe(pointLayer);
+      expect(mockMap.wasmMap.add_points_packed).toHaveBeenCalledWith(0, packed);
+      expect(() => pointLayer.addPacked(new Float32Array(6))).toThrow(
+        'Packed point data length must be divisible by 7'
+      );
+      expect(() => pointLayer.addPacked([] as any)).toThrow(
+        'PointLayer.addPacked expects a Float32Array'
+      );
+    });
+
+    test('appendPacked streams a batch via the wasm append path', () => {
+      const pointLayer = new PointLayer();
+      const mockMap = {
+        wasmMap: {
+          add_point_layer: jest.fn(() => 0),
+          add_points: jest.fn(),
+          append_points_packed: jest.fn()
+        }
+      };
+      pointLayer.addTo(mockMap as any);
+      const packed = new Float32Array([40.7128, -74.0060, 3, 1, 0, 0, 1]);
+
+      expect(pointLayer.appendPacked(packed)).toBe(pointLayer);
+      expect(mockMap.wasmMap.append_points_packed).toHaveBeenCalledWith(0, packed);
+      expect(() => pointLayer.appendPacked(new Float32Array(6))).toThrow(
+        'Packed point data length must be divisible by 7'
+      );
+      expect(() => pointLayer.appendPacked([] as any)).toThrow(
+        'PointLayer.appendPacked expects a Float32Array'
+      );
     });
   });
 });

@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Rustyleaf — Visual Regression</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #111; display: flex; justify-content: center; align-items: center; height: 100vh; }
+  #map { width: 800px; height: 600px; }
+  #status { position: absolute; top: 10px; left: 10px; color: #0f0; font: 12px monospace; display: none; }
+</style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="status"></div>
+  <script type="module">
+    import { Map, PointLayer, LineLayer, PolygonLayer, GeoJSONLayer, TileLayer, Popup } from "../../src/rustyleaf-api.js";
+
+    window.__rustyleafExports = { Map, PointLayer, LineLayer, PolygonLayer, GeoJSONLayer, TileLayer, Popup };
+
+    try {
+      const container = document.getElementById('map');
+      const map = new Map(container, { center: [48.8566, 2.3522], zoom: 13 });
+
+      window.__map = map;
+
+      const pointLayer = new PointLayer();
+      pointLayer.add([
+        { lat: 48.8584, lng: 2.2945, size: 10, color: '#ff0000' },
+        { lat: 48.8606, lng: 2.3376, size: 8,  color: '#ff0000' },
+        { lat: 48.8530, lng: 2.3499, size: 6,  color: '#00ff00' },
+      ]);
+      pointLayer.addTo(map);
+
+      const lineLayer = new LineLayer();
+      lineLayer.add([
+        { coords: [[48.8584, 2.2945], [48.8606, 2.3376]], color: '#00ffff', width: 3 },
+        { coords: [[48.8606, 2.3376], [48.8530, 2.3499]], color: '#ff00ff', width: 2 },
+      ]);
+      lineLayer.addTo(map);
+
+      const polygonLayer = new PolygonLayer();
+      polygonLayer.add([
+        {
+          rings: [[
+            [48.8650, 2.3200], [48.8650, 2.3400],
+            [48.8550, 2.3400], [48.8550, 2.3200],
+            [48.8650, 2.3200]
+          ]],
+          color: '#ff660080'
+        },
+      ]);
+      polygonLayer.addTo(map);
+
+      const geojsonLayer = new GeoJSONLayer(null, {
+        pointColor: '#ffff00',
+        pointSize: 8,
+        lineColor: '#00ffff',
+        lineWidth: 3,
+        polygonColor: '#ff00ff80',
+      });
+      geojsonLayer.addTo(map);
+
+      geojsonLayer.loadData({
+        type: "FeatureCollection",
+        features: [
+          {
+            type: "Feature",
+            properties: { name: "Notre-Dame" },
+            geometry: { type: "Point", coordinates: [2.3499, 48.8530] }
+          },
+          {
+            type: "Feature",
+            properties: { name: "Seine segment" },
+            geometry: {
+              type: "LineString",
+              coordinates: [[2.2900,48.8520],[2.3600,48.8480]]
+            }
+          },
+          {
+            type: "Feature",
+            properties: { name: "Small square" },
+            geometry: {
+              type: "Polygon",
+              coordinates: [[
+                [2.3370,48.8620],[2.3420,48.8620],[2.3420,48.8590],
+                [2.3370,48.8590],[2.3370,48.8620]
+              ]]
+            }
+          }
+        ]
+      });
+
+      let readyFrames = 0;
+      function checkReady() {
+        readyFrames++;
+        if (readyFrames >= 20) {
+          window.__rustyleafReady = true;
+          document.getElementById('status').textContent = 'READY';
+        } else {
+          requestAnimationFrame(checkReady);
+        }
+      }
+      requestAnimationFrame(checkReady);
+    } catch (err) {
+      document.getElementById('status').textContent = 'ERROR: ' + err.message;
+      document.getElementById('status').style.display = 'block';
+    }
+  </script>
+</body>
+</html>
