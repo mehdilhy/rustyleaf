@@ -36,7 +36,7 @@ const server = http.createServer((req, res) => {
     res.end(data);
   } catch (e) {
     try { res.writeHead(500); res.end('Internal error'); } catch {}
-    console.error(`[serve] error serving ${req.url}:`, e.message);
+    console.error('[serve] error serving %s: %s', req.url, e.message);
   }
 });
 

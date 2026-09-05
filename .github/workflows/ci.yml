@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege: jobs only read the repo, except e2e which uploads
+# failure artifacts (granted per-job below).
+permissions:
+  contents: read
+
 jobs:
   rust:
     name: Rust (check + test + clippy)
@@ -69,6 +74,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      actions: write # upload-artifact on failure
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

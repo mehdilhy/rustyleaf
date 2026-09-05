@@ -4988,7 +4988,10 @@ const Util = {
   },
 
   template(str, data) {
-    return str.replace(/\{ *([\w_ -]+) *\}/g, (match, key) => {
+    // Note: the key class intentionally excludes spaces (Leaflet-upstream
+    // shape). Allowing spaces inside the class next to the padding ` *`
+    // made this polynomial (ReDoS) on inputs like '{{    '.
+    return str.replace(/\{ *([\w_-]+) *\}/g, (match, key) => {
       let value = data[key];
       if (value === undefined) throw new Error('No value provided for variable ' + match);
       if (typeof value === 'function') value = value(data);

@@ -280,15 +280,33 @@ function addResult(row) {
   results.push(row);
   const tbody = $('results').querySelector('tbody');
   const tr = document.createElement('tr');
-  const note = row.note ? ` <span class="muted">(${row.note})</span>` : '';
-  tr.innerHTML = `
-    <td><span class="lib-${row.lib}">${row.libLabel}</span></td>
-    <td>${row.count.toLocaleString()}</td>
-    <td>${Math.round(row.setupMs).toLocaleString()}${note}</td>
-    <td>${row.avgFps != null ? row.avgFps.toFixed(1) : '—'}</td>
-    <td>${row.p95Frame != null ? row.p95Frame.toFixed(1) : '—'}</td>
-    <td>${row.worstFrame != null ? row.worstFrame.toFixed(1) : '—'}</td>
-    <td>${row.frames ?? '—'}</td>`;
+  // Built with textContent (never innerHTML): benchmark labels/notes flow
+  // into the DOM as text so markup in them cannot execute (CodeQL xss-through-dom).
+  const textCell = (value) => {
+    const td = document.createElement('td');
+    td.textContent = value;
+    return td;
+  };
+  const libCell = document.createElement('td');
+  const libBadge = document.createElement('span');
+  libBadge.className = `lib-${String(row.lib).replace(/[^a-z]/gi, '')}`;
+  libBadge.textContent = row.libLabel;
+  libCell.appendChild(libBadge);
+  tr.appendChild(libCell);
+  tr.appendChild(textCell(row.count.toLocaleString()));
+  const setupCell = document.createElement('td');
+  setupCell.textContent = String(Math.round(row.setupMs).toLocaleString());
+  if (row.note) {
+    const noteSpan = document.createElement('span');
+    noteSpan.className = 'muted';
+    noteSpan.textContent = ` (${row.note})`;
+    setupCell.appendChild(noteSpan);
+  }
+  tr.appendChild(setupCell);
+  tr.appendChild(textCell(row.avgFps != null ? row.avgFps.toFixed(1) : '—'));
+  tr.appendChild(textCell(row.p95Frame != null ? row.p95Frame.toFixed(1) : '—'));
+  tr.appendChild(textCell(row.worstFrame != null ? row.worstFrame.toFixed(1) : '—'));
+  tr.appendChild(textCell(row.frames == null ? '—' : String(row.frames)));
   tbody.appendChild(tr);
   highlightWinners();
 }
