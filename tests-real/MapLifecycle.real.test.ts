@@ -33,12 +33,9 @@ function makeMap(): any {
 const flushMicrotasks = () => Promise.resolve();
 
 describe('Map lifecycle (real source)', () => {
-  let warnSpy: jest.SpyInstance;
-  let logSpy: jest.SpyInstance;
-
   beforeEach(() => {
-    warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
-    logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    jest.spyOn(console, 'log').mockImplementation(() => {});
   });
 
   afterEach(() => {

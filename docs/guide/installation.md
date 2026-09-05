@@ -1,6 +1,6 @@
 # Installation
 
-Rustyleaf is published on npm as a pre-alpha package. It ships an ES module
+Rustyleaf is published on npm as a compatibility-preview package (v0.0.8). It ships an ES module
 bundle with the WASM inlined via async loading, so it works out of the box with
 Vite, Webpack 5, and other bundlers that support async WebAssembly. **No
 runtime dependencies.**

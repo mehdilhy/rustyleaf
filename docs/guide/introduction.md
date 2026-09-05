@@ -23,11 +23,11 @@ for datasets that DOM-based maps can't handle.
 
 ## What it is not
 
-Rustyleaf is **not** a drop-in Leaflet replacement (yet). It is pre-alpha
-(v0.0.1), the API is unstable until 0.1.0, and several Leaflet features are
-missing. It is, however, honestly documented: everything listed in these docs
-works today and is covered by unit and end-to-end tests. See
-[FAQ & Limitations](/faq) for the current gaps.
+Rustyleaf is a **Leaflet-compatible workflow layer**, not a promise that every
+Leaflet plugin will work unchanged. In v0.0.8, tuple inputs remain valid while
+`LatLng`, `LatLngBounds`, `Point`, `Bounds`, and factory functions expose the
+methods Leaflet applications commonly use. The WebGL2 renderer and plugin
+ecosystem still have explicit gaps; see [FAQ & Limitations](/faq).
 
 ## Browser support
 

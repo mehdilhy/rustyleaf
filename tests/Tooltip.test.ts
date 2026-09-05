@@ -98,7 +98,7 @@ describe('Tooltip feature', () => {
   describe('Binding to a marker', () => {
     test('bindTooltip stores content and returns this', () => {
       const marker = new Marker([48.8566, 2.3522], { icon: new Icon({ iconUrl: 'x.png' }) });
-      const t = new Tooltip({ content: 'tip' });
+      new Tooltip({ content: 'tip' });
       expect(marker.bindTooltip('tip')).toBe(marker);
       expect(marker.getTooltipContent()).toBe('tip');
     });

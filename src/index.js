@@ -1,7 +1,6 @@
-// ⚠️ Rustyleaf is pre-alpha (v0.0.1): the API will change without notice.
-// See README.md "Known limitations" for what works today and what doesn't.
-
-console.warn('Rustyleaf v0.0.1 is pre-alpha: the API is unstable and not production-ready. See the README for known limitations.');
+// Public package entry point. The compatibility surface is versioned from
+// package.json; keep module evaluation side-effect free so applications and
+// SSR bundlers can import Rustyleaf without a release-status warning.
 
 // WASM initialization happens in rustyleaf-api.js (single fetch + instantiate,
 // resolved relative to the bundle URL). Do NOT also import dist/rustyleaf_core.js

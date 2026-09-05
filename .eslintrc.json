@@ -22,17 +22,38 @@
     "linebreak-style": ["warn", "unix"],
     "quotes": ["error", "single"],
     "semi": ["error", "always"],
-    "no-unused-vars": "warn",
+    "no-unused-vars": ["warn", { "argsIgnorePattern": "^_", "caughtErrors": "none" }],
     "no-console": "off",
     "no-undef": "warn",
     "no-unused-expressions": "off",
     "@typescript-eslint/no-unused-expressions": "off",
     "@typescript-eslint/no-require-imports": "off",
-    "@typescript-eslint/no-unused-vars": "warn",
+    "@typescript-eslint/no-unused-vars": ["warn", { "argsIgnorePattern": "^_", "caughtErrors": "none" }],
     "@typescript-eslint/no-explicit-any": "warn"
   },
-  "ignorePatterns": ["dist/", "node_modules/", "coverage/", "*.wasm", "e2e/"],
+  "ignorePatterns": ["dist/", "core/pkg/", "node_modules/", "coverage/", "*.wasm", "e2e/"],
   "overrides": [
+    {
+      "files": ["**/*.ts", "**/*.mts"],
+      "rules": {
+        "no-unused-vars": "off"
+      }
+    },
+    {
+      "files": ["**/*.d.ts"],
+      "rules": {
+        "no-unused-vars": "off",
+        "@typescript-eslint/no-unused-vars": "off",
+        "@typescript-eslint/no-explicit-any": "off",
+        "no-undef": "off"
+      }
+    },
+    {
+      "files": ["tests/**/*.ts", "tests/**/*.js", "tests-real/**/*.ts", "tests-real/**/*.js"],
+      "rules": {
+        "@typescript-eslint/no-explicit-any": "off"
+      }
+    },
     {
       "files": ["scripts/**/*.js", "webpack.config.js", "jest.config.js", "*.cjs", "tests/**/*"],
       "rules": {

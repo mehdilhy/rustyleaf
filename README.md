@@ -12,13 +12,13 @@
 <p align="center">
   <a href="https://www.npmjs.com/package/rustyleaf"><img src="https://img.shields.io/npm/v/rustyleaf" alt="npm version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
-  <img src="https://img.shields.io/badge/status-pre--alpha-orange" alt="pre-alpha">
+  <img src="https://img.shields.io/badge/status-compatibility--preview-orange" alt="compatibility preview">
   <img src="https://img.shields.io/badge/webgl2-required-important" alt="WebGL2 required">
 </p>
 
 <p align="center">
   <a href="https://github.com/mehdilhy/rustyleaf/actions"><img src="https://img.shields.io/github/actions/workflow/status/mehdilhy/rustyleaf/ci.yml?branch=main&label=CI" alt="CI"></a>
-  <img src="https://img.shields.io/badge/tests-798%20passing-brightgreen" alt="tests passing">
+  <img src="https://img.shields.io/badge/tests-823%20passing-brightgreen" alt="tests passing">
   <img src="https://img.shields.io/badge/coverage-100%25%20lines-success" alt="coverage: 100% lines">
   <img src="https://img.shields.io/badge/coverage-95.3%25%20branches-brightgreen" alt="coverage: 95.3% branches">
   <img src="https://img.shields.io/badge/clippy-D%20warnings%20clean-success" alt="clippy clean">
@@ -33,7 +33,10 @@
   <img src="https://img.shields.io/badge/wasm%20core-1.5MB-8A2BE2" alt="wasm core 1.5MB">
 </p>
 
-> ⚠️ **Pre-alpha (v0.0.2).** The API will change without notice and this is not production-ready. It is, however, honestly documented: everything listed below works today and is covered by unit and end-to-end tests.
+> **Compatibility preview (v0.0.8).** Rustyleaf is intentionally API-compatible
+> with common Leaflet workflows while its WebGL2 renderer and plugin surface
+> continue to mature. The documented surface is executable and covered by the
+> unit, parity, and end-to-end suites.
 
 ---
 
@@ -42,6 +45,9 @@
 Leaflet's API is beloved, but its DOM/Canvas renderer struggles past a few thousand features. WebGL map engines (MapLibre GL, deck.gl) scale, but with a different mental model. Rustyleaf is an experiment in having both:
 
 - **Leaflet-shaped API** — `new Map('map')`, `layer.addTo(map)`, `map.on('click', ...)`.
+- **Compatibility value objects and factories** — `LatLng`, `LatLngBounds`,
+  `Point`, `Bounds`, `L.map(...)`, `L.tileLayer(...)`, and common layer
+  factories preserve tuple input while exposing Leaflet's familiar methods.
 - **Rust/WASM core** — GeoJSON parsing, polygon tessellation (Lyon), and R-tree spatial indexing run in compiled Rust, not the JS main thread.
 - **WebGL2 rendering** — tiles, points, lines, and polygons drawn on the GPU; GeoJSON geometry is triangulated once, cached in GPU buffers, and reused across frames.
 
@@ -84,7 +90,7 @@ Leaflet-style) instead of showing empty gray past ±180°.
 - TypeScript definitions matching the actual runtime API
 - RAII-managed WebGL resources (textures, buffers, VAOs, programs are freed deterministically; verified by GL leak-detection e2e tests)
 
-## Known limitations (v0.0.2)
+## Known limitations (v0.0.8)
 
 - **WebGL2 required.** No Canvas2D or WebGL1 rendering fallback (`checkWebGLSupport`
   reports a WebGL1 "limited" level, but the renderer hard-requires a WebGL2
@@ -196,7 +202,7 @@ cargo install wasm-pack
 npm install
 
 npm run build        # wasm-pack + webpack production build
-npm test             # Jest unit tests (405 tests)
+npm test             # Jest unit + parity tests (823 tests)
 npm run lint         # ESLint
 npm run typecheck    # tsc --noEmit
 cargo clippy --manifest-path core/Cargo.toml --target wasm32-unknown-unknown -- -D warnings

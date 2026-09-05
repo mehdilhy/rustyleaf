@@ -8,7 +8,7 @@ import * as RustyleafAPI from '../src/rustyleaf-api.js';
 import * as wasmMock from '../tests/__mocks__/wasmMock';
 const { Map, GeoJSONLayer, Circle, CircleMarker, Rectangle, ImageOverlay,
   VideoOverlay, SVGOverlay, LayerGroup, FeatureGroup, PointLayer,
-  LineLayer, PolygonLayer, Marker, TileLayer } = RustyleafAPI as any;
+  Marker, TileLayer } = RustyleafAPI as any;
 
 function makeMap() {
   const el = document.createElement('div');

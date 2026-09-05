@@ -6,7 +6,7 @@
  */
 
 import * as RustyleafAPI from '../src/rustyleaf-api.js';
-const { Map, Popup, ImageOverlay, SVGOverlay, GeoJSONLayer, CircleMarker,
+const { Map, ImageOverlay, SVGOverlay, GeoJSONLayer, CircleMarker,
   FeatureGroup } = RustyleafAPI as any;
 
 function makeMap() {
@@ -45,7 +45,7 @@ describe('deferCallback fallback (~2163)', () => {
 describe('ImageOverlay style branches (~2226)', () => {
   test('className and opacity options are applied to the element', () => {
     const map = makeMap();
-    const o = new ImageOverlay('/img.png', [[48.8, 2.2], [48.9, 2.5]], {
+    new ImageOverlay('/img.png', [[48.8, 2.2], [48.9, 2.5]], {
       className: 'my-overlay',
       opacity: 0.3,
     }).addTo(map);
@@ -61,7 +61,7 @@ describe('ImageOverlay style branches (~2226)', () => {
     el.style.position = 'static';
     const map = new Map(el, { center: [48.8566, 2.3522], zoom: 12 });
     // The overlay's addTo() is what forces the container to position:relative
-    const o = new ImageOverlay('/img.png', [[48.8, 2.2], [48.9, 2.5]]).addTo(map);
+    new ImageOverlay('/img.png', [[48.8, 2.2], [48.9, 2.5]]).addTo(map);
     expect(map.containerElement.style.position).toBe('relative');
   });
 

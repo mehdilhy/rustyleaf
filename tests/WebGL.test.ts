@@ -2,7 +2,7 @@
  * WebGL support detection tests
  */
 
-import { Map, checkWebGLSupport } from '../src/rustyleaf-api.js';
+import { Map } from '../src/rustyleaf-api.js';
 
 describe('WebGL Support Detection', () => {
   let container: HTMLElement;
@@ -117,7 +117,7 @@ describe('WebGL Support Detection', () => {
         return mockWebGL1Context; // Return mock WebGL1 context
       });
 
-      const map = new Map(container);
+      new Map(container);
 
       expect(consoleSpy).toHaveBeenCalledWith(
         expect.stringContaining('WebGL2 not available, falling back to WebGL1')
@@ -131,9 +131,6 @@ describe('WebGL Support Detection', () => {
 
   describe('WebGL Context Creation', () => {
     test('should create WebGL2 context when available', () => {
-      // Temporarily bypass the mock by calling the real checkWebGLSupport function
-      const { checkWebGLSupport: originalCheckWebGLSupport } = require('../src/rustyleaf-api.js');
-
       const mockContext = {
         getExtension: jest.fn(() => ({ UNMASKED_RENDERER_WEBGL: 0x9246 })),
         getParameter: jest.fn()

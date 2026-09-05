@@ -11,7 +11,7 @@
  * Run: npx jest --config jest.real.config.js tests-real/PopupsTooltips.real.test.ts
  */
 
-import { Map, Marker, Popup, Tooltip, Icon, DivIcon } from '../src/rustyleaf-api.js';
+import { Map, Marker, Popup, Tooltip, DivIcon } from '../src/rustyleaf-api.js';
 
 const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 

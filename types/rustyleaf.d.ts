@@ -3,14 +3,136 @@
  * API surface exactly matching the runtime exports from src/rustyleaf-api.js
  */
 
-// Core types
-export type LatLng = [number, number];
-export type LatLngBounds = [LatLng, LatLng];
+// Core coordinate types. Tuple input remains valid; constructors/factories
+// return array-compatible objects with Leaflet's `.lat`/`.lng` helpers.
+export interface LatLngValue extends Array<number> {
+  lat: number;
+  lng: number;
+  alt?: number;
+  equals(other: LatLngLike, maxMargin?: number): boolean;
+  toArray(): number[];
+  toBounds(size?: number): LatLngBoundsValue;
+  distanceTo(other: LatLngLike): number;
+  wrap(): LatLngValue;
+}
+export type LatLng = [number, number] | LatLngValue;
+export type LatLngLike = LatLng | { lat: number; lng: number; alt?: number };
+export interface LatLngBoundsValue extends Array<number[] | LatLngValue> {
+  _southWest: LatLngValue | null;
+  _northEast: LatLngValue | null;
+  isValid(): boolean;
+  getCenter(): LatLngValue | null;
+  getSouthWest(): LatLngValue | null;
+  getNorthEast(): LatLngValue | null;
+  getNorthWest(): LatLngValue | null;
+  getSouthEast(): LatLngValue | null;
+  getWest(): number | undefined;
+  getSouth(): number | undefined;
+  getEast(): number | undefined;
+  getNorth(): number | undefined;
+  contains(value: LatLngLike | LatLngBoundsLike): boolean;
+  intersects(value: LatLngBoundsLike): boolean;
+  overlaps(value: LatLngBoundsLike): boolean;
+  pad(bufferRatio: number): LatLngBoundsValue;
+  equals(value: LatLngBoundsLike, maxMargin?: number): boolean;
+  toBBox(): string;
+  toArray(): number[][];
+}
+export type LatLngBounds = [[number, number], [number, number]] | LatLngBoundsValue;
+export type LatLngBoundsLike = LatLngBounds | [LatLngLike, LatLngLike] | LatLngLike[];
+
+export interface PointValue extends Array<number> {
+  x: number;
+  y: number;
+  clone(): PointValue;
+  add(other: PointLike): PointValue;
+  subtract(other: PointLike): PointValue;
+  divideBy(value: number, round?: boolean): PointValue;
+  multiplyBy(value: number): PointValue;
+  scaleBy(scale: PointLike): PointValue;
+  unscaleBy(scale: PointLike): PointValue;
+  round(): PointValue;
+  floor(): PointValue;
+  ceil(): PointValue;
+  distanceTo(other: PointLike): number;
+  equals(other: PointLike): boolean;
+  contains(other: PointLike): boolean;
+  toArray(): number[];
+}
+export type PointLike = [number, number] | PointValue | { x: number; y: number };
+export interface BoundsValue extends Array<number[][] | PointValue[]> {
+  min: PointValue | null;
+  max: PointValue | null;
+  isValid(): boolean;
+  getCenter(round?: boolean): PointValue | null;
+  getSize(): PointValue;
+  contains(value: PointLike | BoundsLike): boolean;
+  intersects(value: BoundsLike): boolean;
+  overlaps(value: BoundsLike): boolean;
+  pad(bufferRatio: number): BoundsValue;
+  equals(value: BoundsLike): boolean;
+  toArray(): number[][];
+}
+export type BoundsLike = BoundsValue | [PointLike, PointLike] | PointLike[];
+
+export declare const LatLng: {
+  new (lat: number, lng: number, alt?: number): LatLngValue;
+};
+export declare const LatLngBounds: {
+  new (southWest?: LatLngLike | LatLngBoundsLike, northEast?: LatLngLike): LatLngBoundsValue;
+};
+export declare const Point: {
+  new (x?: number, y?: number, round?: boolean): PointValue;
+};
+export declare const Bounds: {
+  new (a?: PointLike | BoundsLike, b?: PointLike): BoundsValue;
+};
+export declare class Transformation {
+  constructor(a: number, b: number, c: number, d: number);
+  transform(point: PointLike, scale?: number): PointValue;
+  untransform(point: PointLike, scale?: number): PointValue;
+}
+export declare function latLng(lat: number, lng: number, alt?: number): LatLngValue;
+export declare function latLng(value: LatLngLike): LatLngValue;
+export declare function latLngBounds(southWest?: LatLngBoundsLike, northEast?: LatLngLike): LatLngBoundsValue;
+export declare function point(x: number, y: number, round?: boolean): PointValue;
+export declare function point(value: PointLike): PointValue;
+export declare function bounds(a?: PointLike | BoundsLike, b?: PointLike): BoundsValue;
+export declare function wrapNum(value: number, range: [number, number], includeMax?: boolean): number;
+
+export interface CRSLike {
+  code?: string;
+  wrapLng?: [number, number];
+  wrapLat?: [number, number];
+  distance?(a: LatLngLike, b: LatLngLike): number;
+  scale?(zoom: number): number;
+  zoom?(scale: number): number;
+  project?(latlng: LatLngLike): PointValue;
+  unproject?(point: PointLike): LatLngValue;
+  transformation?: Transformation;
+}
+export declare const CRS: {
+  Earth: CRSLike;
+  EPSG3857: CRSLike;
+  EPSG4326: CRSLike;
+  Simple: CRSLike;
+};
+export declare const Projection: Record<string, CRSLike>;
+export declare const Browser: Record<string, boolean>;
+export declare const DomUtil: Record<string, (...args: any[]) => any>;
+export declare const DomEvent: Record<string, (...args: any[]) => any>;
 
 // Map options (only what the constructor actually reads)
 export interface MapOptions {
-  center?: LatLng;
+  center?: LatLngLike;
   zoom?: number;
+  minZoom?: number;
+  maxZoom?: number;
+  maxBounds?: LatLngBoundsLike | null;
+  zoomDelta?: number;
+  zoomSnap?: number;
+  crs?: CRSLike;
+  layers?: GroupableLayer[];
 }
 
 // Options for Map.locate (browser geolocation)
@@ -63,9 +185,13 @@ export interface PolygonFeature {
 export interface GeoJSONFeatureHandle {
   feature: any;
   on(event: 'click' | 'hover', callback: (e: any) => void): this;
-  off(event: string, callback: (e: any) => void): this;
-  bindPopup(content: string): this;
-  bindTooltip(content: string): this;
+  off(event: string, callback?: (e: any) => void): this;
+  bindPopup(content: string | HTMLElement | ((feature: any) => any)): this;
+  bindTooltip(content: string | HTMLElement | ((feature: any) => any)): this;
+  setStyle(style: Record<string, any>): this;
+  resetStyle(): this;
+  getStyle(): Record<string, any>;
+  getBounds(): LatLngBoundsValue | null;
 }
 
 export interface GeoJSONLayerOptions {
@@ -74,6 +200,7 @@ export interface GeoJSONLayerOptions {
   lineColor?: string;
   lineWidth?: number;
   polygonColor?: string;
+  style?: Record<string, any> | ((feature: any) => Record<string, any>);
   /** Exclude features (applies to loadData/constructor/loadUrl, not streaming). */
   filter?: (feature: any) => boolean;
   /** Render point features via the returned layer (Marker/CircleMarker/...). */
@@ -168,10 +295,10 @@ export declare class DivIcon extends Icon {
 // ==================== Marker ====================
 
 export declare class Marker {
-  constructor(latlng: LatLng, options?: MarkerOptions);
+  constructor(latlng: LatLngLike, options?: MarkerOptions);
 
-  setLatLng(latlng: LatLng): this;
-  getLatLng(): LatLng;
+  setLatLng(latlng: LatLngLike): this;
+  getLatLng(): LatLngValue;
   setIcon(icon: Icon | DivIcon): this;
   getIcon(): Icon | DivIcon;
   setOpacity(opacity: number): this;
@@ -186,14 +313,14 @@ export declare class Marker {
   addTo(map: Map): this;
   remove(): this;
   getElement(): HTMLElement | null;
-  bindPopup(content: string | Popup): this;
-  getPopupContent(): string | undefined;
+  bindPopup(content: string | HTMLElement | Popup | ((marker: Marker, latlng: LatLngValue) => any)): this;
+  getPopupContent(): any;
   getPopup(): Popup | undefined;
   openPopup(): this;
   closePopup(): this;
   isPopupOpen(): boolean;
-  bindTooltip(content: string | Popup): this;
-  getTooltipContent(): string | undefined;
+  bindTooltip(content: string | HTMLElement | Popup | ((marker: Marker, latlng: LatLngValue) => any)): this;
+  getTooltipContent(): any;
   openTooltip(): this;
   closeTooltip(): this;
   isTooltipOpen(): boolean;
@@ -204,21 +331,25 @@ export declare class Marker {
 export declare class Map {
   constructor(container: string | HTMLElement, options?: MapOptions);
 
-  setView(latlng: LatLng, zoom: number): this;
+  setView(latlng: LatLngLike, zoom: number): this;
   panBy(dx: number, dy: number): this;
-  zoomIn(): this;
-  zoomOut(): this;
+  panBy(offset: PointLike): this;
+  zoomIn(delta?: number): this;
+  zoomOut(delta?: number): this;
   getWebGLSupport(): WebGLSupportInfo;
-  getCenter(): LatLng;
+  getCenter(): LatLngValue;
   getZoom(): number;
   setMinZoom(minZoom: number): this;
   setMaxZoom(maxZoom: number): this;
-  getBounds(): LatLngBounds;
-  fitBounds(bounds: LatLngBounds): this;
-  flyTo(latlng: LatLng, options?: { zoom?: number; duration?: number }): this;
-  flyToBounds(bounds: LatLngBounds, options?: { duration?: number }): this;
-  setMaxBounds(bounds: LatLngBounds | null): this;
-  getMaxBounds(): LatLngBounds | null;
+  getMinZoom(): number;
+  getMaxZoom(): number;
+  getBounds(): LatLngBoundsValue;
+  fitBounds(bounds: LatLngBoundsLike, options?: { maxZoom?: number }): this;
+  flyTo(latlng: LatLngLike, zoom?: number, options?: { duration?: number }): this;
+  flyTo(latlng: LatLngLike, options?: { zoom?: number; duration?: number }): this;
+  flyToBounds(bounds: LatLngBoundsLike, options?: { maxZoom?: number; duration?: number }): this;
+  setMaxBounds(bounds: LatLngBoundsLike | null): this;
+  getMaxBounds(): LatLngBoundsValue | null;
   invalidateSize(): this;
   locate(options?: LocateOptions): this;
   stopLocate(): this;
@@ -226,8 +357,26 @@ export declare class Map {
   removeLayer(layer: GroupableLayer): this;
   hasLayer(layer: GroupableLayer): boolean;
   addHandler(name: string, HandlerClass: new (map: Map) => Handler): this;
-  project(latlng: LatLng): [number, number];
-  unproject(point: [number, number]): LatLng;
+  distance(a: LatLngLike, b: LatLngLike): number;
+  containerPointToLatLng(point: PointLike): LatLngValue;
+  latLngToContainerPoint(latlng: LatLngLike): PointValue;
+  mouseEventToContainerPoint(event: MouseEvent): PointValue;
+  mouseEventToLayerPoint(event: MouseEvent): PointValue;
+  mouseEventToLatLng(event: MouseEvent): LatLngValue;
+  project(latlng: LatLngLike): PointValue;
+  unproject(point: PointLike): LatLngValue;
+  getSize(): PointValue;
+  getPixelOrigin(): PointValue;
+  getPixelBounds(): BoundsValue;
+  getPixelWorldBounds(zoom?: number): BoundsValue;
+  getZoomScale(toZoom: number, fromZoom?: number): number;
+  getScaleZoom(scale: number, fromZoom?: number): number;
+  getBoundsZoom(bounds: LatLngBoundsLike, inside?: boolean, padding?: PointLike): number;
+  wrapLatLng(latlng: LatLngLike): LatLngValue;
+  wrapLatLngBounds(bounds: LatLngBoundsLike): LatLngBoundsValue;
+  getPane(name?: string): HTMLElement;
+  createPane(name: string, containerPane?: string | HTMLElement): HTMLElement;
+  getPanes(): Record<string, HTMLElement>;
   /**
    * Core events (wasm): move, zoom, click, hover, mousedown, mouseup,
    * contextmenu, keydown, keyup, dragend. Derived/JS events: movestart,
@@ -251,6 +400,18 @@ export declare class TileLayer {
 
   addTo(map: Map): this;
   remove(): this;
+  getTileSize(): PointValue;
+  getTileUrl(coords: { x: number; y: number; z: number; [key: string]: any }): string;
+  setUrl(url: string, noRedraw?: boolean): this;
+  setOpacity(opacity: number): this;
+  getOpacity(): number;
+  setZIndex(zIndex: number): this;
+  bringToFront(): this;
+  bringToBack(): this;
+  getContainer(): HTMLElement | HTMLCanvasElement | null;
+  getAttribution(): string | undefined;
+  isLoading(): boolean;
+  redraw(): this;
 }
 
 export declare class WMSTileLayer extends TileLayer {
@@ -277,7 +438,7 @@ export declare class GridLayer {
 // ==================== PointLayer ====================
 
 export declare class PointLayer {
-  constructor();
+  constructor(options?: Record<string, any>);
 
   add(points: PointFeature[]): this;
   /** Append packed [lat, lng, size, r, g, b, a] float tuples. The layer must
@@ -294,30 +455,50 @@ export declare class PointLayer {
   on(event: 'click' | 'hover', callback: (...args: any[]) => void): this;
   addTo(map: Map): this;
   remove(): this;
+  getBounds(): LatLngBoundsValue | null;
+  getLatLngs(): LatLngValue[];
 }
 
 // ==================== LineLayer ====================
 
 export declare class LineLayer {
-  constructor();
+  constructor(options?: Record<string, any>);
 
   add(lines: LineFeature[]): this;
   clear(): this;
   on(event: 'click' | 'hover', callback: (...args: any[]) => void): this;
   addTo(map: Map): this;
   remove(): this;
+  getLatLngs(): LatLngValue[][];
+  setLatLngs(latlngs: LatLngLike[] | LatLngLike[][]): this;
+  getBounds(): LatLngBoundsValue | null;
+  setStyle(style?: Record<string, any>): this;
+  getStyle(): Record<string, any>;
+  bringToFront(): this;
+  bringToBack(): this;
+  bindPopup(content: any): this;
+  bindTooltip(content: any): this;
 }
 
 // ==================== PolygonLayer ====================
 
 export declare class PolygonLayer {
-  constructor();
+  constructor(options?: Record<string, any>);
 
   add(polygons: PolygonFeature[]): this;
   clear(): this;
   on(event: 'click' | 'hover', callback: (...args: any[]) => void): this;
   addTo(map: Map): this;
   remove(): this;
+  getLatLngs(): LatLngValue[][][];
+  setLatLngs(latlngs: LatLngLike[] | LatLngLike[][] | LatLngLike[][][]): this;
+  getBounds(): LatLngBoundsValue | null;
+  setStyle(style?: Record<string, any>): this;
+  getStyle(): Record<string, any>;
+  bringToFront(): this;
+  bringToBack(): this;
+  bindPopup(content: any): this;
+  bindTooltip(content: any): this;
 }
 
 // ==================== Vector shapes ====================
@@ -326,17 +507,24 @@ export interface ShapeOptions {
   color?: string;
   fillColor?: string;
   meta?: any;
+  weight?: number;
+  opacity?: number;
+  fillOpacity?: number;
 }
 
 // Geodesic circle; radius in meters, tessellated into a polygon.
 export declare class Circle {
-  constructor(latlng: LatLng, options?: ShapeOptions & { radius?: number });
-  getLatLng(): LatLng;
-  setLatLng(latlng: LatLng): this;
+  constructor(latlng: LatLngLike, options?: ShapeOptions & { radius?: number });
+  getLatLng(): LatLngValue;
+  setLatLng(latlng: LatLngLike): this;
   getRadius(): number;
   setRadius(radius: number): this;
   getBounds(): LatLngBounds;
   on(event: 'click' | 'hover', callback: (...args: any[]) => void): this;
+  setStyle(style: Record<string, any>): this;
+  getStyle(): Record<string, any>;
+  bindPopup(content: any): this;
+  bindTooltip(content: any): this;
   addTo(map: Map): this;
   remove(): this;
   redraw(): this;
@@ -344,22 +532,31 @@ export declare class Circle {
 
 // Fixed screen-radius circle; radius in pixels, rendered as a GPU point.
 export declare class CircleMarker {
-  constructor(latlng: LatLng, options?: ShapeOptions & { radius?: number });
-  getLatLng(): LatLng;
-  setLatLng(latlng: LatLng): this;
+  constructor(latlng: LatLngLike, options?: ShapeOptions & { radius?: number });
+  getLatLng(): LatLngValue;
+  setLatLng(latlng: LatLngLike): this;
   getRadius(): number;
   setRadius(radius: number): this;
+  getBounds(): LatLngBoundsValue;
   on(event: 'click' | 'hover', callback: (...args: any[]) => void): this;
+  setStyle(style: Record<string, any>): this;
+  getStyle(): Record<string, any>;
+  bindPopup(content: any): this;
+  bindTooltip(content: any): this;
   addTo(map: Map): this;
   remove(): this;
   redraw(): this;
 }
 
 export declare class Rectangle {
-  constructor(bounds: LatLngBounds, options?: ShapeOptions);
-  getBounds(): LatLngBounds;
-  setBounds(bounds: LatLngBounds): this;
+  constructor(bounds: LatLngBoundsLike, options?: ShapeOptions);
+  getBounds(): LatLngBoundsValue;
+  setBounds(bounds: LatLngBoundsLike): this;
   on(event: 'click' | 'hover', callback: (...args: any[]) => void): this;
+  setStyle(style: Record<string, any>): this;
+  getStyle(): Record<string, any>;
+  bindPopup(content: any): this;
+  bindTooltip(content: any): this;
   addTo(map: Map): this;
   remove(): this;
   redraw(): this;
@@ -380,13 +577,20 @@ export declare class LayerGroup {
   removeLayer(layer: GroupableLayer): this;
   clearLayers(): this;
   eachLayer(fn: (layer: GroupableLayer) => void, context?: any): this;
+  invoke(methodName: string, ...args: any[]): this;
+  bindPopup(content: any): this;
+  bindTooltip(content: any): this;
   addTo(map: Map): this;
   remove(): this;
 }
 
 export declare class FeatureGroup extends LayerGroup {
   on(event: string, callback: (...args: any[]) => void): this;
+  off(event: string, callback?: (...args: any[]) => void): this;
   getBounds(): LatLngBounds | null;
+  setStyle(style: Record<string, any>): this;
+  bringToFront(): this;
+  bringToBack(): this;
 }
 
 // ==================== GeoJSONLayer ====================
@@ -395,6 +599,7 @@ export declare class GeoJSONLayer {
   constructor(geojson?: any, options?: GeoJSONLayerOptions);
 
   loadData(geojson: any): this;
+  addData(geojson: any): this;
   loadUrl(url: string): Promise<this>;
   loadUrlStreaming(url: string, options?: GeoJSONStreamingOptions): Promise<this>;
   loadFile(file: File, options?: GeoJSONStreamingOptions): Promise<this>;
@@ -406,11 +611,18 @@ export declare class GeoJSONLayer {
   }): Promise<this>;
   processChunk(chunk: string, isFinal: boolean): void;
   getFeatureCount(): number;
-  setStyle(style: Partial<GeoJSONLayerOptions>): this;
+  setStyle(style: Partial<GeoJSONLayerOptions> | ((feature: any) => Record<string, any>)): this;
   setStyleFunction(styleFn: (feature: any) => any): this;
   updateStyle(): void;
   addTo(map: Map): this;
   on(event: 'click' | 'hover', callback: (...args: any[]) => void): this;
+  off(event: string, callback?: (...args: any[]) => void): this;
+  getLayers(): Array<GroupableLayer | GeoJSONFeatureHandle>;
+  eachLayer(fn: (layer: GroupableLayer | GeoJSONFeatureHandle) => void, context?: any): this;
+  bindPopup(content: any): this;
+  bindTooltip(content: any): this;
+  resetStyle(layer?: GeoJSONFeatureHandle | GroupableLayer): this;
+  toGeoJSON(): any;
   remove(): this;
   getBounds(): LatLngBounds | null;
   getFeaturesInBounds(bounds: LatLngBounds): any[];
@@ -505,11 +717,13 @@ export interface ImageOverlayOptions {
 }
 
 export declare class ImageOverlay {
-  constructor(url: string, bounds: LatLngBounds, options?: ImageOverlayOptions);
-  getBounds(): LatLngBounds;
-  setBounds(bounds: LatLngBounds): this;
+  constructor(url: string, bounds: LatLngBoundsLike, options?: ImageOverlayOptions);
+  getBounds(): LatLngBoundsValue;
+  getCenter(): LatLngValue;
+  setBounds(bounds: LatLngBoundsLike): this;
   setUrl(url: string): this;
   setOpacity(opacity: number): this;
+  setZIndex(zIndex: number): this;
   getElement(): HTMLElement | null;
   addTo(map: Map): this;
   remove(): this;
@@ -518,7 +732,7 @@ export declare class ImageOverlay {
 }
 
 export declare class VideoOverlay extends ImageOverlay {
-  constructor(url: string, bounds: LatLngBounds, options?: ImageOverlayOptions & {
+  constructor(url: string, bounds: LatLngBoundsLike, options?: ImageOverlayOptions & {
     autoplay?: boolean;
     loop?: boolean;
     muted?: boolean;
@@ -526,7 +740,7 @@ export declare class VideoOverlay extends ImageOverlay {
 }
 
 export declare class SVGOverlay extends ImageOverlay {
-  constructor(svgElement: SVGElement, bounds: LatLngBounds, options?: ImageOverlayOptions);
+  constructor(svgElement: SVGElement, bounds: LatLngBoundsLike, options?: ImageOverlayOptions);
 }
 
 // ==================== Plugin surface ====================
@@ -549,6 +763,13 @@ export declare const Util: {
   formatNum(num: number, digits?: number): number;
   setOptions(obj: any, options: Record<string, any>): Record<string, any>;
   template(str: string, data: Record<string, any>): string;
+  isArray(value: any): boolean;
+  trim(value: any): string;
+  splitWords(value: any): string[];
+  getParamString(obj: Record<string, any>, existingUrl?: string, uppercase?: boolean): string;
+  requestAnimFrame(callback: (...args: any[]) => void, context?: any, immediate?: boolean): number | undefined;
+  cancelAnimFrame(id: number): void;
+  emptyImageUrl: string;
 };
 
 // ==================== WASM bootstrap ====================
@@ -564,11 +785,42 @@ export interface RustyleafConfig {
 }
 
 export declare function configureRustyleaf(config: RustyleafConfig): void;
+export declare function checkWebGLSupport(): WebGLSupportInfo;
+
+// Leaflet-style factories and namespace export.
+export declare function map(container: string | HTMLElement, options?: MapOptions): Map;
+export declare function tileLayer(urlTemplate: string, options?: Record<string, any>): TileLayer;
+export declare function pointLayer(options?: Record<string, any>): PointLayer;
+export declare function lineLayer(options?: Record<string, any>): LineLayer;
+export declare function polygonLayer(options?: Record<string, any>): PolygonLayer;
+export declare function geoJSON(data?: any, options?: GeoJSONLayerOptions): GeoJSONLayer;
+export declare function marker(latlng: LatLngLike, options?: MarkerOptions): Marker;
+export declare function icon(options: IconOptions): Icon;
+export declare function divIcon(options?: DivIconOptions): DivIcon;
+export declare function popup(options?: PopupOptions, source?: any): Popup;
+export declare function tooltip(options?: { content?: any; direction?: string; opacity?: number; className?: string; sticky?: boolean; offset?: [number, number] }): Tooltip;
+export declare function circle(latlng: LatLngLike, options?: ShapeOptions & { radius?: number }): Circle;
+export declare function circleMarker(latlng: LatLngLike, options?: ShapeOptions & { radius?: number }): CircleMarker;
+export declare function rectangle(bounds: LatLngBoundsLike, options?: ShapeOptions): Rectangle;
+export declare function layerGroup(layers?: GroupableLayer[]): LayerGroup;
+export declare function featureGroup(layers?: GroupableLayer[]): FeatureGroup;
+export declare function imageOverlay(url: string, bounds: LatLngBoundsLike, options?: ImageOverlayOptions): ImageOverlay;
+export declare function videoOverlay(url: string, bounds: LatLngBoundsLike, options?: ImageOverlayOptions & { autoplay?: boolean; loop?: boolean; muted?: boolean }): VideoOverlay;
+export declare function svgOverlay(element: SVGElement, bounds: LatLngBoundsLike, options?: ImageOverlayOptions): SVGOverlay;
+export declare function gridLayer(options?: { tileSize?: number; className?: string }): GridLayer;
+export declare function wmsTileLayer(baseUrl: string, options?: Record<string, any>): WMSTileLayer;
+export declare function control(options?: ControlOptions): Control;
+export declare function zoomControl(options?: ControlOptions): ZoomControl;
+export declare function attributionControl(options?: ControlOptions & { prefix?: string }): AttributionControl;
+export declare function scaleControl(options?: ControlOptions & { maxWidth?: number; metric?: boolean; imperial?: boolean }): ScaleControl;
+export declare function layersControl(baseLayers?: Record<string, GroupableLayer>, overlays?: Record<string, GroupableLayer>, options?: ControlOptions): LayersControl;
 
 // ==================== Default export ====================
 
 declare const _default: {
+  version: string;
   configureRustyleaf: typeof configureRustyleaf;
+  checkWebGLSupport: typeof checkWebGLSupport;
   Map: typeof Map;
   TileLayer: typeof TileLayer;
   PointLayer: typeof PointLayer;
@@ -597,5 +849,45 @@ declare const _default: {
   GridLayer: typeof GridLayer;
   Handler: typeof Handler;
   Util: typeof Util;
+  Point: typeof Point;
+  Bounds: typeof Bounds;
+  LatLng: typeof LatLng;
+  LatLngBounds: typeof LatLngBounds;
+  Transformation: typeof Transformation;
+  CRS: typeof CRS;
+  Projection: typeof Projection;
+  Browser: typeof Browser;
+  DomUtil: typeof DomUtil;
+  DomEvent: typeof DomEvent;
+  map: typeof map;
+  tileLayer: typeof tileLayer;
+  pointLayer: typeof pointLayer;
+  lineLayer: typeof lineLayer;
+  polygonLayer: typeof polygonLayer;
+  geoJSON: typeof geoJSON;
+  marker: typeof marker;
+  icon: typeof icon;
+  divIcon: typeof divIcon;
+  popup: typeof popup;
+  tooltip: typeof tooltip;
+  circle: typeof circle;
+  circleMarker: typeof circleMarker;
+  rectangle: typeof rectangle;
+  layerGroup: typeof layerGroup;
+  featureGroup: typeof featureGroup;
+  imageOverlay: typeof imageOverlay;
+  videoOverlay: typeof videoOverlay;
+  svgOverlay: typeof svgOverlay;
+  gridLayer: typeof gridLayer;
+  wmsTileLayer: typeof wmsTileLayer;
+  control: typeof control;
+  zoomControl: typeof zoomControl;
+  attributionControl: typeof attributionControl;
+  scaleControl: typeof scaleControl;
+  layersControl: typeof layersControl;
+  latLng: typeof latLng;
+  latLngBounds: typeof latLngBounds;
+  point: typeof point;
+  bounds: typeof bounds;
 };
 export default _default;

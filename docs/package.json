@@ -1,6 +1,6 @@
 {
   "name": "rustyleaf-docs",
-  "version": "0.0.2",
+  "version": "0.0.8",
   "private": true,
   "type": "module",
   "description": "Documentation site for Rustyleaf (VitePress)",

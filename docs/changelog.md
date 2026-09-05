@@ -4,6 +4,18 @@ All notable changes are documented in
 [`CHANGELOG.md`](https://github.com/mehdilhy/rustyleaf/blob/main/CHANGELOG.md).
 Highlights from the published pre-alpha release are below.
 
+## 0.0.8 — compatibility preview
+
+- Added Leaflet-compatible `Point`, `Bounds`, `LatLng`, and `LatLngBounds` value
+  objects that remain array-compatible with existing Rustyleaf tuples.
+- Added the common `L.*` factory functions, `CRS`/`Projection`, `DomUtil`,
+  `DomEvent`, and expanded `Util` plugin helpers.
+- Added map pixel/coordinate helpers, panes, tile URL/lifecycle methods,
+  vector-layer editing/style APIs, GeoJSON aliases and inspection methods.
+- Added a VitePress navigation shell and a [20-use-case compatibility
+  checklist](/use-cases).
+- Added 20 parity scenarios; the Jest suite now covers 823 tests.
+
 ## 0.0.1 — 2026-07-05 (pre-alpha)
 
 First published release. Functional but under active development — expect API
