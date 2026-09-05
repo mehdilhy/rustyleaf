@@ -290,7 +290,7 @@ describe('Popup _boundFns move/zoom attach-detach re-binding (real source)', () 
 
 describe.each([
   ['PointLayer', 'point'],
-] as const)('%s remove + GPU free paths (real source)', (cls) => {
+] as const)('%s remove + GPU free paths (real source)', () => {
   test('placeholder', () => { /* real tests below */ });
 });
 

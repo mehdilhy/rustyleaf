@@ -22,7 +22,7 @@ npm install
 
 ```bash
 npm run build          # wasm-pack + webpack production build
-npm test               # Jest unit tests (405 tests)
+npm test               # Jest unit + parity tests (823 tests)
 npm run lint           # ESLint
 npm run typecheck      # tsc --noEmit
 cargo clippy --manifest-path core/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
@@ -78,7 +78,7 @@ benchmarks.
 - [x] Deterministic GL resource cleanup (RAII wrappers, leak-detection e2e)
 - [x] Single WASM instantiation in every load path
 - [x] All layer types render independently (u_matrix fix)
-- [x] Green CI: clippy `-D warnings`, 405 unit tests, e2e suite
+- [x] Green CI: clippy `-D warnings`, unit + parity tests, e2e suite
 - [x] Published benchmark: Rustyleaf vs Leaflet vs MapLibre GL
 - [x] GPU-resident point layers — 60fps at 1M points
 - [ ] GitHub Pages demo + benchmark deployed from CI

@@ -1,4 +1,4 @@
-﻿{
+{
   "name": "rustyleaf",
   "version": "0.0.8",
   "description": "A high-performance Rust-based map visualization engine powered by WebAssembly and WebGL2",

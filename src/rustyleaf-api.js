@@ -1,9 +1,26 @@
 // JavaScript wrapper for Rustyleaf WASM library
 // Provides Leaflet-style API as specified in specs.md
+/* global WasmPointLayer:readonly */
 
 // Import low-level WASM bindings and module namespace; we'll initialize manually via fetch
 import { RustyleafMap, TileLayerApi, PointLayerApi } from '../dist/rustyleaf_core_bg.js';
 import * as __rustyleaf_wasm_bg from '../dist/rustyleaf_core_bg.js';
+import {
+  Browser,
+  Bounds,
+  CRS,
+  DomEvent,
+  DomUtil,
+  LatLng,
+  LatLngBounds,
+  Point,
+  Projection,
+  Transformation,
+  bounds,
+  latLng,
+  latLngBounds,
+  point
+} from './leaflet-compat.js';
 
 // True when the WASM instance is already wired into the bg glue module.
 // Webpack (asyncWebAssembly) instantiates the wasm before this module evaluates,
@@ -163,11 +180,18 @@ function checkWebGLSupport() {
 // Map class with Leaflet-style API
 class Map {
   constructor(container, options = {}) {
+    options = options || {};
+    this.options = options;
+
     // Handle container parameter
     if (typeof container === 'string') {
       this.containerElement = document.getElementById(container);
     } else {
       this.containerElement = container;
+    }
+
+    if (!this.containerElement || typeof this.containerElement.getBoundingClientRect !== 'function') {
+      throw new Error('Invalid map container: expected an element or an element id');
     }
 
     // Get container dimensions
@@ -250,8 +274,13 @@ class Map {
     }
 
     // Set initial view
-    const center = options.center || [48.8566, 2.3522]; // Paris by default
-    const zoom = options.zoom || 12;
+    const centerValue = options.center ?? [48.8566, 2.3522]; // Paris by default
+    const center = centerValue instanceof LatLng
+      ? centerValue.toArray()
+      : Array.isArray(centerValue)
+        ? [centerValue[0], centerValue[1]]
+        : [centerValue.lat, centerValue.lng];
+    const zoom = options.zoom ?? 12;
 
     // Validate center coordinates
     if (!Array.isArray(center) || center.length !== 2 ||
@@ -267,7 +296,13 @@ class Map {
       throw new Error('Invalid zoom level: must be a number between 0 and 24');
     }
 
-    this.wasmMap.set_view(center[0], center[1], zoom);
+    this._minZoom = typeof options.minZoom === 'number' ? options.minZoom : 0;
+    this._maxZoom = typeof options.maxZoom === 'number' ? options.maxZoom : 18;
+    this._maxBounds = options.maxBounds ? latLngBounds(options.maxBounds) : null;
+    this.wasmMap.set_min_zoom(this._minZoom);
+    this.wasmMap.set_max_zoom(this._maxZoom);
+    const initialCenter = this._clampToMaxBounds(center);
+    this.wasmMap.set_view(initialCenter[0], initialCenter[1], zoom);
 
     // Set up event handlers
     this._setupEventHandlers();
@@ -289,6 +324,11 @@ class Map {
     // DOM-overlay UI controls (zoom/attribution/scale/etc.)
     this._controls = [];
 
+    // Lazy-created Leaflet-compatible panes. The canvas remains the direct
+    // child used by the renderer; panes are DOM stacking contexts for plugins
+    // and overlays that need explicit z-ordering.
+    this._panes = {};
+
     // Layers currently attached to this map (drives layeradd/layerremove)
     this._attachedLayers = new Set();
 
@@ -297,8 +337,10 @@ class Map {
     this._openPopups = new Set();
     this._openTooltips = new Set();
 
-    // Constructor options, kept for handlers/plugins (map.addHandler)
-    this.options = options;
+    // Add initial layers after all registries are ready.
+    if (Array.isArray(options.layers)) {
+      for (const layer of options.layers) this.addLayer(layer);
+    }
   }
 
   // Leaflet-style plugin hook: instantiates HandlerClass(map), exposes it as
@@ -367,12 +409,19 @@ class Map {
   }
 
   setView(latlng, zoom) {
+    const normalizedLatLng = latlng instanceof LatLng
+      ? latlng.toArray()
+      : Array.isArray(latlng)
+        ? latlng
+        : latlng && typeof latlng === 'object'
+          ? [latlng.lat, latlng.lng]
+          : latlng;
     // Validate center coordinates
-    if (!Array.isArray(latlng) || latlng.length !== 2 ||
-        typeof latlng[0] !== 'number' || typeof latlng[1] !== 'number' ||
-        isNaN(latlng[0]) || isNaN(latlng[1]) ||
-        latlng[0] < -90 || latlng[0] > 90 ||
-        latlng[1] < -180 || latlng[1] > 180) {
+    if (!Array.isArray(normalizedLatLng) || normalizedLatLng.length < 2 ||
+        typeof normalizedLatLng[0] !== 'number' || typeof normalizedLatLng[1] !== 'number' ||
+        !isFinite(normalizedLatLng[0]) || !isFinite(normalizedLatLng[1]) ||
+        normalizedLatLng[0] < -90 || normalizedLatLng[0] > 90 ||
+        normalizedLatLng[1] < -180 || normalizedLatLng[1] > 180) {
       throw new Error('Invalid center coordinates: must be [lat, lng] with lat ∈ [-90, 90] and lng ∈ [-180, 180]');
     }
 
@@ -381,8 +430,10 @@ class Map {
       throw new Error('Invalid zoom level: must be a number between 0 and 24');
     }
 
-    latlng = this._clampToMaxBounds(latlng);
-    this.wasmMap.set_view(latlng[0], latlng[1], zoom);
+    normalizedLatLng[0] = Number(normalizedLatLng[0]);
+    normalizedLatLng[1] = Number(normalizedLatLng[1]);
+    const clampedLatLng = this._clampToMaxBounds(normalizedLatLng);
+    this.wasmMap.set_view(clampedLatLng[0], clampedLatLng[1], zoom);
     return this;
   }
   
@@ -399,13 +450,21 @@ class Map {
   }
   
   zoomIn(delta) {
-    const n = Math.max(1, Math.round(delta === undefined ? 1 : delta));
+    const requested = delta === undefined ? this.options.zoomDelta : delta;
+    if (requested !== undefined && !Number.isInteger(requested)) {
+      return this.setZoom(this.getZoom() + Number(requested));
+    }
+    const n = Math.max(1, Math.round(requested === undefined ? 1 : requested));
     for (let i = 0; i < n; i++) this.wasmMap.zoom_in();
     return this;
   }
 
   zoomOut(delta) {
-    const n = Math.max(1, Math.round(delta === undefined ? 1 : delta));
+    const requested = delta === undefined ? this.options.zoomDelta : delta;
+    if (requested !== undefined && !Number.isInteger(requested)) {
+      return this.setZoom(this.getZoom() - Number(requested));
+    }
+    const n = Math.max(1, Math.round(requested === undefined ? 1 : requested));
     for (let i = 0; i < n; i++) this.wasmMap.zoom_out();
     return this;
   }
@@ -413,7 +472,10 @@ class Map {
   // Leaflet-style setters -------------------------------------------------
 
   setZoom(zoom) {
-    return this.setView(this.getCenter(), zoom);
+    let nextZoom = Number(zoom);
+    const snap = Number(this.options.zoomSnap);
+    if (Number.isFinite(snap) && snap > 0) nextZoom = Math.round(nextZoom / snap) * snap;
+    return this.setView(this.getCenter(), Math.max(this.getMinZoom(), Math.min(this.getMaxZoom(), nextZoom)));
   }
 
   panTo(center) {
@@ -422,23 +484,23 @@ class Map {
 
   // Great-circle distance in meters (haversine, R = 6371000 like Leaflet).
   distance(latlng1, latlng2) {
+    const first = latLng(latlng1);
+    const second = latLng(latlng2);
     const rad = Math.PI / 180;
-    const dLat = (latlng2[0] - latlng1[0]) * rad;
-    const dLng = (latlng2[1] - latlng1[1]) * rad;
+    const dLat = (second.lat - first.lat) * rad;
+    const dLng = (second.lng - first.lng) * rad;
     const a = Math.sin(dLat / 2) * Math.sin(dLat / 2)
-      + Math.cos(latlng1[0] * rad) * Math.cos(latlng2[0] * rad)
+      + Math.cos(first.lat * rad) * Math.cos(second.lat * rad)
       * Math.sin(dLng / 2) * Math.sin(dLng / 2);
     return 6371000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   }
 
   containerPointToLatLng(point) {
-    const p = Array.isArray(point) ? point : [point.x, point.y];
-    return this.unproject(p);
+    return this.unproject(point);
   }
 
   latLngToContainerPoint(latlng) {
-    const p = Array.isArray(latlng) ? latlng : [latlng.lat, latlng.lng];
-    return this.project(p);
+    return this.project(latlng);
   }
 
   closePopup() {
@@ -470,7 +532,7 @@ class Map {
   
   getCenter() {
     const center = this.wasmMap.get_center();
-    return [center[0], center[1]];
+    return new LatLng(center[0], center[1]);
   }
   
   getZoom() {
@@ -478,30 +540,42 @@ class Map {
   }
   
   setMinZoom(minZoom) {
-    this.wasmMap.set_min_zoom(minZoom);
+    this._minZoom = Number(minZoom);
+    this.wasmMap.set_min_zoom(this._minZoom);
     return this;
   }
   
   setMaxZoom(maxZoom) {
-    this.wasmMap.set_max_zoom(maxZoom);
+    this._maxZoom = Number(maxZoom);
+    this.wasmMap.set_max_zoom(this._maxZoom);
     return this;
+  }
+
+  getMinZoom() {
+    return this._minZoom !== undefined ? this._minZoom : 0;
+  }
+
+  getMaxZoom() {
+    return this._maxZoom !== undefined ? this._maxZoom : 18;
   }
   
   getBounds() {
     const bounds = this.wasmMap.get_bounds();
-    return [
-      [bounds[0], bounds[1]], // Southwest
-      [bounds[2], bounds[3]]  // Northeast
-    ];
+    return new LatLngBounds([bounds[0], bounds[1]], [bounds[2], bounds[3]]);
   }
   
-  fitBounds(bounds) {
+  fitBounds(bounds, options = {}) {
+    const normalized = bounds instanceof LatLngBounds ? bounds : latLngBounds(bounds);
+    if (!normalized.isValid()) throw new Error('Invalid bounds: expected two valid corners');
     // Convert bounds array to flat array for WASM
     const flatBounds = [
-      bounds[0][0], bounds[0][1], // sw_lat, sw_lng
-      bounds[1][0], bounds[1][1]  // ne_lat, ne_lng
+      normalized[0][0], normalized[0][1], // sw_lat, sw_lng
+      normalized[1][0], normalized[1][1]  // ne_lat, ne_lng
     ];
     this.wasmMap.fit_bounds(flatBounds);
+    if (options && options.maxZoom !== undefined && this.getZoom() > options.maxZoom) {
+      this.setZoom(options.maxZoom);
+    }
     return this;
   }
 
@@ -509,6 +583,7 @@ class Map {
   // flyTo(latlng, zoom?, options?) — a numeric second arg is the target zoom;
   // an options object as the second arg is also accepted (rustyleaf legacy).
   flyTo(latlng, zoomOrOptions, options = {}) {
+    const target = latLng(latlng);
     let opts;
     if (typeof zoomOrOptions === 'number') {
       opts = { zoom: zoomOrOptions, ...options };
@@ -517,7 +592,13 @@ class Map {
     } else {
       opts = {};
     }
-    const duration = opts.duration !== undefined ? opts.duration : 400;
+    const requestedDuration = opts.duration !== undefined ? Number(opts.duration) : 400;
+    // Leaflet documents duration in seconds; Rustyleaf historically accepted
+    // millisecond values. Keep both forms during the compatibility preview by
+    // treating sub-ten values as seconds and larger values as milliseconds.
+    const duration = requestedDuration > 0 && requestedDuration < 10
+      ? requestedDuration * 1000
+      : requestedDuration;
     const from = this.getCenter();
     const fromZoom = this.getZoom();
     const targetZoom = opts.zoom !== undefined ? opts.zoom : fromZoom;
@@ -525,13 +606,13 @@ class Map {
       clearInterval(this._flyTimer);
       this._flyTimer = null;
     }
-    if (duration <= 0) return this.setView(latlng, targetZoom);
+    if (duration <= 0) return this.setView(target, targetZoom);
     const start = Date.now();
     this._flyTimer = setInterval(() => {
       const t = Math.min(1, (Date.now() - start) / duration);
       const ease = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
       this.setView(
-        [from[0] + (latlng[0] - from[0]) * ease, from[1] + (latlng[1] - from[1]) * ease],
+        [from[0] + (target.lat - from[0]) * ease, from[1] + (target.lng - from[1]) * ease],
         fromZoom + (targetZoom - fromZoom) * ease
       );
       if (t >= 1) {
@@ -543,12 +624,23 @@ class Map {
   }
 
   flyToBounds(bounds, options) {
-    this.fitBounds(bounds);
+    const normalized = bounds instanceof LatLngBounds ? bounds : latLngBounds(bounds);
+    if (options && options.duration > 0) {
+      const targetZoom = options.maxZoom !== undefined ? Math.min(this.getBoundsZoom(normalized), options.maxZoom) : this.getBoundsZoom(normalized);
+      this.flyTo(normalized.getCenter(), { zoom: targetZoom, duration: options.duration });
+    } else {
+      // Keep Leaflet's optional-argument shape: callers that only supplied
+      // an animation option should still reach fitBounds(bounds) exactly.
+      const fitOptions = options ? { ...options } : {};
+      delete fitOptions.duration;
+      if (Object.keys(fitOptions).length > 0) this.fitBounds(normalized, fitOptions);
+      else this.fitBounds(normalized);
+    }
     return this;
   }
 
   setMaxBounds(bounds) {
-    this._maxBounds = bounds || null;
+    this._maxBounds = bounds ? latLngBounds(bounds) : null;
     if (this._maxBounds) this.setView(this.getCenter(), this.getZoom());
     return this;
   }
@@ -623,13 +715,143 @@ class Map {
   }
 
   project(latlng) {
-    const point = this.wasmMap.project(latlng);
-    return [point[0], point[1]];
+    const value = latLng(latlng).toArray();
+    const projected = this.wasmMap.project(value);
+    return new Point(projected[0], projected[1]);
   }
   
   unproject(point) {
-    const latlng = this.wasmMap.unproject(point);
-    return [latlng[0], latlng[1]];
+    const value = point instanceof Point
+      ? point.toArray()
+      : new Point(point && point.x !== undefined ? point.x : point && point[0], point && point.y !== undefined ? point.y : point && point[1]).toArray();
+    const latlng = this.wasmMap.unproject(value);
+    return new LatLng(latlng[0], latlng[1]);
+  }
+
+  getSize() {
+    return new Point(this.width, this.height);
+  }
+
+  getPixelOrigin() {
+    const center = this._projectWorld(this.getCenter());
+    return new Point(center.x - this.width / 2, center.y - this.height / 2);
+  }
+
+  getPixelBounds() {
+    const origin = this.getPixelOrigin();
+    return new Bounds(origin, origin.add(this.getSize()));
+  }
+
+  getPixelWorldBounds(zoom = this.getZoom()) {
+    const scale = 256 * Math.pow(2, Number(zoom));
+    return new Bounds([0, 0], [scale, scale]);
+  }
+
+  getZoomScale(toZoom, fromZoom = this.getZoom()) {
+    return Math.pow(2, Number(toZoom) - Number(fromZoom));
+  }
+
+  getScaleZoom(scale, fromZoom = this.getZoom()) {
+    const numericScale = Number(scale);
+    if (!(numericScale > 0)) return fromZoom;
+    return Number(fromZoom) + Math.log(numericScale) / Math.LN2;
+  }
+
+  getBoundsZoom(bounds, inside = false, padding = [0, 0]) {
+    const target = bounds instanceof LatLngBounds ? bounds : latLngBounds(bounds);
+    if (!target.isValid()) return this.getMinZoom();
+    const pad = padding instanceof Point ? padding : point(padding);
+    const size = this.getSize().subtract(pad.multiplyBy(2));
+    const projectedSouthWest = this._projectWorld(target.getSouthWest());
+    const projectedNorthEast = this._projectWorld(target.getNorthEast());
+    const boundsSize = new Point(
+      Math.max(1e-9, Math.abs(projectedNorthEast.x - projectedSouthWest.x)),
+      Math.max(1e-9, Math.abs(projectedSouthWest.y - projectedNorthEast.y))
+    );
+    const scale = inside
+      ? Math.max(size.x / boundsSize.x, size.y / boundsSize.y)
+      : Math.min(size.x / boundsSize.x, size.y / boundsSize.y);
+    const zoom = this.getZoom() + Math.log(scale) / Math.LN2;
+    return Math.max(this.getMinZoom(), Math.min(this.getMaxZoom(), zoom));
+  }
+
+  _projectWorld(latlng) {
+    const value = latlng instanceof LatLng ? latlng : new LatLng(latlng[0], latlng[1]);
+    const scale = 256 * Math.pow(2, this.getZoom());
+    const sin = Math.sin(Math.max(-85.0511287798, Math.min(85.0511287798, value.lat)) * Math.PI / 180);
+    return new Point((value.lng + 180) / 360 * scale, (0.5 - Math.log((1 + sin) / (1 - sin)) / (4 * Math.PI)) * scale);
+  }
+
+  containerPointToLayerPoint(pointValue) {
+    return point(pointValue).subtract(this.getPixelOrigin());
+  }
+
+  layerPointToContainerPoint(pointValue) {
+    return point(pointValue).add(this.getPixelOrigin());
+  }
+
+  mouseEventToContainerPoint(event) {
+    const rect = this.canvas.getBoundingClientRect();
+    const scaleX = this.canvas.width / (rect.width || this.canvas.width || 1);
+    const scaleY = this.canvas.height / (rect.height || this.canvas.height || 1);
+    return new Point((event.clientX - rect.left) * scaleX, (event.clientY - rect.top) * scaleY);
+  }
+
+  mouseEventToLayerPoint(event) {
+    return this.containerPointToLayerPoint(this.mouseEventToContainerPoint(event));
+  }
+
+  mouseEventToLatLng(event) {
+    return this.containerPointToLatLng(this.mouseEventToContainerPoint(event));
+  }
+
+  wrapLatLng(value) {
+    const ll = value instanceof LatLng ? value : latLng(value);
+    return ll.wrap();
+  }
+
+  wrapLatLngBounds(value) {
+    const target = value instanceof LatLngBounds ? value : latLngBounds(value);
+    if (!target.isValid()) return target;
+    const center = target.getCenter();
+    const wrappedCenter = this.wrapLatLng(center);
+    const shift = wrappedCenter.lng - center.lng;
+    return new LatLngBounds(
+      [target.getSouth(), target.getWest() + shift],
+      [target.getNorth(), target.getEast() + shift]
+    );
+  }
+
+  getPane(name = 'overlayPane') {
+    if (this._panes[name]) return this._panes[name];
+    const pane = document.createElement('div');
+    pane.className = `rustyleaf-pane rustyleaf-${name}`;
+    Object.assign(pane.style, { position: 'absolute', inset: '0', pointerEvents: 'none' });
+    const zIndexes = {
+      mapPane: 0, tilePane: 200, overlayPane: 400, shadowPane: 500,
+      markerPane: 600, tooltipPane: 650, popupPane: 700
+    };
+    pane.style.zIndex = String(zIndexes[name] !== undefined ? zIndexes[name] : 400);
+    if (this.containerElement && pane.parentNode !== this.containerElement) this.containerElement.appendChild(pane);
+    this._panes[name] = pane;
+    return pane;
+  }
+
+  createPane(name, containerPane) {
+    if (this._panes[name]) return this._panes[name];
+    const pane = document.createElement('div');
+    pane.className = `rustyleaf-pane rustyleaf-${name}`;
+    Object.assign(pane.style, { position: 'absolute', inset: '0', pointerEvents: 'none' });
+    const parent = containerPane ? (typeof containerPane === 'string' ? this.getPane(containerPane) : containerPane) : this.containerElement;
+    if (parent) parent.appendChild(pane);
+    this._panes[name] = pane;
+    return pane;
+  }
+
+  getPanes() {
+    const names = ['mapPane', 'tilePane', 'overlayPane', 'shadowPane', 'markerPane', 'tooltipPane', 'popupPane'];
+    for (const name of names) this.getPane(name);
+    return { ...this._panes };
   }
   
   static _WASM_EVENT_MAP = {
@@ -1256,6 +1478,11 @@ class Map {
     this._controls = [];
     this._localEvents = {};
 
+    for (const pane of Object.values(this._panes || {})) {
+      if (pane && pane.parentNode) pane.parentNode.removeChild(pane);
+    }
+    this._panes = {};
+
     if (this.canvas && this.canvas.parentNode) {
       this.canvas.parentNode.removeChild(this.canvas);
     }
@@ -1291,26 +1518,30 @@ class TileLayer {
   constructor(urlTemplate, options = {}) {
     this.wasmTileLayer = new TileLayerApi(urlTemplate);
     this.options = options;
+    this._urlTemplate = urlTemplate || '';
+    this._opacity = options && options.opacity !== undefined ? Number(options.opacity) : 1;
+    this._zIndex = options && options.zIndex !== undefined ? Number(options.zIndex) : 1;
   }
 
   addTo(map) {
     if (!map || !map.wasmMap) return this;
+    const options = this.options || {};
     this.wasmTileLayer.add_to(map.wasmMap);
     // Plumb Leaflet-style options into the Rust tile loader.
     if (typeof map.wasmMap.configure_tile_layer === 'function') {
       try {
-        const subs = this.options.subdomains !== undefined
-          ? (Array.isArray(this.options.subdomains) ? this.options.subdomains : String(this.options.subdomains).split(''))
+        const subs = options.subdomains !== undefined
+          ? (Array.isArray(options.subdomains) ? options.subdomains : String(options.subdomains).split(''))
           : ['a', 'b', 'c'];
-        const minZ = typeof this.options.minZoom === 'number' ? this.options.minZoom : 0;
-        const maxZ = typeof this.options.maxZoom === 'number' ? this.options.maxZoom : 18;
-        const ts = typeof this.options.tileSize === 'number' ? this.options.tileSize : 256;
+        const minZ = typeof options.minZoom === 'number' ? options.minZoom : 0;
+        const maxZ = typeof options.maxZoom === 'number' ? options.maxZoom : 18;
+        const ts = typeof options.tileSize === 'number' ? options.tileSize : 256;
         map.wasmMap.configure_tile_layer(subs, minZ, maxZ, ts);
       } catch (e) {
         console.warn('TileLayer: failed to apply options:', e);
       }
     }
-    if (this.options.attribution && map.containerElement) {
+    if (options.attribution && map.containerElement) {
       let attrib = map.containerElement.querySelector('.rustyleaf-attribution');
       if (!attrib) {
         attrib = document.createElement('div');
@@ -1322,8 +1553,8 @@ class TileLayer {
         map.containerElement.appendChild(attrib);
       }
       const parts = attrib.innerHTML ? attrib.innerHTML.split(' | ') : [];
-      if (!parts.includes(this.options.attribution)) {
-        parts.push(this.options.attribution);
+      if (!parts.includes(options.attribution)) {
+        parts.push(options.attribution);
         attrib.innerHTML = parts.join(' | ');
       }
       this._attributionElement = attrib;
@@ -1340,7 +1571,7 @@ class TileLayer {
       if (this._map.wasmMap && typeof this._map.wasmMap.remove_tile_layer === 'function') {
         this._map.wasmMap.remove_tile_layer();
       }
-      if (this._attributionElement && this.options.attribution) {
+      if (this._attributionElement && this.options && this.options.attribution) {
         const parts = this._attributionElement.innerHTML.split(' | ')
           .filter((p) => p !== this.options.attribution);
         this._attributionElement.innerHTML = parts.join(' | ');
@@ -1351,11 +1582,69 @@ class TileLayer {
     }
     return this;
   }
+
+  getTileSize() {
+    const value = this.options && this.options.tileSize !== undefined ? this.options.tileSize : 256;
+    return Array.isArray(value) ? new Point(value[0], value[1]) : new Point(value, value);
+  }
+
+  getTileUrl(coords) {
+    const options = this.options || {};
+    const subdomains = options.subdomains !== undefined
+      ? (Array.isArray(options.subdomains) ? options.subdomains : String(options.subdomains).split(''))
+      : ['a', 'b', 'c'];
+    const index = Math.abs(Number(coords.x || 0) + Number(coords.y || 0)) % Math.max(1, subdomains.length);
+    const data = { ...options, ...coords, s: subdomains[index], r: options.detectRetina ? '@2x' : '' };
+    return String(this._urlTemplate).replace(/\{([\w-]+)\}/g, (match, key) => data[key] === undefined ? match : data[key]);
+  }
+
+  setUrl(url, noRedraw = false) {
+    this._urlTemplate = url || '';
+    if (this.wasmTileLayer) {
+      if ('urlTemplate' in this.wasmTileLayer) this.wasmTileLayer.urlTemplate = this._urlTemplate;
+      if ('url_template' in this.wasmTileLayer) this.wasmTileLayer.url_template = this._urlTemplate;
+    }
+    if (!noRedraw && this._map) this.redraw();
+    return this;
+  }
+
+  setOpacity(opacity) {
+    this._opacity = Math.max(0, Math.min(1, Number(opacity)));
+    if (this._map && this._map.canvas) this._map.canvas.style.opacity = String(this._opacity);
+    return this;
+  }
+
+  getOpacity() { return this._opacity; }
+
+  setZIndex(zIndex) {
+    this._zIndex = Number(zIndex);
+    if (this._map && this._map.canvas) this._map.canvas.style.zIndex = String(this._zIndex);
+    return this;
+  }
+
+  bringToFront() { return this.setZIndex(Math.max(this._zIndex, 1000)); }
+  bringToBack() { return this.setZIndex(Math.min(this._zIndex, 0)); }
+  getContainer() { return this._map ? this._map.canvas : null; }
+  getAttribution() { return this.options && this.options.attribution; }
+  isLoading() { return false; }
+  redraw() {
+    if (!this._map || !this._map.wasmMap) return this;
+    const map = this._map;
+    this.remove();
+    this.addTo(map);
+    return this;
+  }
+}
+
+function normalizeLayerCoordinate(value) {
+  if (Array.isArray(value)) return { lat: value[0], lng: value[1] };
+  if (value && typeof value === 'object') return { lat: value.lat, lng: value.lng };
+  return { lat: undefined, lng: undefined };
 }
 
 // PointLayer with Leaflet-style API
 class PointLayer {
-  constructor() {
+  constructor(options = {}) {
     // Check if WASM is available, otherwise use mock
     if (typeof WasmPointLayer !== 'undefined') {
       this.wasmPointLayer = new WasmPointLayer();
@@ -1364,6 +1653,8 @@ class PointLayer {
       this.wasmPointLayer = new PointLayerApi();
     }
     this.points = [];
+    this._bounds = new LatLngBounds();
+    this.options = { ...options };
   }
   
   add(points) {
@@ -1377,7 +1668,12 @@ class PointLayer {
     } else {
       // Before mounting, keep the original references once. addTo() transfers
       // them to Rust and immediately releases this array.
-      for (const point of points) this.points.push(point);
+      for (const point of points) {
+        this.points.push(point);
+        if (point && Number.isFinite(Number(point.lat)) && Number.isFinite(Number(point.lng))) {
+          this._bounds.extend([Number(point.lat), Number(point.lng)]);
+        }
+      }
     }
     return this;
   }
@@ -1428,6 +1724,7 @@ class PointLayer {
   
   clear() {
     this.points = [];
+    this._bounds = new LatLngBounds();
     if (this._map && this._layerIndex !== undefined) {
       this._map.wasmMap.clear_points(this._layerIndex);
     } else {
@@ -1472,25 +1769,37 @@ class PointLayer {
     }
     return this;
   }
+
+  getBounds() {
+    return this._bounds && this._bounds.isValid() ? this._bounds : null;
+  }
+
+  getLatLngs() {
+    return this.points
+      .filter((value) => value && value.lat !== undefined && value.lng !== undefined)
+      .map((value) => new LatLng(value.lat, value.lng));
+  }
 }
 
 // LineLayer with Leaflet-style API
 class LineLayer {
-  constructor() {
+  constructor(options = {}) {
     this.lines = [];
+    this.options = { ...options };
   }
   
   add(lines) {
     // Convert lines to expected format
-    const linesData = lines.map(line => ({
-      coords: line.coords.map(coord => ({
-        lat: coord.lat,
-        lng: coord.lng
-      })),
-      color: line.color || '#ff0000',
-      width: line.width || 2,
-      meta: line.meta || null
-    }));
+    if (!Array.isArray(lines)) throw new TypeError('LineLayer.add expects an array of lines');
+    const linesData = lines.map(line => {
+      const coords = Array.isArray(line) ? line : line.coords;
+      return {
+        coords: coords.map(normalizeLayerCoordinate),
+        color: line.color || '#ff0000',
+        width: line.width || this.options.weight || this.options.width || 2,
+        meta: line.meta || null
+      };
+    });
 
     if (this.map && this._layerIndex !== undefined) {
       // Mounted: forward straight to the wasm layer (append semantics).
@@ -1519,6 +1828,19 @@ class LineLayer {
     }
     return this;
   }
+
+  off(event, callback) {
+    const key = event === 'click' ? 'clickCallback' : event === 'hover' ? 'hoverCallback' : null;
+    if (!key) return this;
+    if (!callback || this[key] === callback) this[key] = undefined;
+    return this;
+  }
+
+  fire(event, data = {}) {
+    const callback = event === 'click' ? this.clickCallback : event === 'hover' ? this.hoverCallback : undefined;
+    if (typeof callback === 'function') callback({ type: event, target: this, ...data });
+    return this;
+  }
   
   addTo(map) {
     if (this.map === map && this._layerIndex !== undefined) {
@@ -1543,6 +1865,56 @@ class LineLayer {
     }
     return this;
   }
+
+  getLatLngs() {
+    return this.lines.map((line) => line.coords.map((coord) => new LatLng(coord.lat, coord.lng)));
+  }
+
+  setLatLngs(latlngs) {
+    const isCoord = (value) => Array.isArray(value) && typeof value[0] === 'number'
+      || value && typeof value === 'object' && value.lat !== undefined;
+    const normalized = Array.isArray(latlngs) && latlngs.length && isCoord(latlngs[0]) ? [latlngs] : [latlngs];
+    this.lines = normalized.map((coords) => ({
+      coords: coords.map((coord) => {
+        const ll = latLng(coord);
+        return { lat: ll.lat, lng: ll.lng };
+      }),
+      color: this.options.color || '#ff0000',
+      width: this.options.width || 2,
+      meta: null
+    }));
+    if (this.map && this._layerIndex !== undefined) {
+      this.map.wasmMap.clear_lines(this._layerIndex);
+      this.map.wasmMap.add_lines(this._layerIndex, this.lines);
+    }
+    return this;
+  }
+
+  getBounds() {
+    const result = new LatLngBounds();
+    for (const line of this.lines) for (const coord of line.coords) result.extend([coord.lat, coord.lng]);
+    return result.isValid() ? result : null;
+  }
+
+  setStyle(style = {}) {
+    Object.assign(this.options, style);
+    for (const line of this.lines) {
+      if (style.color !== undefined) line.color = style.color;
+      if (style.weight !== undefined) line.width = style.weight;
+      if (style.width !== undefined) line.width = style.width;
+    }
+    if (this.map && this._layerIndex !== undefined) {
+      this.map.wasmMap.clear_lines(this._layerIndex);
+      this.map.wasmMap.add_lines(this._layerIndex, this.lines);
+    }
+    return this;
+  }
+
+  getStyle() { return { ...this.options }; }
+  bringToFront() { this._zIndex = Math.max(this._zIndex || 0, 1000); return this; }
+  bringToBack() { this._zIndex = Math.min(this._zIndex || 0, 0); return this; }
+  bindPopup(content) { this._popup = new Popup({ content }); return this._popup.bindTo(this, content) && this; }
+  bindTooltip(content) { this._tooltip = new Tooltip({ content }); return this._tooltip.bindTo ? this._tooltip.bindTo(this, content) && this : this; }
 }
 
 // Enhanced Popup class with proper anchoring and auto-panning
@@ -1788,10 +2160,10 @@ class Popup {
     this.element.style.top = xy[1] + 'px';
     
     // Adjust position to keep popup in viewport
-    this._adjustForViewport(xy[0], xy[1]);
+    this._adjustForViewport();
   }
-  
-  _adjustForViewport(x, y) {
+
+  _adjustForViewport() {
     if (!this.element) return;
     
     const rect = this.element.getBoundingClientRect();
@@ -1821,8 +2193,7 @@ class Popup {
   
   _handleAutoPan() {
     if (!this.options.autoPan || !this.map || !this.latlng) return;
-    
-    const xy = this.map.wasmMap.screen_xy(this.latlng[0], this.latlng[1]);
+
     const containerRect = this.map.containerElement.getBoundingClientRect();
     const popupRect = this.element.getBoundingClientRect();
     
@@ -1962,10 +2333,11 @@ class Popup {
   bindTo(layer, content) {
     layer.on('click', (e) => {
       if (e.latlng) {
+        const resolvedContent = typeof content === 'function' ? content(layer, e) : content;
         this.setLatLng(e.latlng)
-          .setContent(content)
+          .setContent(resolvedContent)
           .setSource(layer)
-          .openOn(layer.map || this.map);
+          .openOn(layer.map || layer._map || layer._attachedMap || this.map);
       }
     });
     
@@ -1975,19 +2347,26 @@ class Popup {
 
 // PolygonLayer with Leaflet-style API  
 class PolygonLayer {
-  constructor() {
+  constructor(options = {}) {
     this.polygons = [];
+    this.options = { ...options };
   }
   
   add(polygons) {
     // Convert polygons to expected format
-    const polygonsData = polygons.map(polygon => ({
-      rings: polygon.rings.map(ring => 
-        ring.map(coord => ({ lat: coord.lat, lng: coord.lng }))
-      ),
-      color: polygon.color || '#ff0000',
-      meta: polygon.meta || null
-    }));
+    if (!Array.isArray(polygons)) throw new TypeError('PolygonLayer.add expects an array of polygons');
+    const polygonsData = polygons.map(polygon => {
+      const hasRingsProperty = polygon && !Array.isArray(polygon) && Array.isArray(polygon.rings);
+      const ringsInput = Array.isArray(polygon) ? polygon : polygon.rings;
+      const rings = hasRingsProperty ? ringsInput : (Array.isArray(ringsInput) && ringsInput.length &&
+        Array.isArray(ringsInput[0]) && (typeof ringsInput[0][0] === 'number' || (ringsInput[0][0] && ringsInput[0][0].lat !== undefined))
+        ? [ringsInput] : ringsInput);
+      return {
+        rings: rings.map(ring => ring.map(normalizeLayerCoordinate)),
+        color: polygon.color || this.options.fillColor || this.options.color || '#ff0000',
+        meta: polygon.meta || null
+      };
+    });
     
     for (const pg of polygonsData) this.polygons.push(pg);
     return this;
@@ -2006,6 +2385,19 @@ class PolygonLayer {
       // Store callback for later use
       this.hoverCallback = callback;
     }
+    return this;
+  }
+
+  off(event, callback) {
+    const key = event === 'click' ? 'clickCallback' : event === 'hover' ? 'hoverCallback' : null;
+    if (!key) return this;
+    if (!callback || this[key] === callback) this[key] = undefined;
+    return this;
+  }
+
+  fire(event, data = {}) {
+    const callback = event === 'click' ? this.clickCallback : event === 'hover' ? this.hoverCallback : undefined;
+    if (typeof callback === 'function') callback({ type: event, target: this, ...data });
     return this;
   }
   
@@ -2032,6 +2424,51 @@ class PolygonLayer {
     }
     return this;
   }
+
+  getLatLngs() {
+    return this.polygons.map((polygon) => polygon.rings.map((ring) => ring.map((coord) => new LatLng(coord.lat, coord.lng))));
+  }
+
+  setLatLngs(latlngs) {
+    const isCoord = (value) => Array.isArray(value) && typeof value[0] === 'number'
+      || value && typeof value === 'object' && value.lat !== undefined;
+    const rings = Array.isArray(latlngs) && latlngs.length && isCoord(latlngs[0]) ? [latlngs] : latlngs;
+    this.polygons = [{
+      rings: rings.map((ring) => ring.map((coord) => { const ll = latLng(coord); return { lat: ll.lat, lng: ll.lng }; })),
+      color: this.options.fillColor || this.options.color || '#ff0000',
+      meta: null
+    }];
+    if (this.map && this._layerIndex !== undefined) {
+      this.map.wasmMap.clear_polygons(this._layerIndex);
+      this.map.wasmMap.add_polygons(this._layerIndex, this.polygons);
+    }
+    return this;
+  }
+
+  getBounds() {
+    const result = new LatLngBounds();
+    for (const polygon of this.polygons) for (const ring of polygon.rings) for (const coord of ring) result.extend([coord.lat, coord.lng]);
+    return result.isValid() ? result : null;
+  }
+
+  setStyle(style = {}) {
+    Object.assign(this.options, style);
+    for (const polygon of this.polygons) {
+      if (style.fillColor !== undefined) polygon.color = style.fillColor;
+      else if (style.color !== undefined) polygon.color = style.color;
+    }
+    if (this.map && this._layerIndex !== undefined) {
+      this.map.wasmMap.clear_polygons(this._layerIndex);
+      this.map.wasmMap.add_polygons(this._layerIndex, this.polygons);
+    }
+    return this;
+  }
+
+  getStyle() { return { ...this.options }; }
+  bringToFront() { this._zIndex = Math.max(this._zIndex || 0, 1000); return this; }
+  bringToBack() { this._zIndex = Math.min(this._zIndex || 0, 0); return this; }
+  bindPopup(content) { this._popup = new Popup({ content }); return this._popup.bindTo(this, content) && this; }
+  bindTooltip(content) { this._tooltip = new Tooltip({ content }); return this._tooltip.bindTo ? this._tooltip.bindTo(this, content) && this : this; }
 }
 
 // ---------- Vector shapes (Circle / CircleMarker / Rectangle) ----------
@@ -2041,7 +2478,7 @@ const METERS_PER_DEG_LAT = 111320;
 // Base for shapes rendered through an internal point/polygon layer.
 class Shape {
   constructor(options = {}) {
-    this.options = options;
+    this.options = { ...options };
     this._layer = null;
     this._pendingEvents = [];
   }
@@ -2054,6 +2491,29 @@ class Shape {
 
   remove() {
     if (this._layer) this._layer.remove();
+    return this;
+  }
+
+  setStyle(style = {}) {
+    Object.assign(this.options, style);
+    return this.redraw();
+  }
+
+  getStyle() { return { ...this.options }; }
+
+  bindPopup(content) {
+    this._popup = content instanceof Popup ? content : new Popup({ content });
+    this._popup.bindTo(this, content);
+    return this;
+  }
+
+  bindTooltip(content) {
+    this._tooltipContent = content;
+    this.on('click', (event) => {
+      if (event && event.latlng && this._attachedMap) {
+        new Tooltip({ content }).setLatLng(event.latlng).openOn(this._attachedMap);
+      }
+    });
     return this;
   }
 
@@ -2093,13 +2553,15 @@ class Shape {
 // Circle with a geodesic radius in meters, tessellated into a polygon ring.
 class Circle extends Shape {
   constructor(latlng, options = {}) {
+    options = options || {};
     super(options);
-    this._latlng = [latlng[0], latlng[1]];
+    const value = latLng(latlng);
+    this._latlng = [value.lat, value.lng];
     this._radius = options.radius !== undefined ? options.radius : 10;
   }
 
-  getLatLng() { return [this._latlng[0], this._latlng[1]]; }
-  setLatLng(latlng) { this._latlng = [latlng[0], latlng[1]]; return this.redraw(); }
+  getLatLng() { return new LatLng(this._latlng[0], this._latlng[1]); }
+  setLatLng(latlng) { const value = latLng(latlng); this._latlng = [value.lat, value.lng]; return this.redraw(); }
   getRadius() { return this._radius; }
   setRadius(radius) { this._radius = radius; return this.redraw(); }
 
@@ -2123,7 +2585,7 @@ class Circle extends Shape {
   getBounds() {
     const [lat, lng] = this._latlng;
     const [dLat, dLng] = this._delta();
-    return [[lat - dLat, lng - dLng], [lat + dLat, lng + dLng]];
+    return new LatLngBounds([lat - dLat, lng - dLng], [lat + dLat, lng + dLng]);
   }
 
   addTo(map) {
@@ -2142,15 +2604,22 @@ class Circle extends Shape {
 // Circle with a fixed screen radius in pixels, rendered as a GPU point.
 class CircleMarker extends Shape {
   constructor(latlng, options = {}) {
+    options = options || {};
     super(options);
-    this._latlng = [latlng[0], latlng[1]];
+    const value = latLng(latlng);
+    this._latlng = [value.lat, value.lng];
     this._radius = options.radius !== undefined ? options.radius : 10;
   }
 
-  getLatLng() { return [this._latlng[0], this._latlng[1]]; }
-  setLatLng(latlng) { this._latlng = [latlng[0], latlng[1]]; return this.redraw(); }
+  getLatLng() { return new LatLng(this._latlng[0], this._latlng[1]); }
+  setLatLng(latlng) { const value = latLng(latlng); this._latlng = [value.lat, value.lng]; return this.redraw(); }
   getRadius() { return this._radius; }
   setRadius(radius) { this._radius = radius; return this.redraw(); }
+
+  getBounds() {
+    const value = latLng(this._latlng);
+    return new LatLngBounds([value.lat, value.lng], [value.lat, value.lng]);
+  }
 
   addTo(map) {
     if (this._reattached(map)) return this;
@@ -2170,16 +2639,16 @@ class CircleMarker extends Shape {
 // Axis-aligned rectangle from LatLngBounds, rendered as a polygon.
 class Rectangle extends Shape {
   constructor(bounds, options = {}) {
+    options = options || {};
     super(options);
     this.setBounds(bounds);
   }
 
-  getBounds() {
-    return [[this._bounds[0][0], this._bounds[0][1]], [this._bounds[1][0], this._bounds[1][1]]];
-  }
+  getBounds() { return new LatLngBounds(this._bounds); }
 
   setBounds(bounds) {
-    this._bounds = [[bounds[0][0], bounds[0][1]], [bounds[1][0], bounds[1][1]]];
+    const normalized = latLngBounds(bounds);
+    this._bounds = normalized.toJSON ? normalized.toJSON() : [[normalized[0][0], normalized[0][1]], [normalized[1][0], normalized[1][1]]];
     return this.redraw();
   }
 
@@ -2222,9 +2691,10 @@ class LayerGroup {
   }
 
   removeLayer(layer) {
-    if (this.hasLayer(layer)) {
-      this._layers = this._layers.filter((l) => l !== layer);
-      if (this._map) layer.remove();
+    const target = typeof layer === 'number' ? this._layers.find((item) => item && item._leaflet_id === layer) : layer;
+    if (this.hasLayer(target)) {
+      this._layers = this._layers.filter((l) => l !== target);
+      if (this._map && target && typeof target.remove === 'function') target.remove();
     }
     return this;
   }
@@ -2242,14 +2712,31 @@ class LayerGroup {
     return this;
   }
 
+  invoke(methodName, ...args) {
+    for (const layer of this._layers.slice()) {
+      if (layer && typeof layer[methodName] === 'function') layer[methodName](...args);
+    }
+    return this;
+  }
+
+  bindPopup(content) {
+    return this.invoke('bindPopup', content);
+  }
+
+  bindTooltip(content) {
+    return this.invoke('bindTooltip', content);
+  }
+
   addTo(map) {
     this._map = map;
     for (const layer of this._layers) layer.addTo(map);
+    if (map && map._notifyLayerAdd) map._notifyLayerAdd(this);
     return this;
   }
 
   remove() {
     for (const layer of this._layers) layer.remove();
+    if (this._map && this._map._notifyLayerRemove) this._map._notifyLayerRemove(this);
     this._map = null;
     return this;
   }
@@ -2292,20 +2779,19 @@ class FeatureGroup extends LayerGroup {
   }
 
   getBounds() {
-    let out = null;
+    const out = new LatLngBounds();
     for (const layer of this._layers) {
       if (typeof layer.getBounds !== 'function') continue;
       const b = layer.getBounds();
       if (!b) continue;
-      out = out
-        ? [
-          [Math.min(out[0][0], b[0][0]), Math.min(out[0][1], b[0][1])],
-          [Math.max(out[1][0], b[1][0]), Math.max(out[1][1], b[1][1])]
-        ]
-        : [[b[0][0], b[0][1]], [b[1][0], b[1][1]]];
+      out.extend(b);
     }
-    return out;
+    return out.isValid() ? out : null;
   }
+
+  setStyle(style) { return this.invoke('setStyle', style); }
+  bringToFront() { return this.invoke('bringToFront'); }
+  bringToBack() { return this.invoke('bringToBack'); }
 }
 
 // WASM event callbacks are dispatched synchronously while the Rust map is
@@ -2323,6 +2809,7 @@ function deferCallback(fn) {
 // the wasm screen_xy projection.
 class ImageOverlay {
   constructor(url, bounds, options = {}) {
+    options = options || {};
     this._url = url;
     this.options = options;
     this._element = null;
@@ -2332,13 +2819,18 @@ class ImageOverlay {
   }
 
   getBounds() {
-    return [[this._bounds[0][0], this._bounds[0][1]], [this._bounds[1][0], this._bounds[1][1]]];
+    return new LatLngBounds(this._bounds);
   }
 
   setBounds(bounds) {
-    this._bounds = [[bounds[0][0], bounds[0][1]], [bounds[1][0], bounds[1][1]]];
+    const normalized = latLngBounds(bounds);
+    this._bounds = [[normalized[0][0], normalized[0][1]], [normalized[1][0], normalized[1][1]]];
     this._updatePosition();
     return this;
+  }
+
+  getCenter() {
+    return latLngBounds(this._bounds).getCenter();
   }
 
   setUrl(url) {
@@ -2348,8 +2840,14 @@ class ImageOverlay {
   }
 
   setOpacity(opacity) {
-    this.options.opacity = opacity;
+    if (this.options) this.options.opacity = opacity;
     if (this._element) this._element.style.opacity = String(opacity);
+    return this;
+  }
+
+  setZIndex(zIndex) {
+    this._zIndex = Number(zIndex);
+    if (this._element) this._element.style.zIndex = String(this._zIndex);
     return this;
   }
 
@@ -2476,6 +2974,7 @@ class SVGOverlay extends ImageOverlay {
 // GeoJSONLayer with Leaflet-style API
 class GeoJSONLayer {
   constructor(geojson = null, options = {}) {
+    options = options || {};
     this.geojson = geojson;
     this.options = {
       pointColor: options.pointColor || '#0080ff',
@@ -2490,6 +2989,7 @@ class GeoJSONLayer {
     this._pendingTimer = null;
     // Leaflet-style options state: filter / pointToLayer / onEachFeature
     this._featureLayers = [];        // layers returned by pointToLayer
+    this._featureLayerFeatures = []; // source features for pointToLayer layers
     this._featureHandles = [];       // per-feature handles for onEachFeature
     this._mountedFeatureLayerCount = 0;
     this._optionsApplied = false;
@@ -2497,6 +2997,8 @@ class GeoJSONLayer {
     this._layerEvents = {};          // layer-level click/hover listeners
     this._openTooltip = null;
     this._openTooltipFid = undefined;
+    this._featureStyles = [];
+    this._collectionBindings = [];
   }
 
   // Apply filter / pointToLayer / onEachFeature before data reaches the wasm
@@ -2506,8 +3008,9 @@ class GeoJSONLayer {
   // to their handles. Streaming loads (loadUrlStreaming/loadFile/processChunk)
   // bypass these options.
   _applyFeatureOptions(geojson) {
-    const { filter, onEachFeature, pointToLayer } = this.options;
-    if (!filter && !onEachFeature && !pointToLayer) return geojson;
+    const { filter, onEachFeature, pointToLayer, style } = this.options;
+    const styleOption = style || this.styleFunction;
+    if (!filter && !onEachFeature && !pointToLayer && !styleOption) return geojson;
     if (this._optionsApplied) return this._processedGeoJSON || geojson;
 
     let features;
@@ -2519,6 +3022,12 @@ class GeoJSONLayer {
     const kept = [];
     for (const feature of features) {
       if (filter && !filter(feature)) continue;
+      if (styleOption) {
+        const featureStyle = typeof styleOption === 'function' ? styleOption(feature) : styleOption;
+        this._featureStyles.push(featureStyle || {});
+      } else {
+        this._featureStyles.push({});
+      }
       const geomType = feature.geometry && feature.geometry.type;
       if (pointToLayer && (geomType === 'Point' || geomType === 'MultiPoint')) {
         const coordsList = geomType === 'Point' ? [feature.geometry.coordinates] : feature.geometry.coordinates;
@@ -2526,7 +3035,10 @@ class GeoJSONLayer {
         for (const c of coordsList) {
           const layer = pointToLayer(feature, [c[1], c[0]]);
           if (layer) {
+            const featureStyle = this._featureStyles[this._featureStyles.length - 1];
+            if (featureStyle && typeof layer.setStyle === 'function') layer.setStyle(featureStyle);
             this._featureLayers.push(layer);
+            this._featureLayerFeatures.push(feature);
             if (!firstLayer) firstLayer = layer;
           }
         }
@@ -2557,11 +3069,27 @@ class GeoJSONLayer {
         return this;
       },
       off(event, callback) {
-        if (this._events[event]) this._events[event] = this._events[event].filter((cb) => cb !== callback);
+        if (!this._events[event]) return this;
+        if (typeof callback === 'function') this._events[event] = this._events[event].filter((cb) => cb !== callback);
+        else delete this._events[event];
         return this;
       },
       bindPopup(content) { this._popupContent = content; return this; },
       bindTooltip(content) { this._tooltipContent = content; return this; },
+      setStyle(style) { this._style = { ...(this._style || {}), ...style }; return this; },
+      resetStyle() { this._style = undefined; return this; },
+      getStyle() { return { ...(this._style || {}) }; },
+      getBounds() {
+        const coordinates = feature.geometry && feature.geometry.coordinates;
+        const result = new LatLngBounds();
+        const visit = (value) => {
+          if (!Array.isArray(value)) return;
+          if (typeof value[0] === 'number' && typeof value[1] === 'number') result.extend([value[1], value[0]]);
+          else for (const child of value) visit(child);
+        };
+        visit(coordinates);
+        return result.isValid() ? result : null;
+      },
     };
   }
 
@@ -2575,8 +3103,12 @@ class GeoJSONLayer {
       this._clickDispatcherAttached = true;
       // Attach whenever the layer is on a map — feature handles AND
       // layer-level click/hover listeners both dispatch through here.
-      this.map.on('click', (e) => deferCallback(() => this._dispatchFeatureEvent(e, 'click')));
-      this.map.on('hover', (e) => deferCallback(() => this._dispatchFeatureEvent(e, 'hover')));
+      this._dispatchHandlers = {
+        click: (e) => deferCallback(() => this._dispatchFeatureEvent(e, 'click')),
+        hover: (e) => deferCallback(() => this._dispatchFeatureEvent(e, 'hover'))
+      };
+      this.map.on('click', this._dispatchHandlers.click);
+      this.map.on('hover', this._dispatchHandlers.hover);
     }
   }
 
@@ -2625,10 +3157,12 @@ class GeoJSONLayer {
       }
     }
     if (kind === 'click' && handle._popupContent) {
-      new Popup().setLatLng(e.latlng).setContent(handle._popupContent).setSource(this).openOn(this.map);
+      const content = typeof handle._popupContent === 'function' ? handle._popupContent(handle.feature) : handle._popupContent;
+      new Popup().setLatLng(e.latlng).setContent(content).setSource(this).openOn(this.map);
     }
     if (kind === 'hover' && handle._tooltipContent && !this._openTooltip) {
-      this._openTooltip = new Tooltip({ content: handle._tooltipContent }).setLatLng(e.latlng).openOn(this.map);
+      const content = typeof handle._tooltipContent === 'function' ? handle._tooltipContent(handle.feature) : handle._tooltipContent;
+      this._openTooltip = new Tooltip({ content }).setLatLng(e.latlng).openOn(this.map);
       this._openTooltipFid = fid;
     }
     // Layer-level listeners always see feature hits too.
@@ -2664,9 +3198,14 @@ class GeoJSONLayer {
         }
       }
       this._featureLayers = [];
+      this._featureLayerFeatures = [];
       this._featureHandles = [];
+      this._featureStyles = [];
+      this._collectionBindings = [];
       this._mountedFeatureLayerCount = 0;
       this._optionsApplied = false;
+      this._processedGeoJSON = null;
+      this._streamedText = null;
       this.dataLoaded = false;
     }
 
@@ -2782,8 +3321,18 @@ class GeoJSONLayer {
               .then(({ done, value }) => {
                 if (done) {
                   // Process final buffer
-                  if (buffer.trim()) {
-                    this.processChunk(buffer, true);
+                  const finalText = buffer + decoder.decode();
+                  if (finalText.trim()) {
+                    this.processChunk(finalText, true);
+                  }
+                  // A complete FeatureCollection may have been emitted by the
+                  // quote-aware scanner on the last data chunk, leaving no
+                  // final tail. Parse the accumulated text for query APIs.
+                  if (!this.geojson && this._streamedText) {
+                    try {
+                      this.geojson = JSON.parse(this._streamedText);
+                      this.dataLoaded = true;
+                    } catch (e) { /* NDJSON streams remain query-less */ }
                   }
                   
                   if (completeCallback) {
@@ -2805,7 +3354,7 @@ class GeoJSONLayer {
                 totalBytes += value.length;
                 
                 // Process complete JSON objects from buffer
-                this.processStreamingBuffer(buffer, false);
+                ({ remaining: buffer } = this.processStreamingBuffer(buffer));
                 
                 // Report progress
                 if (progressCallback && totalSize) {
@@ -2844,7 +3393,7 @@ class GeoJSONLayer {
   }
 
   // Process streaming buffer for GeoJSON chunks
-  processStreamingBuffer(buffer, isFinal) {
+  processStreamingBuffer(buffer) {
     // Try to find and process complete JSON objects
     let processed = 0;
     
@@ -2936,26 +3485,129 @@ class GeoJSONLayer {
 
   // Set style options
   setStyle(style) {
-    Object.assign(this.options, style);
+    if (typeof style === 'function') {
+      this.styleFunction = style;
+      this.options.style = style;
+    } else if (style && typeof style === 'object') {
+      Object.assign(this.options, style);
+      if (style.style !== undefined) {
+        this.styleFunction = typeof style.style === 'function' ? style.style : undefined;
+      }
+    }
     if (this.map) {
       this.updateStyle();
+      this._applyFeatureStyles();
     }
     return this;
+  }
+
+  _featuresFromData(data) {
+    let value = data;
+    if (typeof value === 'string') {
+      try { value = JSON.parse(value); } catch (e) { return []; }
+    }
+    if (!value || typeof value !== 'object') return [];
+    if (value.type === 'FeatureCollection') return Array.isArray(value.features) ? value.features : [];
+    if (value.type === 'Feature') return [value];
+    if (value.type) return [{ type: 'Feature', geometry: value, properties: {} }];
+    return [];
+  }
+
+  // Leaflet's addData appends features; loadData remains the explicit
+  // replacement API used by streaming and URL loads.
+  addData(geojson) {
+    const incoming = this._featuresFromData(geojson);
+    const existing = this._featuresFromData(this.geojson);
+    if (existing.length > 0 && incoming.length > 0) {
+      return this.loadData({
+        type: 'FeatureCollection',
+        features: [...existing, ...incoming]
+      });
+    }
+    return this.loadData(geojson);
+  }
+
+  _featureCollection() {
+    return this._featuresFromData(this.geojson);
+  }
+
+  getLayers() {
+    return this._featureLayers.concat(this._featureHandles);
+  }
+
+  eachLayer(fn, context) {
+    if (typeof fn !== 'function') return this;
+    for (const layer of this.getLayers()) fn.call(context, layer);
+    return this;
+  }
+
+  bindPopup(content) {
+    this._collectionBindings.push({ method: 'bindPopup', content });
+    return this.invokeFeatureMethod('bindPopup', content);
+  }
+
+  bindTooltip(content) {
+    this._collectionBindings.push({ method: 'bindTooltip', content });
+    return this.invokeFeatureMethod('bindTooltip', content);
+  }
+
+  invokeFeatureMethod(methodName, ...args) {
+    for (const layer of this.getLayers()) {
+      if (layer && typeof layer[methodName] === 'function') layer[methodName](...args);
+    }
+    return this;
+  }
+
+  resetStyle(layer) {
+    if (layer && typeof layer.resetStyle === 'function') {
+      layer.resetStyle();
+    } else if (layer && typeof layer.setStyle === 'function') {
+      layer.setStyle({});
+    } else {
+      this._applyFeatureStyles();
+    }
+    return this;
+  }
+
+  toGeoJSON() {
+    const value = this.geojson;
+    if (value === null || value === undefined) return null;
+    if (typeof value === 'string') {
+      try { return JSON.parse(value); } catch (e) { return null; }
+    }
+    try { return JSON.parse(JSON.stringify(value)); } catch (e) { return value; }
+  }
+
+  _applyFeatureStyles() {
+    const styleOption = this.options.style || this.styleFunction;
+    if (!styleOption) return;
+    for (const handle of this._featureHandles) {
+      const style = typeof styleOption === 'function' ? styleOption(handle.feature) : styleOption;
+      if (handle && typeof handle.setStyle === 'function') handle.setStyle(style || {});
+    }
+    for (let i = 0; i < this._featureLayers.length; i += 1) {
+      const feature = this._featureLayerFeatures[i];
+      const style = typeof styleOption === 'function' ? styleOption(feature) : styleOption;
+      const layer = this._featureLayers[i];
+      if (layer && typeof layer.setStyle === 'function') layer.setStyle(style || {});
+    }
   }
 
   // Update style on the map
   updateStyle() {
     if (this.map && this.layerIndex !== undefined &&
         typeof this.map.wasmMap.set_geojson_style === 'function') {
+      const style = this.options.style && typeof this.options.style === 'object' ? this.options.style : {};
       const styleData = {
-        pointColor: this.options.pointColor,
-        pointSize: this.options.pointSize,
-        lineColor: this.options.lineColor,
-        lineWidth: this.options.lineWidth,
-        polygonColor: this.options.polygonColor
+        pointColor: style.pointColor || style.color || this.options.pointColor,
+        pointSize: style.pointSize || style.radius || this.options.pointSize,
+        lineColor: style.lineColor || style.color || this.options.lineColor,
+        lineWidth: style.lineWidth || style.weight || style.width || this.options.lineWidth,
+        polygonColor: style.polygonColor || style.fillColor || style.color || this.options.polygonColor
       };
       this.map.wasmMap.set_geojson_style(this.layerIndex, styleData);
     }
+    this._applyFeatureStyles();
   }
 
   // Add layer to map
@@ -3042,6 +3694,12 @@ class GeoJSONLayer {
         try { this.map.wasmMap.free_geojson_layer_gpu(this.layerIndex); } catch (e) { /* stale index */ }
       }
       if (this.map._notifyLayerRemove) this.map._notifyLayerRemove(this);
+      if (this._dispatchHandlers && typeof this.map.off === 'function') {
+        this.map.off('click', this._dispatchHandlers.click);
+        this.map.off('hover', this._dispatchHandlers.hover);
+      }
+      this._dispatchHandlers = null;
+      this._clickDispatcherAttached = false;
     }
     for (const layer of this._featureLayers) layer.remove();
     return this;
@@ -3049,63 +3707,58 @@ class GeoJSONLayer {
 
   // Get feature bounds
   getBounds() {
-    if (!this.geojson) return null;
-    
-    // Calculate bounds from GeoJSON features
-    let minLng = Infinity, minLat = Infinity;
-    let maxLng = -Infinity, maxLat = -Infinity;
-    
-    const extractCoordinates = (geometry) => {
-      switch (geometry.type) {
-      case 'Point':
-        return [geometry.coordinates];
-      case 'MultiPoint':
-        return geometry.coordinates;
-      case 'LineString':
-        return geometry.coordinates;
-      case 'MultiLineString':
-        return geometry.coordinates.flat();
-      case 'Polygon':
-        return geometry.coordinates.flat();
-      case 'MultiPolygon':
-        return geometry.coordinates.flat().flat();
-      default:
-        return [];
+    let source = this.geojson;
+    if (!source) return null;
+    if (typeof source === 'string') {
+      try { source = JSON.parse(source); } catch (e) { return null; }
+    }
+    const result = new LatLngBounds();
+    const visitCoordinates = (coordinates) => {
+      if (!Array.isArray(coordinates)) return;
+      if (typeof coordinates[0] === 'number' && typeof coordinates[1] === 'number') {
+        if (Number.isFinite(coordinates[0]) && Number.isFinite(coordinates[1])) {
+          result.extend([coordinates[1], coordinates[0]]);
+        }
+        return;
+      }
+      for (const value of coordinates) visitCoordinates(value);
+    };
+    const visitGeometry = (geometry) => {
+      if (!geometry) return;
+      if (geometry.type === 'GeometryCollection') {
+        for (const child of geometry.geometries || []) visitGeometry(child);
+      } else {
+        visitCoordinates(geometry.coordinates);
       }
     };
-
-    const processFeature = (feature) => {
-      const coords = extractCoordinates(feature.geometry);
-      coords.forEach(([lng, lat]) => {
-        if (typeof lng === 'number' && typeof lat === 'number' && !isNaN(lng) && !isNaN(lat)) {
-          minLng = Math.min(minLng, lng);
-          minLat = Math.min(minLat, lat);
-          maxLng = Math.max(maxLng, lng);
-          maxLat = Math.max(maxLat, lat);
-        }
-      });
+    const visit = (value) => {
+      if (!value) return;
+      if (value.type === 'FeatureCollection') {
+        for (const feature of value.features || []) visit(feature);
+      } else if (value.type === 'Feature') {
+        visitGeometry(value.geometry);
+      } else if (value.type) {
+        visitGeometry(value);
+      }
     };
-
-    if (this.geojson.type === 'FeatureCollection' && Array.isArray(this.geojson.features)) {
-      this.geojson.features.forEach(processFeature);
-    } else if (this.geojson.type === 'Feature' && this.geojson.geometry) {
-      processFeature(this.geojson);
-    } else if (this.geojson.type && this.geojson.coordinates) {
-      // Direct geometry
-      processFeature({ geometry: this.geojson });
-    }
-
-    if (minLng === Infinity) return null;
-    
-    return [
-      [minLat, minLng], // Southwest
-      [maxLat, maxLng]  // Northeast
-    ];
+    visit(source);
+    return result.isValid() ? result : null;
   }
 
   // Clear layer data
   clear() {
     this.geojson = null;
+    this.dataLoaded = false;
+    this._processedGeoJSON = null;
+    this._streamedText = null;
+    this._featureStyles = [];
+    this._featureHandles = [];
+    this._featureLayerFeatures = [];
+    this._mountedFeatureLayerCount = 0;
+    for (const layer of this._featureLayers) {
+      try { layer.remove(); } catch (e) { /* already detached */ }
+    }
+    this._featureLayers = [];
     if (this.map && this.layerIndex !== undefined) {
       try {
         this.map.wasmMap.clear_geojson_layer(this.layerIndex);
@@ -3246,6 +3899,13 @@ class GeoJSONLayer {
     try {
       const featureStr = typeof feature === 'string' ? feature : JSON.stringify(feature);
       this.processChunk(featureStr, false);
+      if (typeof feature !== 'string' && feature && typeof feature === 'object') {
+        if (this.geojson && this.geojson.type === 'FeatureCollection') {
+          this.geojson.features = [...(this.geojson.features || []), feature];
+        } else if (!this.geojson) {
+          this.geojson = { type: 'FeatureCollection', features: [feature] };
+        }
+      }
     } catch (error) {
       console.warn('Failed to add feature:', error);
     }
@@ -3264,11 +3924,14 @@ class GeoJSONLayer {
     const features = this.geojson
       ? (this.geojson.type === 'FeatureCollection' ? this.geojson.features : this.geojson.type === 'Feature' ? [this.geojson] : [])
       : [];
-    if (!bounds || !Array.isArray(bounds)) return features.slice();
-    const south = Math.min(bounds[0][0], bounds[1][0]);
-    const north = Math.max(bounds[0][0], bounds[1][0]);
-    const west = Math.min(bounds[0][1], bounds[1][1]);
-    const east = Math.max(bounds[0][1], bounds[1][1]);
+    if (!bounds) return features.slice();
+    let normalized;
+    try { normalized = bounds instanceof LatLngBounds ? bounds : latLngBounds(bounds); } catch (e) { return []; }
+    if (!normalized.isValid()) return [];
+    const south = normalized.getSouth();
+    const north = normalized.getNorth();
+    const west = normalized.getWest();
+    const east = normalized.getEast();
     const coordIn = ([lng, lat]) => lat >= south && lat <= north && lng >= west && lng <= east;
     const anyCoord = (coords) => {
       if (!Array.isArray(coords)) return false;
@@ -3280,7 +3943,9 @@ class GeoJSONLayer {
 
   // Set data-driven styling based on properties
   setStyleFunction(styleFn) {
+    if (typeof styleFn !== 'function') throw new TypeError('GeoJSONLayer.setStyleFunction expects a function');
     this.styleFunction = styleFn;
+    this.options.style = styleFn;
     if (this.map && this.layerIndex !== undefined) {
       this.updateStyle();
     }
@@ -3291,6 +3956,7 @@ class GeoJSONLayer {
 // Icon with Leaflet-style API
 class Icon {
   constructor(options = {}) {
+    options = options || {};
     this.options = { ...options };
     if (!this.options.iconUrl && !(this instanceof DivIcon)) {
       throw new Error('Icon requires an iconUrl option');
@@ -3317,6 +3983,7 @@ Icon.Default = class extends Icon {
 // DivIcon — HTML-based icon
 class DivIcon extends Icon {
   constructor(options = {}) {
+    options = options || {};
     super({ ...options, iconUrl: options.iconUrl || 'divicon' });
     // Leaflet parity: DivIcon renders `html` (string or HTMLElement) as a
     // DOM overlay marker instead of a GPU sprite.
@@ -3342,12 +4009,10 @@ function parseMarkerColor(hex) {
 // forwards it to the WASM map. Popups/tooltips remain DOM overlays.
 class Marker {
   constructor(latlng, options = {}) {
-    if (!Array.isArray(latlng) || latlng.length !== 2 ||
-        typeof latlng[0] !== 'number' || typeof latlng[1] !== 'number' ||
-        isNaN(latlng[0]) || isNaN(latlng[1])) {
-      throw new Error('Invalid latlng: expected [lat, lng] numbers');
-    }
-    this._latlng = [latlng[0], latlng[1]];
+    options = options || {};
+    let value;
+    try { value = latLng(latlng); } catch (error) { throw new Error('Invalid latlng: expected [lat, lng] numbers'); }
+    this._latlng = [value.lat, value.lng];
     this._options = options;
     this._opacity = options.opacity !== undefined ? options.opacity : 1;
     this._zIndexOffset = options.zIndexOffset !== undefined ? options.zIndexOffset : 0;
@@ -3361,19 +4026,15 @@ class Marker {
   }
 
   getLatLng() {
-    return [this._latlng[0], this._latlng[1]];
+    return new LatLng(this._latlng[0], this._latlng[1]);
   }
 
   setLatLng(latlng) {
-    if (!Array.isArray(latlng) || latlng.length !== 2 ||
-        typeof latlng[0] !== 'number' || typeof latlng[1] !== 'number' ||
-        isNaN(latlng[0]) || isNaN(latlng[1]) ||
-        !isFinite(latlng[0]) || !isFinite(latlng[1])) {
-      throw new Error('Invalid latlng: expected [lat, lng] numbers');
-    }
-    this._latlng = [latlng[0], latlng[1]];
+    let value;
+    try { value = latLng(latlng); } catch (error) { throw new Error('Invalid latlng: expected [lat, lng] numbers'); }
+    this._latlng = [value.lat, value.lng];
     if (this._map && this._id !== null) {
-      this._map.wasmMap.update_marker(this._id, latlng[0], latlng[1]);
+      this._map.wasmMap.update_marker(this._id, value.lat, value.lng);
     }
     this._updateDomPosition();
     return this;
@@ -3578,7 +4239,8 @@ class Marker {
       this._popup.openOn(this._map);
     } else if (this._popupContent !== undefined) {
       // String/DOM content bound via bindPopup(content) — wrap lazily.
-      this._popup = new Popup({ content: this._popupContent });
+      const content = typeof this._popupContent === 'function' ? this._popupContent(this, this._latlng) : this._popupContent;
+      this._popup = new Popup({ content });
       this._popup.setLatLng(this._latlng);
       this._popup.openOn(this._map);
     }
@@ -3614,7 +4276,8 @@ class Marker {
     } else if (this._tooltipContent !== undefined) {
       // String/DOM content bound via bindTooltip(content) — wrap lazily.
       if (!this._boundTooltip || !(this._boundTooltip instanceof Tooltip)) {
-        this._boundTooltip = new Tooltip({ content: this._tooltipContent });
+        const content = typeof this._tooltipContent === 'function' ? this._tooltipContent(this, this._latlng) : this._tooltipContent;
+        this._boundTooltip = new Tooltip({ content });
       }
       this._boundTooltip.setLatLng(this._latlng);
       this._boundTooltip.openOn(this._map);
@@ -3642,6 +4305,7 @@ class Marker {
 // the render loop (the same pattern as Popup).
 class Tooltip {
   constructor(options = {}) {
+    options = options || {};
     this.options = Object.assign({
       direction: 'auto',
       opacity: 0.9,
@@ -3737,6 +4401,24 @@ class Tooltip {
     return this._isOpen ? this.element : null;
   }
 
+  bindTo(layer, content) {
+    this._source = layer;
+    if (content !== undefined && typeof content !== 'function') this.setContent(content);
+    const handler = (event) => {
+      const latlng = event && event.latlng
+        ? event.latlng
+        : (typeof layer.getLatLng === 'function' ? layer.getLatLng() : null);
+      const map = layer.map || layer._map || layer._attachedMap;
+      if (!latlng || !map) return;
+      const resolvedContent = typeof content === 'function' ? content(layer, event) : content;
+      if (resolvedContent !== undefined) this.setContent(resolvedContent);
+      this.setLatLng(latlng).openOn(map);
+    };
+    this._boundLayerHandler = handler;
+    if (layer && typeof layer.on === 'function') layer.on('hover', handler);
+    return this;
+  }
+
   _initLayout() {
     this.element = document.createElement('div');
     this.element.className = 'rustyleaf-tooltip' + (this.options.className ? ' ' + this.options.className : '');
@@ -3802,11 +4484,11 @@ class Control {
   }
 
   // Subclasses override this to build and return their DOM element.
-  onAdd(map) {
+  onAdd(_map) {
     return document.createElement('div');
   }
 
-  onRemove(map) {
+  onRemove(_map) {
     return this;
   }
 
@@ -4024,6 +4706,7 @@ class ScaleControl extends Control {
 // substituted by the Rust tile loader via the {bbox-epsg-3857} token.
 class WMSTileLayer extends TileLayer {
   constructor(baseUrl, options = {}) {
+    options = options || {};
     const params = {
       service: 'WMS',
       request: 'GetMap',
@@ -4094,7 +4777,7 @@ class GridLayer {
   }
 
   // Override in subclasses. Return a DOM element for the given {z, x, y}.
-  createTile(coords) { // eslint-disable-line no-unused-vars
+  createTile(_coords) {
     return document.createElement('div');
   }
 
@@ -4237,10 +4920,21 @@ const Util = {
   },
 
   stamp(obj) {
+    if (!obj || (typeof obj !== 'object' && typeof obj !== 'function')) {
+      throw new TypeError('Util.stamp expects an object');
+    }
     if (!obj._rustyleaf_id) {
       Util._lastId += 1;
       Object.defineProperty(obj, '_rustyleaf_id', {
         value: Util._lastId,
+        enumerable: false,
+        configurable: true,
+        writable: true,
+      });
+    }
+    if (!obj._leaflet_id) {
+      Object.defineProperty(obj, '_leaflet_id', {
+        value: obj._rustyleaf_id,
         enumerable: false,
         configurable: true,
         writable: true,
@@ -4301,6 +4995,38 @@ const Util = {
       return value;
     });
   },
+
+  isArray(value) { return Array.isArray(value); },
+
+  trim(value) { return String(value).trim(); },
+
+  splitWords(value) { return Util.trim(value).split(/\s+/).filter(Boolean); },
+
+  getParamString(obj, existingUrl = '', uppercase = false) {
+    const keys = Object.keys(obj || {});
+    if (!keys.length) return '';
+    const prefix = existingUrl && existingUrl.indexOf('?') !== -1 ? '&' : '?';
+    return prefix + keys.map((key) => {
+      const name = uppercase ? key.toUpperCase() : key;
+      return `${encodeURIComponent(name)}=${encodeURIComponent(obj[key] === null ? '' : obj[key])}`;
+    }).join('&');
+  },
+
+  requestAnimFrame(callback, context, immediate) {
+    const fn = () => callback.call(context);
+    if (immediate) {
+      fn();
+      return undefined;
+    }
+    return (typeof requestAnimationFrame === 'function' ? requestAnimationFrame : setTimeout)(fn, 16);
+  },
+
+  cancelAnimFrame(id) {
+    if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(id);
+    else clearTimeout(id);
+  },
+
+  emptyImageUrl: 'data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs='
 };
 
 // Leaflet-style layers control: checkboxes for overlays, radios for base layers.
@@ -4334,7 +5060,7 @@ class LayersControl extends Control {
     return this;
   }
 
-  onAdd(map) {
+  onAdd(_map) {
     const el = document.createElement('div');
     el.className = 'rustyleaf-layers-control';
     Object.assign(el.style, {
@@ -4382,8 +5108,73 @@ class LayersControl extends Control {
   }
 }
 
-// Export classes
-export { configureRustyleaf, Map, TileLayer, PointLayer, LineLayer, PolygonLayer, GeoJSONLayer, Popup, Marker, Icon, DivIcon, Tooltip, Control, ZoomControl, AttributionControl, ScaleControl, LayersControl, Circle, CircleMarker, Rectangle, LayerGroup, FeatureGroup, ImageOverlay, VideoOverlay, SVGOverlay, WMSTileLayer, GridLayer, Handler, Util };
+// Leaflet-style factory functions. Keeping factories as thin constructors
+// makes migration possible without hiding the class-based API.
+function map(container, options) { return new Map(container, options); }
+function tileLayer(urlTemplate, options) { return new TileLayer(urlTemplate, options); }
+function pointLayer(options) { return new PointLayer(options); }
+function lineLayer(options) { return new LineLayer(options); }
+function polygonLayer(options) { return new PolygonLayer(options); }
+function geoJSON(data, options) { return new GeoJSONLayer(data, options); }
+function marker(latlng, options) { return new Marker(latlng, options); }
+function icon(options) { return new Icon(options); }
+function divIcon(options) { return new DivIcon(options); }
+function popup(options, source) {
+  const value = new Popup(options);
+  if (source) value.setSource(source);
+  return value;
+}
+function tooltip(options) { return new Tooltip(options); }
+function circle(latlng, options) { return new Circle(latlng, options); }
+function circleMarker(latlng, options) { return new CircleMarker(latlng, options); }
+function rectangle(bounds, options) { return new Rectangle(bounds, options); }
+function layerGroup(layers) { return new LayerGroup(layers); }
+function featureGroup(layers) { return new FeatureGroup(layers); }
+function imageOverlay(url, bounds, options) { return new ImageOverlay(url, bounds, options); }
+function videoOverlay(url, bounds, options) { return new VideoOverlay(url, bounds, options); }
+function svgOverlay(element, bounds, options) { return new SVGOverlay(element, bounds, options); }
+function gridLayer(options) { return new GridLayer(options); }
+function wmsTileLayer(url, options) { return new WMSTileLayer(url, options); }
+function control(options) { return new Control(options); }
+function zoomControl(options) { return new ZoomControl(options); }
+function attributionControl(options) { return new AttributionControl(options); }
+function scaleControl(options) { return new ScaleControl(options); }
+function layersControl(baseLayers, overlays, options) { return new LayersControl(baseLayers, overlays, options); }
 
-// Default export for compatibility
-export default { configureRustyleaf, Map, TileLayer, PointLayer, LineLayer, PolygonLayer, GeoJSONLayer, Popup, Marker, Icon, DivIcon, Tooltip, Control, ZoomControl, AttributionControl, ScaleControl, LayersControl, Circle, CircleMarker, Rectangle, LayerGroup, FeatureGroup, ImageOverlay, VideoOverlay, SVGOverlay, WMSTileLayer, GridLayer, Handler, Util };
+const L = {
+  version: '0.0.8',
+  configureRustyleaf,
+  checkWebGLSupport,
+  Map, TileLayer, PointLayer, LineLayer, PolygonLayer, GeoJSONLayer,
+  Popup, Marker, Icon, DivIcon, Tooltip, Control, ZoomControl,
+  AttributionControl, ScaleControl, LayersControl, Circle, CircleMarker,
+  Rectangle, LayerGroup, FeatureGroup, ImageOverlay, VideoOverlay, SVGOverlay,
+  WMSTileLayer, GridLayer, Handler, Util,
+  Point, Bounds, LatLng, LatLngBounds, Transformation, CRS, Projection, Browser,
+  DomUtil, DomEvent,
+  map, tileLayer, pointLayer, lineLayer, polygonLayer, geoJSON, marker, icon,
+  divIcon, popup, tooltip, circle, circleMarker, rectangle, layerGroup,
+  featureGroup, imageOverlay, videoOverlay, svgOverlay, gridLayer,
+  wmsTileLayer, control, zoomControl, attributionControl, scaleControl,
+  layersControl,
+  latLng, latLngBounds, point, bounds
+};
+
+// Named exports mirror the default `L` namespace for both modern ES modules
+// and the migration pattern used by Leaflet plugins.
+export {
+  configureRustyleaf, checkWebGLSupport, Map, TileLayer, PointLayer, LineLayer,
+  PolygonLayer, GeoJSONLayer, Popup, Marker, Icon, DivIcon, Tooltip, Control,
+  ZoomControl, AttributionControl, ScaleControl, LayersControl, Circle,
+  CircleMarker, Rectangle, LayerGroup, FeatureGroup, ImageOverlay, VideoOverlay,
+  SVGOverlay, WMSTileLayer, GridLayer, Handler, Util, L,
+  Browser, Bounds, CRS, DomEvent, DomUtil, LatLng, LatLngBounds, Point,
+  Projection, Transformation, bounds, latLng, latLngBounds, point,
+  map, tileLayer, pointLayer, lineLayer, polygonLayer, geoJSON, marker, icon,
+  divIcon, popup, tooltip, circle, circleMarker, rectangle, layerGroup,
+  featureGroup, imageOverlay, videoOverlay, svgOverlay, gridLayer,
+  wmsTileLayer, control, zoomControl, attributionControl, scaleControl,
+  layersControl
+};
+
+export default L;

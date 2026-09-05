@@ -50,7 +50,7 @@ describe('ImageOverlay', () => {
 
   test('repositions on map move', async () => {
     const map = makeMap();
-    const o = new ImageOverlay('/img.png', bounds).addTo(map);
+    new ImageOverlay('/img.png', bounds).addTo(map);
     const img = map.containerElement.querySelector('img.rustyleaf-image-overlay');
     map.wasmMap.screen_xy.mockImplementation((lat: number, lng: number) => [lng * 100 + 50, -lat * 10 + 600]);
     wasmMock.fire(map.wasmMap.ptr, 'move', { type: 'move' });

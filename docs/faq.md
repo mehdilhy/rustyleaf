@@ -1,7 +1,7 @@
 # FAQ & Limitations
 
-Rustyleaf is **pre-alpha (v0.0.1)**. The API is unstable until 0.1.0. This page
-collects the current gaps and gotchas in one place.
+Rustyleaf is a **compatibility preview (v0.0.8)**. The API is still evolving
+until 0.1.0. This page collects the current gaps and gotchas in one place.
 
 ## Does it require WebGL2?
 

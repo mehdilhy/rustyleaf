@@ -51,7 +51,7 @@ features:
   - icon: 🧪
     title: Honestly documented & tested
     details: >-
-      405 Jest unit tests, a Playwright e2e suite (visual regression, GL leak
+      823 Jest unit and parity tests, a Playwright e2e suite (visual regression, GL leak
       detection, FPS, soak), and a reproducible benchmark. Nothing here is
       aspirational.
 
@@ -88,9 +88,9 @@ points.add(
 points.addTo(map)
 ```
 
-> ⚠️ **Pre-alpha (v0.0.1).** The API will change without notice and this is not
-> production-ready. Everything documented here works today and is covered by
-> unit and end-to-end tests.
+> **Compatibility preview (v0.0.8).** The documented Leaflet-style surface is
+> covered by unit, parity, and end-to-end tests while the WebGL2 renderer and
+> plugin ecosystem continue to mature.
 
 ## Performance at a glance
 
@@ -113,3 +113,5 @@ environment). [See the benchmark →](/performance)
 - **Looking up a method?** Jump to the [API Reference](/api).
 - **Want proof?** Check [Examples](/examples) and
   [Performance](/performance).
+- **Migrating a Leaflet workflow?** Use the [20 use cases](/use-cases) as a
+  copy-paste compatibility checklist.

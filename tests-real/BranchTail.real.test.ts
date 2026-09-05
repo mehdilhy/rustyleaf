@@ -5,9 +5,8 @@
  */
 
 import * as RustyleafAPI from '../src/rustyleaf-api.js';
-import * as wasmMock from '../tests/__mocks__/wasmMock';
-const { Map, Popup, Tooltip, Marker, DivIcon, Icon, GeoJSONLayer, ImageOverlay,
-  VideoOverlay, SVGOverlay, WMSTileLayer, GridLayer, LayerGroup, CircleMarker,
+const { Map, Popup, Tooltip, Marker, DivIcon, GeoJSONLayer, ImageOverlay,
+  WMSTileLayer, GridLayer, LayerGroup, CircleMarker,
   configureRustyleaf } = RustyleafAPI as any;
 
 describe('configureRustyleaf / wasm bootstrap', () => {
@@ -313,7 +312,7 @@ describe('Marker tooltip/popup binding guards (3286, 3370-3371, 3463)', () => {
   test('DivIcon marker anchor transform handles zero anchors (3370-3371)', () => {
     const map = makeMap();
     const icon = new DivIcon({ html: '<div>z</div>', iconSize: [20, 20], iconAnchor: [0, 0] });
-    const m = new Marker([48.85, 2.35], { icon }).addTo(map);
+    new Marker([48.85, 2.35], { icon }).addTo(map);
     const domEl = map.containerElement.querySelector('.rustyleaf-div-icon-marker');
     if (domEl) {
       expect(domEl.style.transform).toContain('translate');

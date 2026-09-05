@@ -9,13 +9,38 @@ import rustyleaf from 'rustyleaf'        // default: { Map, TileLayer, ... }
 import { Map, PointLayer } from 'rustyleaf' // named is usually easier
 ```
 
+The package also exposes an `L`-style namespace and thin factories for common
+Leaflet codebases:
+
+```js
+import L, { CRS, latLng, latLngBounds } from 'rustyleaf'
+
+const map = L.map('map')
+const points = L.pointLayer()
+const bounds = latLngBounds([[48, 2], [49, 3]])
+map.fitBounds(bounds)
+```
+
 ## Types
 
 ```ts
-type LatLng = [number, number]            // [lat, lng]
-type LatLngBounds = [LatLng, LatLng]      // [southWest, northEast]
+type LatLng = [number, number] | LatLngValue // [lat, lng]
+type LatLngBounds = [LatLng, LatLng] | LatLngBoundsValue
+type LatLngLike = LatLng | { lat: number; lng: number; alt?: number }
+type LatLngBoundsLike = LatLngBounds | [LatLngLike, LatLngLike]
+type PointLike = [number, number] | PointValue | { x: number; y: number }
 
-interface MapOptions { center?: LatLng; zoom?: number }
+interface LatLngValue extends Array<number> { lat: number; lng: number; toArray(): number[] }
+interface LatLngBoundsValue extends Array<number[]> { isValid(): boolean; getCenter(): LatLngValue | null; toBBox(): string }
+interface PointValue extends Array<number> { x: number; y: number; toArray(): number[] }
+interface BoundsValue extends Array<number[][]> { isValid(): boolean; getCenter(): PointValue | null }
+
+interface MapOptions {
+  center?: LatLngLike
+  zoom?: number; minZoom?: number; maxZoom?: number
+  maxBounds?: LatLngBoundsLike | null; zoomDelta?: number; zoomSnap?: number
+  crs?: CRSLike; layers?: GroupableLayer[]
+}
 
 interface LocateOptions {
   setView?: boolean; maxZoom?: number; watch?: boolean
@@ -41,24 +66,24 @@ interface PolygonFeature { rings: Array<Array<{ lat: number; lng: number }>>; co
 class Map {
   constructor(container: string | HTMLElement, options?: MapOptions)
 
-  setView(latlng: LatLng, zoom: number): this
-  panBy(dx: number, dy: number): this
-  zoomIn(): this
-  zoomOut(): this
+  setView(latlng: LatLngLike, zoom: number): this
+  panBy(offset: PointLike): this; panBy(dx: number, dy: number): this
+  zoomIn(delta?: number): this; zoomOut(delta?: number): this
 
   getWebGLSupport(): WebGLSupportInfo
   static checkWebGLSupport(): WebGLSupportInfo
 
-  getCenter(): LatLng
+  getCenter(): LatLngValue
   getZoom(): number
-  setMinZoom(minZoom: number): this
-  setMaxZoom(maxZoom: number): this
-  getBounds(): LatLngBounds
-  fitBounds(bounds: LatLngBounds): this
-  flyTo(latlng: LatLng, options?: { zoom?: number; duration?: number }): this
-  flyToBounds(bounds: LatLngBounds, options?: { duration?: number }): this
-  setMaxBounds(bounds: LatLngBounds | null): this
-  getMaxBounds(): LatLngBounds | null
+  setMinZoom(minZoom: number): this; setMaxZoom(maxZoom: number): this
+  getMinZoom(): number; getMaxZoom(): number
+  getBounds(): LatLngBoundsValue
+  fitBounds(bounds: LatLngBoundsLike, options?: { maxZoom?: number }): this
+  flyTo(latlng: LatLngLike, zoom?: number, options?: { duration?: number }): this
+  flyTo(latlng: LatLngLike, options?: { zoom?: number; duration?: number }): this
+  flyToBounds(bounds: LatLngBoundsLike, options?: { maxZoom?: number; duration?: number }): this
+  setMaxBounds(bounds: LatLngBoundsLike | null): this
+  getMaxBounds(): LatLngBoundsValue | null
   invalidateSize(): this
 
   locate(options?: LocateOptions): this
@@ -69,8 +94,23 @@ class Map {
   hasLayer(layer: GroupableLayer): boolean
   addHandler(name: string, HandlerClass: new (map: Map) => Handler): this
 
-  project(latlng: LatLng): [number, number]
-  unproject(point: [number, number]): LatLng
+  distance(a: LatLngLike, b: LatLngLike): number
+  project(latlng: LatLngLike): PointValue
+  unproject(point: PointLike): LatLngValue
+  getSize(): PointValue; getPixelOrigin(): PointValue; getPixelBounds(): BoundsValue
+  getPixelWorldBounds(zoom?: number): BoundsValue
+  getZoomScale(toZoom: number, fromZoom?: number): number
+  getScaleZoom(scale: number, fromZoom?: number): number
+  getBoundsZoom(bounds: LatLngBoundsLike, inside?: boolean, padding?: PointLike): number
+  containerPointToLatLng(point: PointLike): LatLngValue
+  latLngToContainerPoint(latlng: LatLngLike): PointValue
+  mouseEventToContainerPoint(event: MouseEvent): PointValue
+  mouseEventToLayerPoint(event: MouseEvent): PointValue
+  mouseEventToLatLng(event: MouseEvent): LatLngValue
+  wrapLatLng(latlng: LatLngLike): LatLngValue
+  wrapLatLngBounds(bounds: LatLngBoundsLike): LatLngBoundsValue
+  getPane(name?: string): HTMLElement; createPane(name: string, parent?: string | HTMLElement): HTMLElement
+  getPanes(): Record<string, HTMLElement>
 
   on(event: string, callback: (...args: any[]) => void): this
   off(event: string, callback: (...args: any[]) => void): this
@@ -78,7 +118,12 @@ class Map {
   remove(): this
   destroy(): this
 }
+
 ```
+
+`flyTo`/`flyToBounds` use Leaflet's seconds for durations below ten; larger
+values retain Rustyleaf's legacy millisecond form during the compatibility
+preview.
 
 Events: see [Events](./guide/events).
 
@@ -89,6 +134,12 @@ class TileLayer {
   constructor(urlTemplate: string, options?: Record<string, any>)
   addTo(map: Map): this
   remove(): this
+  getTileSize(): PointValue; getTileUrl(coords: { x: number; y: number; z: number }): string
+  setUrl(url: string, noRedraw?: boolean): this
+  setOpacity(opacity: number): this; getOpacity(): number
+  setZIndex(zIndex: number): this; bringToFront(): this; bringToBack(): this
+  getContainer(): HTMLElement | HTMLCanvasElement | null
+  getAttribution(): string | undefined; isLoading(): boolean; redraw(): this
 }
 
 class WMSTileLayer extends TileLayer {
@@ -111,30 +162,39 @@ class GridLayer {
 
 ```ts
 class PointLayer {
-  constructor()
+  constructor(options?: Record<string, any>)
   add(points: PointFeature[]): this
   clear(): this
   on(event: 'click' | 'hover', callback: (...args: any[]) => void): this
   addTo(map: Map): this
   remove(): this
+  getBounds(): LatLngBoundsValue | null; getLatLngs(): LatLngValue[]
 }
 
 class LineLayer {
-  constructor()
+  constructor(options?: Record<string, any>)
   add(lines: LineFeature[]): this
   clear(): this
   on(event: 'click' | 'hover', callback: (...args: any[]) => void): this
   addTo(map: Map): this
   remove(): this
+  getLatLngs(): LatLngValue[][]; setLatLngs(latlngs: LatLngLike[] | LatLngLike[][]): this
+  getBounds(): LatLngBoundsValue | null; setStyle(style?: Record<string, any>): this
+  getStyle(): Record<string, any>; bringToFront(): this; bringToBack(): this
+  bindPopup(content: any): this; bindTooltip(content: any): this
 }
 
 class PolygonLayer {
-  constructor()
+  constructor(options?: Record<string, any>)
   add(polygons: PolygonFeature[]): this
   clear(): this
   on(event: 'click' | 'hover', callback: (...args: any[]) => void): this
   addTo(map: Map): this
   remove(): this
+  getLatLngs(): LatLngValue[][][]; setLatLngs(latlngs: LatLngLike[] | LatLngLike[][] | LatLngLike[][][]): this
+  getBounds(): LatLngBoundsValue | null; setStyle(style?: Record<string, any>): this
+  getStyle(): Record<string, any>; bringToFront(): this; bringToBack(): this
+  bindPopup(content: any): this; bindTooltip(content: any): this
 }
 ```
 
@@ -170,12 +230,16 @@ class GeoJSONLayer {
   clear(): this
   addFeature(feature: any): this
   addFeatures(features: any[]): this
+  getLayers(): any[]; eachLayer(fn: (layer: any) => void, context?: any): this
+  bindPopup(content: any): this; bindTooltip(content: any): this
+  resetStyle(layer?: any): this; toGeoJSON(): any
 }
 
 interface GeoJSONLayerOptions {
   pointColor?: string; pointSize?: number
   lineColor?: string; lineWidth?: number
   polygonColor?: string
+  style?: Record<string, any> | ((feature: any) => Record<string, any>)
   filter?: (feature: any) => boolean
   pointToLayer?: (feature: any, latlng: LatLng) => GroupableLayer | null
   onEachFeature?: (feature: any, layer: GroupableLayer | GeoJSONFeatureHandle) => void
@@ -191,9 +255,11 @@ interface GeoJSONStreamingOptions {
 interface GeoJSONFeatureHandle {
   feature: any
   on(event: 'click' | 'hover', cb: (e: any) => void): this
-  off(event: string, cb: (e: any) => void): this
-  bindPopup(content: string): this
-  bindTooltip(content: string): this
+  off(event: string, cb?: (e: any) => void): this
+  bindPopup(content: any): this
+  bindTooltip(content: any): this
+  setStyle(style: Record<string, any>): this; resetStyle(): this
+  getStyle(): Record<string, any>; getBounds(): LatLngBounds | null
 }
 ```
 
@@ -210,9 +276,9 @@ class DivIcon extends Icon {
 }
 
 class Marker {
-  constructor(latlng: LatLng, options?: MarkerOptions)
+  constructor(latlng: LatLngLike, options?: MarkerOptions)
 
-  setLatLng(latlng: LatLng): this; getLatLng(): LatLng
+  setLatLng(latlng: LatLngLike): this; getLatLng(): LatLngValue
   setIcon(icon: Icon | DivIcon): this; getIcon(): Icon | DivIcon
   setOpacity(opacity: number): this; getOpacity(): number
   setZIndexOffset(offset: number): this; getZIndexOffset(): number
@@ -225,9 +291,9 @@ class Marker {
   addTo(map: Map): this; remove(): this
   getElement(): HTMLElement | null
 
-  bindPopup(content: string | Popup): this; getPopupContent(): string | undefined
+  bindPopup(content: any): this; getPopupContent(): any
   getPopup(): Popup | undefined; openPopup(): this; closePopup(): this; isPopupOpen(): boolean
-  bindTooltip(content: string | Popup): this; getTooltipContent(): string | undefined
+  bindTooltip(content: any): this; getTooltipContent(): any
   openTooltip(): this; closeTooltip(): this; isTooltipOpen(): boolean
 }
 ```
@@ -238,23 +304,26 @@ class Marker {
 interface ShapeOptions { color?: string; fillColor?: string; meta?: any }
 
 class Circle {
-  constructor(latlng: LatLng, options?: ShapeOptions & { radius?: number })
-  getLatLng(): LatLng; setLatLng(latlng: LatLng): this
+  constructor(latlng: LatLngLike, options?: ShapeOptions & { radius?: number })
+  getLatLng(): LatLngValue; setLatLng(latlng: LatLngLike): this
   getRadius(): number; setRadius(radius: number): this   // meters
-  getBounds(): LatLngBounds
+  getBounds(): LatLngBoundsValue
   on(event: 'click' | 'hover', cb: (...a: any[]) => void): this
   addTo(map: Map): this; remove(): this; redraw(): this
 }
 class CircleMarker {
-  constructor(latlng: LatLng, options?: ShapeOptions & { radius?: number })
-  getLatLng(): LatLng; setLatLng(latlng: LatLng): this
+  constructor(latlng: LatLngLike, options?: ShapeOptions & { radius?: number })
+  getLatLng(): LatLngValue; setLatLng(latlng: LatLngLike): this
   getRadius(): number; setRadius(radius: number): this   // pixels
+  getBounds(): LatLngBoundsValue
   on(event: 'click' | 'hover', cb: (...a: any[]) => void): this
   addTo(map: Map): this; remove(): this; redraw(): this
 }
 class Rectangle {
-  constructor(bounds: LatLngBounds, options?: ShapeOptions)
-  getBounds(): LatLngBounds; setBounds(bounds: LatLngBounds): this
+  constructor(bounds: LatLngBoundsLike, options?: ShapeOptions)
+  getBounds(): LatLngBoundsValue; setBounds(bounds: LatLngBoundsLike): this
+  setStyle(style?: Record<string, any>): this; getStyle(): Record<string, any>
+  bindPopup(content: any): this; bindTooltip(content: any): this
   on(event: 'click' | 'hover', cb: (...a: any[]) => void): this
   addTo(map: Map): this; remove(): this; redraw(): this
 }
@@ -277,7 +346,8 @@ class LayerGroup {
 }
 class FeatureGroup extends LayerGroup {
   on(event: string, cb: (...a: any[]) => void): this
-  getBounds(): LatLngBounds | null
+  off(event: string, cb?: (...a: any[]) => void): this
+  getBounds(): LatLngBoundsValue | null
 }
 ```
 
@@ -286,23 +356,24 @@ class FeatureGroup extends LayerGroup {
 ```ts
 class Popup {
   constructor(options?: PopupOptions)
-  setLatLng(latlng: LatLng): this
-  setContent(content: string | HTMLElement): this
+  setLatLng(latlng: LatLngLike): this
+  setContent(content: any): this
   setSource(layer: any): this
   openOn(map: Map): this; close(): this; toggle(map: Map): this
   update(): this
   isOpenPopup(): boolean
   bringToFront(): this; bringToBack(): this
-  bindTo(layer: any, content: string | HTMLElement): this
+  bindTo(layer: any, content: any): this
 }
 class Tooltip {
-  constructor(options?: { content?: string; direction?: string; opacity?: number; className?: string; sticky?: boolean; offset?: [number, number] })
-  setContent(content: string | HTMLElement): this
-  getTooltipContent(): string
-  setLatLng(latlng: LatLng): this; getLatLng(): LatLng | null
+  constructor(options?: { content?: any; direction?: string; opacity?: number; className?: string; sticky?: boolean; offset?: [number, number] })
+  setContent(content: any): this
+  getTooltipContent(): any
+  setLatLng(latlng: LatLngLike): this; getLatLng(): LatLngValue | null
   openOn(map: Map): this; close(): this
   isOpen(): boolean; isOpenTooltip(): boolean
   getElement(): HTMLElement | null
+  bindTo(layer: any, content?: any): this
 }
 ```
 
@@ -381,5 +452,11 @@ const Util: {
   formatNum(num: number, digits?: number): number
   setOptions(obj: any, options: Record<string, any>): Record<string, any>
   template(str: string, data: Record<string, any>): string
+  isArray(value: any): boolean
+  trim(value: any): string; splitWords(value: any): string[]
+  getParamString(obj: Record<string, any>, existingUrl?: string, uppercase?: boolean): string
+  requestAnimFrame(callback: (...args: any[]) => void, context?: any, immediate?: boolean): number | undefined
+  cancelAnimFrame(id: number): void
+  emptyImageUrl: string
 }
 ```

@@ -215,7 +215,7 @@ describe('GeoJSONLayer data loading (real source)', () => {
 
     test('totalFeatures/dataLoaded state transitions across loads', () => {
       const map = makeMap();
-      const countSpy = jest
+      jest
         .spyOn(map.wasmMap, 'get_geojson_feature_count')
         .mockReturnValueOnce(0)
         .mockReturnValueOnce(FC.features.length);
@@ -328,7 +328,7 @@ describe('GeoJSONLayer data loading (real source)', () => {
     test('aborting mid-flight surfaces the abort rejection through errorCallback', async () => {
       const controller = new AbortController();
       fetchSpy.mockImplementationOnce(
-        (_url, init) =>
+        (_url, _init) =>
           new Promise((_resolve, reject) => {
             controller.signal.addEventListener('abort', () =>
               reject(new DOMException('The operation was aborted.', 'AbortError'))
@@ -422,7 +422,7 @@ describe('GeoJSONLayer data loading (real source)', () => {
       const onProgress = jest.fn();
       const onComplete = jest.fn();
       const map = makeMap();
-      const countSpy = jest
+      jest
         .spyOn(map.wasmMap, 'get_geojson_feature_count')
         .mockReturnValue(FC.features.length);
 
