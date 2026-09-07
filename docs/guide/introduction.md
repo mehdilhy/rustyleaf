@@ -24,7 +24,7 @@ for datasets that DOM-based maps can't handle.
 ## What it is not
 
 Rustyleaf is a **Leaflet-compatible workflow layer**, not a promise that every
-Leaflet plugin will work unchanged. In v0.0.8, tuple inputs remain valid while
+Leaflet plugin will work unchanged. In v0.0.9, tuple inputs remain valid while
 `LatLng`, `LatLngBounds`, `Point`, `Bounds`, and factory functions expose the
 methods Leaflet applications commonly use. The WebGL2 renderer and plugin
 ecosystem still have explicit gaps; see [FAQ & Limitations](/faq).

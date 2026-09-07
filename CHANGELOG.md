@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.0.9 - 2026-09-07
+
+First release published since 0.0.3 (0.0.4–0.0.8 lived only in git).
+
+### Added
+- **Leaflet compatibility preview** — array-compatible `LatLng`,
+  `LatLngBounds`, `Point`, `Bounds` value objects; the `L.*` factory surface
+  (`map`, `tileLayer`, `marker`, `geoJSON`, …); `CRS`/`Projection`,
+  `DomUtil`/`DomEvent`, expanded `Util`; map pixel/coordinate helpers and
+  panes; tile URL/lifecycle, vector editing/style, and GeoJSON
+  alias/inspection APIs; 20-scenario parity suite (`tests/LeafletParity.test.ts`,
+  824 Jest tests total) and the `docs/use-cases.md` checklist.
+
+### Fixed
+- **Stable marker IDs** (#15) — remove vacates the GPU slot instead of
+  shifting later markers; add reuses the lowest vacant slot.
+- **Packed-append shadow sync** (#16) — full point uploads refresh the CPU
+  shadow; appends with a pending upload defer to the rebuild.
+- **Hidden layers excluded from hit-testing** (#17) — rebuilds skip
+  invisible layers; visibility setters dirty the index only on flips.
+- **Tap coordinates** (#18) — tap origins stored in canvas-relative space so
+  offset canvases no longer read as finger movement.
+- **Security clean** — `Util.template` ReDoS, benchmark `innerHTML` XSS,
+  `serve.mjs` format string, least-privilege CI permissions; dependency
+  bumps (browserslist 4.28.7, vite 6.4.3, esbuild 0.25.0, postcss 8.5.23,
+  rstar 0.12). Zero open CodeQL/Dependabot alerts, `npm audit` clean.
+
 ## 0.0.8 - 2026-09-03
 
 ### Fixed
