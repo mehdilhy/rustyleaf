@@ -249,11 +249,15 @@ impl TileLoader {
     ) {
         let tile_key = format!("{}/{}/{}", coord.z, coord.x, coord.y);
         let url = {
-            let subdomain = tile_layer
-                .subdomains
-                .get(((coord.x + coord.y) as usize) % tile_layer.subdomains.len())
-                .cloned()
-                .unwrap_or_else(|| "a".to_string());
+            let subdomain = if tile_layer.subdomains.is_empty() {
+                "a".to_string()
+            } else {
+                tile_layer
+                    .subdomains
+                    .get(((coord.x + coord.y) as usize) % tile_layer.subdomains.len())
+                    .cloned()
+                    .unwrap_or_else(|| "a".to_string())
+            };
             let mut url = tile_layer
                 .url_template
                 .replace("{s}", &subdomain)
@@ -264,7 +268,7 @@ impl TileLoader {
             // (minx,miny,maxx,maxy in meters), as used by GetMap requests.
             if url.contains("{bbox-epsg-3857}") {
                 const HALF_WORLD_M: f64 = 20037508.342789244;
-                let tiles_per_axis = (1u64 << coord.z.min(31)) as f64;
+                let tiles_per_axis = (1u64 << coord.z.min(30)) as f64;
                 let tile_size_m = (HALF_WORLD_M * 2.0) / tiles_per_axis;
                 let min_x = -HALF_WORLD_M + coord.x as f64 * tile_size_m;
                 let max_y = HALF_WORLD_M - coord.y as f64 * tile_size_m;

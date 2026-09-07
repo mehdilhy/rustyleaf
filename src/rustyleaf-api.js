@@ -269,6 +269,29 @@ function __buildWmsTileUrl(baseUrl, params) {
   return `${serialized}${sep}${query}&bbox={bbox-epsg-3857}`;
 }
 
+// Error fallback notice built with text nodes only: detail lines may contain
+// exception messages (e.g. driver strings, URLs) and must never be parsed
+// as HTML.
+function __rustyleafErrorNotice(title, body, details) {
+  const box = document.createElement('div');
+  box.setAttribute('style', 'padding: 20px; text-align: center; background: #ffebee; color: #c62828; border-radius: 4px;');
+  const heading = document.createElement('h3');
+  heading.textContent = title;
+  box.appendChild(heading);
+  const paragraph = document.createElement('p');
+  paragraph.textContent = body;
+  box.appendChild(paragraph);
+  for (const detail of details || []) {
+    if (detail === null || detail === undefined) continue;
+    const line = document.createElement('p');
+    const small = document.createElement('small');
+    small.textContent = String(detail);
+    line.appendChild(small);
+    box.appendChild(line);
+  }
+  return box;
+}
+
 // J-4/J-5: render attribution parts as text (never parsed as HTML), joined by
 // literal ' | ' text nodes, so attribution strings cannot inject markup.
 function __renderAttributionParts(container, parts) {
@@ -293,11 +316,22 @@ function __validateCircleRadius(radius) {
 
 // WebGL support check utility
 function checkWebGLSupport() {
+  let probeGl = null;
+  const releaseProbe = () => {
+    // Probing creates a real GL context per call (per new Map): release it
+    // so repeated checks cannot exhaust the browser's context limit.
+    try {
+      const ext = probeGl && probeGl.getExtension('WEBGL_lose_context');
+      if (ext && typeof ext.loseContext === 'function') ext.loseContext();
+    } catch (e) { /* best-effort */ }
+    probeGl = null;
+  };
   try {
     const canvas = document.createElement('canvas');
     const gl = canvas.getContext('webgl2', { preserveDrawingBuffer: true }) || canvas.getContext('webgl', { preserveDrawingBuffer: true }) || canvas.getContext('experimental-webgl', { preserveDrawingBuffer: true });
-    
+    probeGl = gl;
     if (!gl) {
+      releaseProbe();
       return {
         supported: false,
         level: 'none',
@@ -313,7 +347,7 @@ function checkWebGLSupport() {
     const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
     const isWebGL2 = !!canvas.getContext('webgl2', { preserveDrawingBuffer: true });
     
-    return {
+    const result = {
       supported: true,
       level: isWebGL2 ? 'full' : 'limited',
       webgl2: isWebGL2,
@@ -323,6 +357,8 @@ function checkWebGLSupport() {
       extensions: gl.getSupportedExtensions() || [],
       error: null
     };
+    releaseProbe();
+    return result;
   } catch (error) {
     return {
       supported: false,
@@ -411,14 +447,14 @@ class Map {
 
     if (!webglSupport.supported) {
       console.error('Rustyleaf: WebGL not supported. Map cannot be initialized.', webglSupport);
-      this.containerElement.innerHTML = `
-        <div style="padding: 20px; text-align: center; background: #ffebee; color: #c62828; border-radius: 4px;">
-          <h3>⚠️ WebGL Not Supported</h3>
-          <p>Rustyleaf requires WebGL to function. Please use a modern browser with WebGL enabled.</p>
-          <p><small>Support level: ${webglSupport.level}</small></p>
-          ${webglSupport.error ? `<p><small>Error: ${webglSupport.error}</small></p>` : ''}
-        </div>
-      `;
+      // Build the fallback notice with text nodes: webglSupport.error comes
+      // from a caught exception message and must never be parsed as HTML.
+      this.containerElement.replaceChildren(__rustyleafErrorNotice(
+        '⚠️ WebGL Not Supported',
+        'Rustyleaf requires WebGL to function. Please use a modern browser with WebGL enabled.',
+        [`Support level: ${webglSupport.level}`,
+          webglSupport.error ? `Error: ${webglSupport.error}` : null].filter(Boolean)
+      ));
       throw new Error('WebGL not supported');
     }
 
@@ -432,13 +468,11 @@ class Map {
       this.wasmMap.init_canvas(this.canvas.id);
     } catch (error) {
       console.error('Rustyleaf: Failed to initialize WebGL context:', error);
-      this.containerElement.innerHTML = `
-        <div style="padding: 20px; text-align: center; background: #ffebee; color: #c62828; border-radius: 4px;">
-          <h3>⚠️ WebGL Initialization Failed</h3>
-          <p>Failed to initialize WebGL context: ${error.message}</p>
-          <p>Please check your browser settings and ensure WebGL is enabled.</p>
-        </div>
-      `;
+      this.containerElement.replaceChildren(__rustyleafErrorNotice(
+        '⚠️ WebGL Initialization Failed',
+        'Please check your browser settings and ensure WebGL is enabled.',
+        [`Failed to initialize WebGL context: ${error && error.message ? error.message : error}`]
+      ));
       throw error;
     }
 
@@ -529,30 +563,55 @@ class Map {
     const burst = (startEvent, endEvent) => {
       let active = false;
       let timer = null;
-      return (e) => {
-        if (!active) {
-          active = true;
-          deferCallback(() => this._fireLocalEvent(startEvent, e));
+      const handler = (e) => {
+        if (!this._destroyed) {
+          if (!active) {
+            active = true;
+            deferCallback(() => { if (!this._destroyed) this._fireLocalEvent(startEvent, e); });
+          }
+          clearTimeout(timer);
+          timer = setTimeout(() => {
+            active = false;
+            timer = null;
+            if (!this._destroyed) this._fireLocalEvent(endEvent, e);
+          }, 150);
         }
-        clearTimeout(timer);
-        timer = setTimeout(() => {
-          active = false;
-          this._fireLocalEvent(endEvent, e);
-        }, 150);
       };
+      handler._burstTimer = () => timer;
+      handler._burstCancel = () => { if (timer !== null) { clearTimeout(timer); timer = null; } active = false; };
+      return handler;
     };
-    this.wasmMap.on_move(burst('movestart', 'moveend'));
-    this.wasmMap.on_zoom(burst('zoomstart', 'zoomend'));
+    this._derivedMoveHandler = burst('movestart', 'moveend');
+    this._derivedZoomHandler = burst('zoomstart', 'zoomend');
+    this.wasmMap.on_move(this._derivedMoveHandler);
+    this.wasmMap.on_zoom(this._derivedZoomHandler);
+  }
+
+  _teardownDerivedEvents() {
+    try {
+      if (this._derivedMoveHandler) {
+        if (this.wasmMap && typeof this.wasmMap.off_move === 'function') this.wasmMap.off_move(this._derivedMoveHandler);
+        if (typeof this._derivedMoveHandler._burstCancel === 'function') this._derivedMoveHandler._burstCancel();
+        this._derivedMoveHandler = null;
+      }
+      if (this._derivedZoomHandler) {
+        if (this.wasmMap && typeof this.wasmMap.off_zoom === 'function') this.wasmMap.off_zoom(this._derivedZoomHandler);
+        if (typeof this._derivedZoomHandler._burstCancel === 'function') this._derivedZoomHandler._burstCancel();
+        this._derivedZoomHandler = null;
+      }
+    } catch (e) { /* best-effort */ }
   }
 
   // ---- Leaflet-style layer management (fires layeradd/layerremove) ----
 
   addLayer(layer) {
+    if (!layer || typeof layer.addTo !== 'function') return this;
     layer.addTo(this);
     return this;
   }
 
   removeLayer(layer) {
+    if (!layer || typeof layer.remove !== 'function') return this;
     layer.remove();
     return this;
   }
@@ -781,17 +840,27 @@ class Map {
     // Leaflet documents duration in seconds; Rustyleaf historically accepted
     // millisecond values. Keep both forms during the compatibility preview by
     // treating sub-ten values as seconds and larger values as milliseconds.
-    const duration = requestedDuration > 0 && requestedDuration < 10
-      ? requestedDuration * 1000
-      : requestedDuration;
+    // Non-finite durations (e.g. duration:'fast' -> NaN) would poison the
+    // animation (t=NaN, setView throws every tick, timer never clears), so
+    // fall back to an instant setView.
+    const normalizedDuration = Number.isFinite(requestedDuration) ? requestedDuration : NaN;
+    const duration = Number.isFinite(normalizedDuration) && normalizedDuration > 0 && normalizedDuration < 10
+      ? normalizedDuration * 1000
+      : normalizedDuration;
     const from = this.getCenter();
     const fromZoom = this.getZoom();
-    const targetZoom = opts.zoom !== undefined ? opts.zoom : fromZoom;
+    const rawTargetZoom = opts.zoom !== undefined ? Number(opts.zoom) : fromZoom;
+    const targetZoom = Number.isFinite(rawTargetZoom)
+      ? Math.max(this.getMinZoom(), Math.min(this.getMaxZoom(), rawTargetZoom))
+      : fromZoom;
+    if (!Number.isFinite(target.lat) || !Number.isFinite(target.lng)) {
+      throw new Error('Invalid target coordinates for flyTo');
+    }
     if (this._flyTimer) {
       clearInterval(this._flyTimer);
       this._flyTimer = null;
     }
-    if (duration <= 0) return this.setView(target, targetZoom);
+    if (!Number.isFinite(duration) || duration <= 0) return this.setView(target, targetZoom);
     const start = Date.now();
     this._flyTimer = setInterval(() => {
       const t = Math.min(1, (Date.now() - start) / duration);
@@ -874,8 +943,12 @@ class Map {
       timeout: options.timeout !== undefined ? options.timeout : 10000,
       maximumAge: options.maximumAge || 0
     };
-    if (options.watch) this._locateWatchId = geo.watchPosition(onSuccess, onError, geoOptions);
-    else geo.getCurrentPosition(onSuccess, onError, geoOptions);
+    if (options.watch) {
+      // Clear any previous watch first: overwriting the id would leak the
+      // old watch (its callbacks keep firing on a map that forgot them).
+      this.stopLocate();
+      this._locateWatchId = geo.watchPosition(onSuccess, onError, geoOptions);
+    } else geo.getCurrentPosition(onSuccess, onError, geoOptions);
     return this;
   }
 
@@ -890,7 +963,9 @@ class Map {
 
   _fireLocalEvent(event, data) {
     const handlers = (this._localEvents && this._localEvents[event]) || [];
-    for (const handler of handlers) {
+    // Dispatch over a snapshot: handlers may once()/off() (mutating the live
+    // array) without skipping the remaining listeners.
+    for (const handler of handlers.slice()) {
       try {
         handler(data);
       } catch (e) {
@@ -906,6 +981,11 @@ class Map {
   }
   
   unproject(point) {
+    // Fail fast on missing input: the old fallthrough coerced null/undefined
+    // to Point(0,0) and silently returned the origin's latlng.
+    if (point === null || point === undefined) {
+      throw new TypeError('unproject requires a Point, [x, y] tuple, or {x, y} object');
+    }
     const value = point instanceof Point
       ? point.toArray()
       : new Point(point && point.x !== undefined ? point.x : point && point[0], point && point.y !== undefined ? point.y : point && point[1]).toArray();
@@ -957,6 +1037,10 @@ class Map {
       ? Math.max(size.x / boundsSize.x, size.y / boundsSize.y)
       : Math.min(size.x / boundsSize.x, size.y / boundsSize.y);
     const zoom = this.getZoom() + Math.log(scale) / Math.LN2;
+    // Oversized padding can drive the size negative, making scale <= 0 and
+    // log(scale) NaN (Math.max/min propagate NaN). Clamp to min zoom instead
+    // of returning NaN into setView/flyTo.
+    if (!Number.isFinite(zoom)) return this.getMinZoom();
     return Math.max(this.getMinZoom(), Math.min(this.getMaxZoom(), zoom));
   }
 
@@ -1067,7 +1151,7 @@ class Map {
 
   _listenerEntry(event, callback) {
     if (!this._listeners || !this._listeners[event]) return null;
-    return this._listeners[event].find((e) => e.callback === callback) || null;
+    return this._listeners[event].find((e) => e.callback === callback || e.callback._onceOriginal === callback) || null;
   }
 
   on(event, callback, context) {
@@ -1109,6 +1193,9 @@ class Map {
       this.off(event, wrapper);
       return callback.apply(context || this, [ev]);
     };
+    // Tag the wrapper so off(event, originalCallback) can find and cancel a
+    // pending once() registration (see _listenerEntry).
+    wrapper._onceOriginal = callback;
     return this.on(event, wrapper);
   }
 
@@ -1157,7 +1244,23 @@ class Map {
     this._windowListeners.push([type, handler, listenerOptions]);
   }
 
-  // J-11: detach every tracked canvas/window listener (called from remove()).
+  // Drag/box-zoom handlers attach to `document` (pointer capture outside the
+  // canvas). Tracked like window listeners so remove() detaches them even
+  // mid-drag; otherwise they keep calling into the freed wasmMap forever.
+  _trackDocumentListener(type, handler, listenerOptions) {
+    this._documentListeners = this._documentListeners || [];
+    document.addEventListener(type, handler, listenerOptions);
+    this._documentListeners.push([type, handler, listenerOptions]);
+  }
+
+  _untrackDocumentListener(type, handler) {
+    document.removeEventListener(type, handler);
+    if (Array.isArray(this._documentListeners)) {
+      this._documentListeners = this._documentListeners.filter((entry) => entry[1] !== handler);
+    }
+  }
+
+  // J-11: detach every tracked canvas/window/document listener (called from remove()).
   _removeTrackedListeners() {
     if (this.canvas && Array.isArray(this._canvasListeners)) {
       for (const [type, handler, listenerOptions] of this._canvasListeners) {
@@ -1171,6 +1274,12 @@ class Map {
       }
     }
     this._windowListeners = [];
+    if (typeof document !== 'undefined' && Array.isArray(this._documentListeners)) {
+      for (const [type, handler, listenerOptions] of this._documentListeners) {
+        try { document.removeEventListener(type, handler, listenerOptions); } catch (e) { /* best-effort */ }
+      }
+    }
+    this._documentListeners = [];
   }
 
   _setupEventHandlers() {
@@ -1209,9 +1318,9 @@ class Map {
       if (isDragging) {
         isDragging = false;
         this.canvas.style.cursor = 'grab';
-        document.removeEventListener('selectstart', preventSelection);
-        document.removeEventListener('mousemove', handleGlobalMouseMove);
-        document.removeEventListener('mouseup', handleGlobalMouseUp);
+        this._untrackDocumentListener('selectstart', preventSelection);
+        this._untrackDocumentListener('mousemove', handleGlobalMouseMove);
+        this._untrackDocumentListener('mouseup', handleGlobalMouseUp);
 
         // Convert screen coordinates to canvas coordinates (accounting for scaling)
         const rect = this.canvas.getBoundingClientRect();
@@ -1221,7 +1330,7 @@ class Map {
         const canvasY = (e.clientY - rect.top) * scaleY;
 
         // Always trigger mouse up with proper coordinates
-        this.wasmMap.handle_mouse_up(canvasX, canvasY);
+        if (!this._destroyed && this.wasmMap) this.wasmMap.handle_mouse_up(canvasX, canvasY);
       }
     };
 
@@ -1243,9 +1352,10 @@ class Map {
         const hitMarker = this._topmostMarkerAt(dragStartX, dragStartY);
         if (hitMarker && typeof hitMarker.isDraggable === 'function' && hitMarker.isDraggable()) {
           this.canvas.style.cursor = 'move';
-          document.addEventListener('selectstart', preventSelection);
+          this._trackDocumentListener('selectstart', preventSelection);
           hitMarker.fire('dragstart', { type: 'dragstart', target: hitMarker, latlng: hitMarker.getLatLng() });
           const markerMove = (ev) => {
+            if (this._destroyed) return;
             const r2 = this.canvas.getBoundingClientRect();
             const cx2 = (ev.clientX - r2.left) * (this.canvas.width / r2.width);
             const cy2 = (ev.clientY - r2.top) * (this.canvas.height / r2.height);
@@ -1256,13 +1366,13 @@ class Map {
             }
           };
           const markerUp = () => {
-            document.removeEventListener('mousemove', markerMove);
-            document.removeEventListener('mouseup', markerUp);
+            this._untrackDocumentListener('mousemove', markerMove);
+            this._untrackDocumentListener('mouseup', markerUp);
             this.canvas.style.cursor = 'grab';
             hitMarker.fire('dragend', { type: 'dragend', target: hitMarker, latlng: hitMarker.getLatLng() });
           };
-          document.addEventListener('mousemove', markerMove);
-          document.addEventListener('mouseup', markerUp);
+          this._trackDocumentListener('mousemove', markerMove);
+          this._trackDocumentListener('mouseup', markerUp);
           return;
         }
 
@@ -1271,11 +1381,11 @@ class Map {
         this.canvas.style.cursor = 'move';
 
         // Prevent text selection during drag
-        document.addEventListener('selectstart', preventSelection);
+        this._trackDocumentListener('selectstart', preventSelection);
 
         // Add global listeners for smooth dragging
-        document.addEventListener('mousemove', handleGlobalMouseMove);
-        document.addEventListener('mouseup', handleGlobalMouseUp);
+        this._trackDocumentListener('mousemove', handleGlobalMouseMove);
+        this._trackDocumentListener('mouseup', handleGlobalMouseUp);
 
         this.wasmMap.handle_mouse_down(dragStartX, dragStartY);
       }
@@ -1609,9 +1719,10 @@ class Map {
       box.style.height = Math.abs(ev.clientY - startY) + 'px';
     };
     const finish = (ev) => {
-      document.removeEventListener('mousemove', update);
-      document.removeEventListener('mouseup', finish);
+      this._untrackDocumentListener('mousemove', update);
+      this._untrackDocumentListener('mouseup', finish);
       box.remove();
+      if (this._destroyed || !this.wasmMap) return;
       if (Math.abs(ev.clientX - startX) < 10 || Math.abs(ev.clientY - startY) < 10) return;
       const rect = this.canvas.getBoundingClientRect();
       const scaleX = this.canvas.width / rect.width;
@@ -1624,12 +1735,16 @@ class Map {
       ]);
       this._fireLocalEvent('boxzoomend', { type: 'boxzoomend' });
     };
-    document.addEventListener('mousemove', update);
-    document.addEventListener('mouseup', finish);
+    this._trackDocumentListener('mousemove', update);
+    this._trackDocumentListener('mouseup', finish);
   }
 
   _handleResize() {
     const rect = this.containerElement.getBoundingClientRect();
+    // A hidden container (display:none) reports 0x0: pushing that into the
+    // canvas + GL viewport yields divide-by-zero projections. Keep the last
+    // good size until the container is visible again.
+    if (!rect.width || !rect.height) return;
     this.width = rect.width;
     this.height = rect.height;
     this.canvas.width = this.width;
@@ -1642,12 +1757,21 @@ class Map {
     if (this._needsRestore) return;
     const render = () => {
       if (this._destroyed || this._needsRestore) return;
-      this.wasmMap.render(this.canvas.id);
+      // A single throwing frame (context loss, WASM panic) must not kill the
+      // loop forever: always reschedule, then report the error.
+      try {
+        this.wasmMap.render(this.canvas.id);
+      } catch (error) {
+        console.error('Rustyleaf: render frame failed:', error);
+      } finally {
+        if (!this._destroyed && !this._needsRestore) {
+          this._rafId = requestAnimationFrame(render);
+        }
+      }
       if (!this._loadFired) {
         this._loadFired = true;
         this._fireLocalEvent('load', { type: 'load', target: this });
       }
-      this._rafId = requestAnimationFrame(render);
     };
     // First frame via rAF so same-tick 'load' listeners are registered in time
     this._rafId = requestAnimationFrame(render);
@@ -1684,6 +1808,9 @@ class Map {
       clearTimeout(this._longPressTimer);
       this._longPressTimer = null;
     }
+
+    // Derived movestart/moveend + zoomstart/zoomend timers/handlers.
+    this._teardownDerivedEvents();
 
     // J-11: detach all tracked canvas/window DOM listeners.
     this._removeTrackedListeners();
@@ -1731,6 +1858,19 @@ class Map {
     }
 
     this._markerRegistry = [];
+    // Controls own DOM nodes and listeners: remove() each one instead of just
+    // dropping the registry, or their divs and handlers outlive the map.
+    // Only tear down controls owned by this map (control._map === this):
+    // foreign/detached entries are left alone.
+    if (Array.isArray(this._controls)) {
+      for (const control of Array.from(this._controls)) {
+        try {
+          // Only tear down controls attached to this map (Control.addTo sets
+          // control._map). Entries never attached have no DOM to clean up.
+          if (control && control._map === this) control.remove();
+        } catch (e) { /* best-effort teardown */ }
+      }
+    }
     this._controls = [];
     this._localEvents = {};
 
@@ -1754,7 +1894,7 @@ class Map {
 
   addControl(control) {
     if (!this._controls) this._controls = [];
-    this._controls.push(control);
+    if (!this._controls.includes(control)) this._controls.push(control);
     return control.addTo(this);
   }
 
@@ -1830,6 +1970,12 @@ class TileLayer {
       if (this._map.wasmMap && typeof this._map.wasmMap.remove_tile_layer === 'function') {
         this._map.wasmMap.remove_tile_layer();
       }
+      // Restore canvas presentation this layer may have changed via
+      // setOpacity/setZIndex so a removed layer cannot dim the map forever.
+      if (this._map.canvas) {
+        this._map.canvas.style.opacity = '1';
+        this._map.canvas.style.zIndex = '1';
+      }
       if (this._attributionElement && this.options && this.options.attribution) {
         // J-4: remove by text comparison, then re-render as text nodes.
         const text = this._attributionElement.textContent || '';
@@ -1877,7 +2023,10 @@ class TileLayer {
   }
 
   setOpacity(opacity) {
-    this._opacity = Math.max(0, Math.min(1, Number(opacity)));
+    const numeric = Number(opacity);
+    // NaN/Infinity previously propagated into canvas style (and stuck there
+    // after remove). Clamp finite input; fall back to fully opaque.
+    this._opacity = Number.isFinite(numeric) ? Math.max(0, Math.min(1, numeric)) : 1;
     if (this._map && this._map.canvas) this._map.canvas.style.opacity = String(this._opacity);
     return this;
   }
@@ -1885,7 +2034,8 @@ class TileLayer {
   getOpacity() { return this._opacity; }
 
   setZIndex(zIndex) {
-    this._zIndex = Number(zIndex);
+    const numeric = Number(zIndex);
+    this._zIndex = Number.isFinite(numeric) ? Math.trunc(numeric) : 1;
     if (this._map && this._map.canvas) this._map.canvas.style.zIndex = String(this._zIndex);
     return this;
   }
@@ -1897,9 +2047,20 @@ class TileLayer {
   isLoading() { return false; }
   redraw() {
     if (!this._map || !this._map.wasmMap) return this;
+    // NOTE: the WASM core currently exposes a single tile-layer slot, so a
+    // redraw re-attaches this layer through it. Re-apply this layer's own
+    // presentation afterwards (remove() resets the shared canvas).
     const map = this._map;
+    const opacity = this._opacity;
+    const zIndex = this._zIndex;
     this.remove();
     this.addTo(map);
+    this._opacity = opacity;
+    this._zIndex = zIndex;
+    if (map.canvas) {
+      map.canvas.style.opacity = String(opacity);
+      map.canvas.style.zIndex = String(zIndex);
+    }
     return this;
   }
 }
@@ -1933,6 +2094,14 @@ class PointLayer {
       // Append only the new batch. The old implementation retained every JS
       // object and resent the entire layer, causing multi-GB spikes at 1M.
       this._map.wasmMap.append_points(this._layerIndex, points);
+      // Keep getBounds() accurate on the mounted path too (cheap scalar
+      // extends; the point objects themselves are not retained).
+      for (const point of points) {
+        const coord = normalizeLayerCoordinate(point);
+        if (Number.isFinite(Number(coord.lat)) && Number.isFinite(Number(coord.lng))) {
+          this._bounds.extend([Number(coord.lat), Number(coord.lng)]);
+        }
+      }
     } else {
       // Before mounting, keep the original references once. addTo() transfers
       // them to Rust and immediately releases this array.
@@ -1996,7 +2165,12 @@ class PointLayer {
     if (this._map && this._layerIndex !== undefined) {
       this._map.wasmMap.clear_points(this._layerIndex);
     } else {
-      // Reset the detached helper used before the layer is mounted.
+      // Reset the detached helper used before the layer is mounted. Free the
+      // old WASM object first: wasm-bindgen finalizers are nondeterministic,
+      // so without an explicit free every clear() leaks until GC.
+      if (this.wasmPointLayer && typeof this.wasmPointLayer.free === 'function') {
+        try { this.wasmPointLayer.free(); } catch (e) { /* best-effort */ }
+      }
       this.wasmPointLayer = new PointLayerApi();
     }
     return this;
@@ -2070,8 +2244,10 @@ class LineLayer {
     });
 
     if (this.map && this._layerIndex !== undefined) {
-      // Mounted: forward straight to the wasm layer (append semantics).
+      // Mounted: forward straight to the wasm layer (append semantics), but
+      // keep the local store in sync so getLatLngs()/getBounds() stay complete.
       this.map.wasmMap.append_lines(this._layerIndex, linesData);
+      for (const l of linesData) this.lines.push(l);
     } else {
       for (const l of linesData) this.lines.push(l);
     }
@@ -2141,7 +2317,7 @@ class LineLayer {
   setLatLngs(latlngs) {
     const isCoord = (value) => Array.isArray(value) && typeof value[0] === 'number'
       || value && typeof value === 'object' && value.lat !== undefined;
-    const normalized = Array.isArray(latlngs) && latlngs.length && isCoord(latlngs[0]) ? [latlngs] : [latlngs];
+    const normalized = Array.isArray(latlngs) && latlngs.length && isCoord(latlngs[0]) ? [latlngs] : latlngs;
     this.lines = normalized.map((coords) => ({
       coords: coords.map((coord) => {
         const ll = latLng(coord);
@@ -2206,7 +2382,9 @@ class Popup {
     this.element = null;
     this.latlng = null;
     this.map = null;
-    this.content = '';
+    // Honor options.content: the old hard-coded '' made new Popup({content})
+    // (e.g. Marker.openPopup's lazy path) render an empty popup.
+    this.content = options && options.content !== undefined ? options.content : '';
     this.isOpen = false;
     this._source = null; // Layer that opened this popup
     this._timeout = null;
@@ -2248,7 +2426,6 @@ class Popup {
       return this;
     }
 
-    this.map = map;
     this._initLayout();
     this._updateContent();
 
@@ -2258,11 +2435,17 @@ class Popup {
     // see below) instead of only when the popup would go off-screen.
     try {
       map.containerElement.appendChild(this.element);
-      this.isOpen = true;
     } catch (error) {
       console.warn('Popup: Failed to append popup to map container:', error);
+      // Assign map only after a successful append: the old order left a
+      // half-open popup (map set, isOpen false, untracked in _openPopups).
+      this.map = null;
+      this.isOpen = false;
+      this.element = null;
       return this;
     }
+    this.map = map;
+    this.isOpen = true;
 
     this._updatePosition();
     this._handleAutoPan();
@@ -2783,11 +2966,22 @@ class Shape {
 
   bindTooltip(content) {
     this._tooltipContent = content;
-    this.on('click', (event) => {
-      if (event && event.latlng && this._attachedMap) {
-        new Tooltip({ content }).setLatLng(event.latlng).openOn(this._attachedMap);
-      }
-    });
+    // Close the previous tooltip before opening a new one: the old code
+    // created one Tooltip per click and never closed them (unbounded growth
+    // in map._openTooltips).
+    if (!this._bindTooltipHandler) {
+      this._bindTooltipHandler = (event) => {
+        if (event && event.latlng && this._attachedMap) {
+          if (this._activeShapeTooltip) {
+            try { this._activeShapeTooltip.close(); } catch (e) { /* best-effort */ }
+            this._activeShapeTooltip = null;
+          }
+          this._activeShapeTooltip = new Tooltip({ content: this._tooltipContent });
+          this._activeShapeTooltip.setLatLng(event.latlng).openOn(this._attachedMap);
+        }
+      };
+      this.on('click', this._bindTooltipHandler);
+    }
     return this;
   }
 
@@ -2841,7 +3035,10 @@ class Circle extends Shape {
 
   _delta() {
     const dLat = this._radius / METERS_PER_DEG_LAT;
-    const dLng = this._radius / (METERS_PER_DEG_LAT * Math.cos(this._latlng[0] * Math.PI / 180));
+    // cos(lat) vanishes at the poles; floor it so a polar circle does not
+    // produce a ~1e11-degree longitude delta.
+    const cosLat = Math.max(Math.cos(this._latlng[0] * Math.PI / 180), 1e-9);
+    const dLng = this._radius / (METERS_PER_DEG_LAT * cosLat);
     return [dLat, dLng];
   }
 
@@ -3140,6 +3337,9 @@ class ImageOverlay {
   }
 
   addTo(map) {
+    if (this._map && this._map !== map) {
+      try { this.remove(); } catch (e) { /* best-effort */ }
+    }
     this._map = map;
     if (!this._element) this._element = this._createElement();
     const el = this._element;
@@ -3196,6 +3396,8 @@ class ImageOverlay {
         this._onViewChange = null;
       }
       if (this._map._notifyLayerRemove) this._map._notifyLayerRemove(this);
+      // Clear the map ref so post-remove setBounds() cannot touch dead WASM.
+      this._map = null;
     }
     return this;
   }
@@ -3235,6 +3437,9 @@ class VideoOverlay extends ImageOverlay {
 class SVGOverlay extends ImageOverlay {
   constructor(svgElement, bounds, options = {}) {
     super('', bounds, options);
+    if (!svgElement || !(svgElement instanceof Element)) {
+      throw new TypeError('SVGOverlay requires an SVGElement');
+    }
     svgElement.classList.add('rustyleaf-svg-overlay');
     this._element = svgElement;
   }
@@ -3598,11 +3803,17 @@ class GeoJSONLayer {
       chunkSize = 1024 * 1024, // 1MB chunks
       progressCallback = null,
       completeCallback = null,
-      errorCallback = null
-    } = options;
+      errorCallback = null,
+      signal = null,
+      timeout = null,
+      maxBytes = GEOJSON_DEFAULT_MAX_BYTES
+    } = options || {};
+    const max = Number.isFinite(Number(maxBytes)) && Number(maxBytes) > 0 ? Number(maxBytes) : GEOJSON_DEFAULT_MAX_BYTES;
+    const { signal: fetchSignal, cleanup } = __rustyleafAbortForLoad(signal, timeout);
 
     return new Promise((resolve, reject) => {
-      fetch(url)
+      const fetched = fetchSignal ? fetch(url, { signal: fetchSignal }) : fetch(url);
+      fetched
         .then(response => {
           if (!response.ok) {
             throw new Error(`HTTP error! status: ${response.status}`);
@@ -3646,6 +3857,7 @@ class GeoJSONLayer {
                   }
                   
                   resolve(this);
+                  cleanup();
                   return;
                 }
                 
@@ -3654,6 +3866,17 @@ class GeoJSONLayer {
                 buffer += chunk;
                 loadedBytes += value.length;
                 totalBytes += value.length;
+                // Enforce the payload cap on the running total: without this
+                // a chunked response with no (or a lying) Content-Length
+                // buffers unboundedly.
+                if (loadedBytes > max) {
+                  try { reader.cancel(); } catch (e) { /* best-effort */ }
+                  cleanup();
+                  reject(new Error(
+                    `GeoJSON payload exceeded the ${max}-byte cap while downloading (options.maxBytes to raise).`
+                  ));
+                  return;
+                }
                 
                 // Process complete JSON objects from buffer
                 ({ remaining: buffer } = this.processStreamingBuffer(buffer));
@@ -3676,6 +3899,7 @@ class GeoJSONLayer {
                 readChunk();
               })
               .catch(error => {
+                cleanup();
                 if (errorCallback) {
                   errorCallback(error);
                 }
@@ -3686,6 +3910,7 @@ class GeoJSONLayer {
           readChunk();
         })
         .catch(error => {
+          cleanup();
           if (errorCallback) {
             errorCallback(error);
           }
@@ -4339,6 +4564,9 @@ class GeoJSONLayer {
 
   // Add multiple GeoJSON features
   addFeatures(features) {
+    if (!Array.isArray(features)) {
+      throw new TypeError('GeoJSONLayer.addFeatures expects an array of features');
+    }
     features.forEach(feature => this.addFeature(feature));
     return this;
   }
@@ -4416,11 +4644,14 @@ class DivIcon extends Icon {
 }
 
 // Parse a #rrggbb / #rgb hex string into normalized [r, g, b] in [0, 1].
+// Anything else (including '#zzzzzz') falls back to the default red instead
+// of propagating NaN into set_marker_style.
+const MARKER_DEFAULT_COLOR = [0.878, 0.224, 0.243]; // default red
 function parseMarkerColor(hex) {
-  if (typeof hex !== 'string') return [0.878, 0.224, 0.243]; // default red
+  if (typeof hex !== 'string') return MARKER_DEFAULT_COLOR.slice();
   let h = hex.replace('#', '');
   if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
-  if (h.length !== 6) return [0.878, 0.224, 0.243];
+  if (h.length !== 6 || !/^[0-9a-fA-F]{6}$/.test(h)) return MARKER_DEFAULT_COLOR.slice();
   const r = parseInt(h.slice(0, 2), 16) / 255;
   const g = parseInt(h.slice(2, 4), 16) / 255;
   const b = parseInt(h.slice(4, 6), 16) / 255;
@@ -4478,9 +4709,11 @@ class Marker {
   }
 
   setOpacity(o) {
-    if (o < 0) o = 0;
-    if (o > 1) o = 1;
-    this._opacity = o;
+    const numeric = Number(o);
+    // NaN and non-numeric strings previously slipped through the <0/>1
+    // comparisons and were stored (then forwarded to WASM). Clamp finite
+    // input; fall back to fully opaque.
+    this._opacity = Number.isFinite(numeric) ? Math.max(0, Math.min(1, numeric)) : 1;
     this._applyStyle();
     return this;
   }
@@ -4545,6 +4778,19 @@ class Marker {
   }
 
   addTo(map) {
+    // Re-adding to the same map must not orphan the previous GPU sprite/DOM
+    // element (ghost marker + GPU leak): treat it as a no-op re-show.
+    if (this._map === map && (this._id !== null || this._domElement)) {
+      if (this._id !== null && map.wasmMap) {
+        try { map.wasmMap.set_marker_visible(this._id, true); } catch (e) { /* best-effort */ }
+      }
+      if (map._notifyLayerAdd) map._notifyLayerAdd(this);
+      return this;
+    }
+    // Moving between maps: detach from the previous one first.
+    if (this._map && this._map !== map) {
+      try { this.remove(); } catch (e) { /* best-effort */ }
+    }
     this._map = map;
     if (this._icon instanceof DivIcon && typeof map.containerElement !== 'undefined') {
       return this._mountDomOverlay(map);
@@ -4642,7 +4888,8 @@ class Marker {
     return this;
   }
 
-  // Markers are GPU sprites, so there is no DOM element to return.
+  // Markers are GPU sprites, so there is no DOM element to return — even
+  // DivIcon markers (their overlay is tracked separately via _domElement).
   getElement() {
     return null;
   }
@@ -4662,6 +4909,7 @@ class Marker {
   }
 
   openPopup() {
+    // Requested-open flag (also covers detached markers with no map yet).
     this._popupOpen = true;
     if (!this._map) return this;
     if (this._popup) {
@@ -4684,11 +4932,17 @@ class Marker {
   }
 
   isPopupOpen() {
-    return this._popupOpen;
+    // Live popup state wins: map-click auto-close closes the popup without
+    // notifying the marker, so the requested flag alone would lie once on a
+    // map. The flag only counts while no popup object exists yet (detached).
+    if (this._popup && typeof this._popup.isOpenPopup === 'function' && this._popup.isOpenPopup()) return true;
+    return !this._popup && !!this._popupOpen;
   }
 
   bindTooltip(content) {
-    if (content && content instanceof Popup) this._tooltip = content;
+    // A Tooltip (or Popup, for backwards compatibility) instance is used
+    // as-is; anything else is stored as content and wrapped lazily on open.
+    if (content && (content instanceof Tooltip || content instanceof Popup)) this._tooltip = content;
     else this._tooltipContent = content;
     return this;
   }
@@ -4726,7 +4980,12 @@ class Marker {
   }
 
   isTooltipOpen() {
-    return this._tooltipOpen;
+    // Live tooltip state wins (see isPopupOpen); the requested flag only
+    // counts while no tooltip object exists yet (detached marker).
+    const direct = this._tooltip && typeof this._tooltip.isOpen === 'function' ? this._tooltip.isOpen() : !!(this._tooltip && this._tooltip._isOpen);
+    if (direct) return true;
+    if (this._boundTooltip && this._boundTooltip._isOpen) return true;
+    return !this._tooltip && !this._boundTooltip && !!this._tooltipOpen;
   }
 }
 
@@ -4832,7 +5091,13 @@ class Tooltip {
   }
 
   bindTo(layer, content) {
+    // Unbind any previous layer first: the old code stacked a new 'hover'
+    // handler per call, leaking (tooltip, map) closures after remove().
+    if (this._boundLayer && this._boundLayerHandler && typeof this._boundLayer.off === 'function') {
+      try { this._boundLayer.off('hover', this._boundLayerHandler); } catch (e) { /* best-effort */ }
+    }
     this._source = layer;
+    this._boundLayer = layer;
     if (content !== undefined && typeof content !== 'function') this.setContent(content);
     const handler = (event) => {
       const latlng = event && event.latlng
@@ -4929,6 +5194,12 @@ class Control {
   }
 
   addTo(map) {
+    // Guard double-add: replacing _container without removing the old one
+    // orphaned the previous div in the map container.
+    if (this._map === map && this._container && this._container.parentNode) return this;
+    if (this._map && this._map !== map) {
+      try { this.remove(); } catch (e) { /* best-effort */ }
+    }
     this._map = map;
     this._container = this.onAdd(map);
     if (this._container && map.containerElement) {
@@ -5080,10 +5351,13 @@ class ScaleControl extends Control {
     if (!this._containerEl || !map) return;
     const zoom = typeof map.getZoom === 'function' ? map.getZoom() : 12;
     const center = typeof map.getCenter === 'function' ? map.getCenter() : [0, 0];
+    if (!Number.isFinite(Number(zoom)) || !center || !Number.isFinite(Number(center[0]))) return;
     const latRad = center[0] * Math.PI / 180;
     const mpp = 156543.03392 * Math.cos(latRad) / Math.pow(2, zoom);
+    if (!Number.isFinite(mpp) || mpp <= 0) return;
     const maxPx = this.options.maxWidth || 100;
     const meters = mpp * maxPx;
+    if (!Number.isFinite(meters) || meters <= 0) return;
     const parts = [];
     // Leaflet rounds the scale to a "nice" number so the bar width matches
     // the label exactly; render metric and/or imperial per options.
@@ -5163,8 +5437,15 @@ class WMSTileLayer extends TileLayer {
   }
 
   // Leaflet parity: update WMS request parameters and reload tiles.
+  // Only known WMS keys merge; __proto__/constructor/prototype are ignored
+  // so untrusted JSON cannot pollute the params object.
   setParams(params) {
-    Object.assign(this.wmsParams, params);
+    if (params && typeof params === 'object') {
+      for (const key of Object.keys(params)) {
+        if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
+        this.wmsParams[key] = params[key];
+      }
+    }
     const p = this.wmsParams;
     p[p.version === '1.3.0' ? 'crs' : 'srs'] = 'EPSG:3857';
     const newUrl = __buildWmsTileUrl(this._baseUrl, p); // J-9
@@ -5245,7 +5526,10 @@ class GridLayer {
 
   _update() {
     if (!this._map || !this._container) return;
-    const zoom = Math.round(this._map.getZoom());
+    // Clamp to the map's zoom range: unclamped negative/large zooms make
+    // 2^zoom fractional or huge, blanking all tiles or iterating millions.
+    const rawZoom = Number(this._map.getZoom());
+    const zoom = Math.round(Math.max(this._map.getMinZoom(), Math.min(this._map.getMaxZoom(), Number.isFinite(rawZoom) ? rawZoom : 0)));
     const center = this._map.getCenter();
     const size = this.options.tileSize;
     const scale = size * Math.pow(2, zoom);
@@ -5422,6 +5706,11 @@ const Util = {
     // shape). Allowing spaces inside the class next to the padding ` *`
     // made this polynomial (ReDoS) on inputs like '{{    '.
     return str.replace(/\{ *([\w_-]+) *\}/g, (match, key) => {
+      // Own-property only: inherited members (constructor/prototype) must
+      // not be readable or invocable through a template.
+      if (!data || !Object.prototype.hasOwnProperty.call(data, key)) {
+        throw new Error('No value provided for variable ' + match);
+      }
       let value = data[key];
       if (value === undefined) throw new Error('No value provided for variable ' + match);
       if (typeof value === 'function') value = value(data);
@@ -5505,8 +5794,24 @@ class LayersControl extends Control {
       boxShadow: '0 1px 4px rgba(0,0,0,0.2)'
     });
     this._container = el;
+    // Re-render when layers are added/removed outside the control so the
+    // checked state cannot go stale (see _refresh).
+    if (_map && typeof _map.on === 'function') {
+      this._layerListener = () => this._refresh();
+      _map.on('layeradd', this._layerListener);
+      _map.on('layerremove', this._layerListener);
+    }
     this._refresh();
     return el;
+  }
+
+  onRemove(map) {
+    if (map && this._layerListener && typeof map.off === 'function') {
+      map.off('layeradd', this._layerListener);
+      map.off('layerremove', this._layerListener);
+      this._layerListener = null;
+    }
+    return this;
   }
 
   _refresh() {
@@ -5520,7 +5825,12 @@ class LayersControl extends Control {
       const input = document.createElement('input');
       input.type = entry.overlay ? 'checkbox' : 'radio';
       if (!entry.overlay) input.name = 'rustyleaf-base-layer';
-      input.checked = true;
+      // Reflect actual map state so a removed overlay does not stay checked.
+      try {
+        input.checked = this._map && typeof this._map.hasLayer === 'function' ? this._map.hasLayer(entry.layer) : true;
+      } catch (e) {
+        input.checked = true;
+      }
       input.addEventListener('change', () => {
         const map = this._map;
         if (!map) return;

@@ -10,6 +10,14 @@ const EARTH_RADIUS = 6371000;
 const MAX_MERCATOR_LATITUDE = 85.0511287798;
 
 function finiteNumber(value, name) {
+  // Reject values that Number() would silently coerce: null -> 0, '' -> 0,
+  // true -> 1, [] -> 0. Callers should pass real numbers or numeric strings.
+  if (value === null || typeof value === 'boolean' || Array.isArray(value)) {
+    throw new TypeError(`${name} must be a finite number`);
+  }
+  if (typeof value === 'string' && value.trim() === '') {
+    throw new TypeError(`${name} must be a finite number`);
+  }
   const number = Number(value);
   if (!Number.isFinite(number)) {
     throw new TypeError(`${name} must be a finite number`);
@@ -20,7 +28,8 @@ function finiteNumber(value, name) {
 function defineCoordinateProperties(target, properties) {
   for (const [name, value] of Object.entries(properties)) {
     const internalName = `_${name}`;
-    const coordinateIndex = name === 'x' || name === 'lat' ? 0 : name === 'y' || name === 'lng' ? 1 : name === 'alt' ? 2 : -1;
+    const isAlt = name === 'alt';
+    const coordinateIndex = name === 'x' || name === 'lat' ? 0 : name === 'y' || name === 'lng' ? 1 : isAlt ? 2 : -1;
     Object.defineProperty(target, internalName, {
       configurable: true,
       enumerable: false,
@@ -30,13 +39,36 @@ function defineCoordinateProperties(target, properties) {
     Object.defineProperty(target, name, {
       configurable: true,
       enumerable: false,
-      get: () => target[`_${name}`],
+      get: () => target[internalName],
       set: (next) => {
-        const numeric = finiteNumber(next, name);
-        target[internalName] = numeric;
-        if (coordinateIndex >= 0) target[coordinateIndex] = numeric;
+        // Allow clearing an optional altitude; every other coordinate must
+        // stay a finite number.
+        if (isAlt && next === undefined) {
+          target[internalName] = undefined;
+          if (target.length > 2) target.length = 2;
+          return;
+        }
+        target[internalName] = finiteNumber(next, name);
       }
     });
+    // Keep tuple indices in sync with the named properties. Without this,
+    // direct index writes (p[0] = n, splice, length tricks) silently desync
+    // from p.x / p.lat while the class still advertises tuple compatibility.
+    if (coordinateIndex >= 0) {
+      const key = String(coordinateIndex);
+      Object.defineProperty(target, key, {
+        configurable: true,
+        enumerable: true,
+        get: () => target[internalName],
+        set: (next) => {
+          if (isAlt && next === undefined) {
+            target[internalName] = undefined;
+            return;
+          }
+          target[internalName] = finiteNumber(next, name);
+        }
+      });
+    }
   }
 }
 
@@ -56,26 +88,62 @@ function asPoint(value, y) {
   if (value && typeof value === 'object' && value.x !== undefined && value.y !== undefined) {
     return new Point(value.x, value.y);
   }
-  return new Point(value, y);
+  // Fail fast on missing input instead of silently collapsing to the origin
+  // (Point(0,0)), which made e.g. Bounds.contains(empty) meaningless.
+  if (y !== undefined) return new Point(value, y);
+  if (typeof value === 'number' || (typeof value === 'string' && value.trim() !== '')) {
+    return new Point(value, undefined);
+  }
+  throw new TypeError('Expected a [x, y] tuple or {x, y} object');
 }
 
 // Leaflet's public SphericalMercator projection uses meters. Plugin code
 // calling CRS.EPSG3857.project should receive the familiar meter coordinates.
-function sphericalMercatorProject(latlng) {
+function crsScale(zoom) {
+  const numeric = Number(zoom);
+  if (!Number.isFinite(numeric)) {
+    throw new RangeError('CRS scale requires a finite zoom');
+  }
+  return 256 * Math.pow(2, numeric);
+}
+
+function crsZoom(scale) {
+  const numeric = Number(scale);
+  if (!(numeric > 0)) {
+    throw new RangeError('CRS zoom requires a positive finite scale');
+  }
+  return Math.log(numeric / 256) / Math.LN2;
+}
+
+// Leaflet's SphericalMercator uses the mean earth radius; the (elliptical)
+// Mercator projection uses the WGS84 semi-major axis. They were previously
+// aliased to the same function, silently giving spherical math to anyone
+// selecting Mercator.
+const WGS84_SEMI_MAJOR = 6378137;
+
+function mercatorProject(latlng, radius) {
   const value = asLatLng(latlng);
   const latitude = Math.max(-MAX_MERCATOR_LATITUDE, Math.min(MAX_MERCATOR_LATITUDE, value.lat));
   const radians = Math.PI / 180;
   const sin = Math.sin(latitude * radians);
-  return new Point(EARTH_RADIUS * value.lng * radians,
-    EARTH_RADIUS * Math.log((1 + sin) / (1 - sin)) / 2);
+  return new Point(radius * value.lng * radians,
+    radius * Math.log((1 + sin) / (1 - sin)) / 2);
 }
 
-function sphericalMercatorUnproject(pointValue) {
+function mercatorUnproject(pointValue, radius) {
   const value = asPoint(pointValue);
   const radians = 180 / Math.PI;
-  return new LatLng((2 * Math.atan(Math.exp(value.y / EARTH_RADIUS)) - Math.PI / 2) * radians,
-    value.x * radians / EARTH_RADIUS);
+  return new LatLng((2 * Math.atan(Math.exp(value.y / radius)) - Math.PI / 2) * radians,
+    value.x * radians / radius);
 }
+
+function sphericalMercatorProject(latlng) { return mercatorProject(latlng, EARTH_RADIUS); }
+
+function sphericalMercatorUnproject(pointValue) { return mercatorUnproject(pointValue, EARTH_RADIUS); }
+
+function ellipticalMercatorProject(latlng) { return mercatorProject(latlng, WGS84_SEMI_MAJOR); }
+
+function ellipticalMercatorUnproject(pointValue) { return mercatorUnproject(pointValue, WGS84_SEMI_MAJOR); }
 
 export class Point extends Array {
   // Array methods (slice/map/filter/…) construct via Symbol.species: without
@@ -102,7 +170,14 @@ export class Point extends Array {
   ceil() { return new Point(Math.ceil(this.x), Math.ceil(this.y)); }
   trunc() { return new Point(Math.trunc(this.x), Math.trunc(this.y)); }
   distanceTo(other) { const p = asPoint(other); return Math.hypot(this.x - p.x, this.y - p.y); }
-  equals(other) { const p = asPoint(other); return this.x === p.x && this.y === p.y; }
+  equals(other) {
+    try {
+      const p = asPoint(other);
+      return this.x === p.x && this.y === p.y;
+    } catch (e) {
+      return false;
+    }
+  }
   // Leaflet parity: Point.contains uses abs() comparison (upstream Leaflet
   // `Point.contains` is `Math.abs(p.x) <= Math.abs(this.x) && ...`). This is
   // intentionally sign-insensitive to match Leaflet — do NOT "fix" to a range
@@ -168,19 +243,30 @@ export class Bounds extends Array {
   getSize() { return this.isValid() ? this._max.subtract(this._min) : new Point(0, 0); }
   contains(value) {
     if (!this.isValid()) return false;
-    if (value instanceof Bounds || (value && value.min && value.max)) {
-      return this.contains(value.min || value[0]) && this.contains(value.max || value[1]);
+    try {
+      if (value instanceof Bounds || (value && value.min && value.max)) {
+        return this.contains(value.min || value[0]) && this.contains(value.max || value[1]);
+      }
+      if (Array.isArray(value) && value.length === 2 &&
+        (Array.isArray(value[0]) || (value[0] && value[0].x !== undefined))) {
+        return this.contains(value[0]) && this.contains(value[1]);
+      }
+      const point = asPoint(value);
+      return point.x >= this._min.x && point.x <= this._max.x && point.y >= this._min.y && point.y <= this._max.y;
+    } catch (e) {
+      // Containment is a predicate, not a parser: unrecognizable input is
+      // simply not contained.
+      return false;
     }
-    if (Array.isArray(value) && value.length === 2 &&
-      (Array.isArray(value[0]) || (value[0] && value[0].x !== undefined))) {
-      return this.contains(value[0]) && this.contains(value[1]);
-    }
-    const point = asPoint(value);
-    return point.x >= this._min.x && point.x <= this._max.x && point.y >= this._min.y && point.y <= this._max.y;
   }
   intersects(value) {
     if (!this.isValid()) return false;
-    const other = value instanceof Bounds ? value : new Bounds(value);
+    let other;
+    try {
+      other = value instanceof Bounds ? value : new Bounds(value);
+    } catch (e) {
+      return false;
+    }
     if (!other.isValid()) return false;
     return other._max.x >= this._min.x && other._min.x <= this._max.x
       && other._max.y >= this._min.y && other._min.y <= this._max.y;
@@ -194,7 +280,15 @@ export class Bounds extends Array {
       new Point(this._max.x + size.x * bufferRatio, this._max.y + size.y * bufferRatio)
     );
   }
-  equals(value) { const other = value instanceof Bounds ? value : new Bounds(value); return this.isValid() && other.isValid() && this._min.equals(other._min) && this._max.equals(other._max); }
+  equals(value) {
+    let other;
+    try {
+      other = value instanceof Bounds ? value : new Bounds(value);
+    } catch (e) {
+      return false;
+    }
+    return this.isValid() && other.isValid() && this._min.equals(other._min) && this._max.equals(other._max);
+  }
   toArray() { return this.isValid() ? [this._min.toArray(), this._max.toArray()] : []; }
   toString() { return this.isValid() ? `Bounds(${this._min.toString()}, ${this._max.toString()})` : 'Bounds(INVALID)'; }
 }
@@ -215,7 +309,12 @@ export class LatLng extends Array {
   }
 
   equals(other, maxMargin = 1e-9) {
-    const point = asLatLng(other);
+    let point;
+    try {
+      point = asLatLng(other);
+    } catch (e) {
+      return false;
+    }
     return Math.max(Math.abs(this.lat - point.lat), Math.abs(this.lng - point.lng)) <= maxMargin
       && (this.alt === undefined || point.alt === undefined || Math.abs(this.alt - point.alt) <= maxMargin);
   }
@@ -224,7 +323,10 @@ export class LatLng extends Array {
   // 40075017m; lng scaled by cos(lat)) like Leaflet's LatLng.toBounds.
   toBounds(size = 0) {
     const latAccuracy = 180 * size / 40075017;
-    const lngAccuracy = latAccuracy / Math.cos((Math.PI / 180) * this.lat);
+    // cos(lat) vanishes at the poles; without a floor the longitude accuracy
+    // explodes (e.g. (90,0).toBounds(100) -> lng +/-7.3e12).
+    const cosLat = Math.max(Math.cos((Math.PI / 180) * this.lat), 1e-9);
+    const lngAccuracy = latAccuracy / cosLat;
     return new LatLngBounds(
       [this.lat - latAccuracy, this.lng - lngAccuracy],
       [this.lat + latAccuracy, this.lng + lngAccuracy]
@@ -238,7 +340,7 @@ export class LatLng extends Array {
     const a = Math.sin(dLat / 2) ** 2 + Math.cos(this.lat * rad) * Math.cos(point.lat * rad) * Math.sin(dLng / 2) ** 2;
     return EARTH_RADIUS * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   }
-  wrap() { return new LatLng(this.lat, wrapNum(this.lng, [-180, 180]), this.alt); }
+  wrap() { return new LatLng(this.lat, wrapNum(this.lng, [-180, 180], true), this.alt); }
   toString() { return `LatLng(${this.lat}, ${this.lng})`; }
 }
 
@@ -323,17 +425,26 @@ export class LatLngBounds extends Array {
   getNorth() { return this._northEast ? this._northEast.lat : undefined; }
   contains(value) {
     if (!this.isValid()) return false;
-    if (value instanceof LatLngBounds || (value && value._southWest)) return this.contains(value._southWest) && this.contains(value._northEast);
-    if (Array.isArray(value) && value.length === 2 &&
-      (Array.isArray(value[0]) || (value[0] && value[0].lat !== undefined))) {
-      return this.contains(value[0]) && this.contains(value[1]);
+    try {
+      if (value instanceof LatLngBounds || (value && value._southWest)) return this.contains(value._southWest) && this.contains(value._northEast);
+      if (Array.isArray(value) && value.length === 2 &&
+        (Array.isArray(value[0]) || (value[0] && value[0].lat !== undefined))) {
+        return this.contains(value[0]) && this.contains(value[1]);
+      }
+      const point = asLatLng(value);
+      return point.lat >= this.getSouth() && point.lat <= this.getNorth() && point.lng >= this.getWest() && point.lng <= this.getEast();
+    } catch (e) {
+      return false;
     }
-    const point = asLatLng(value);
-    return point.lat >= this.getSouth() && point.lat <= this.getNorth() && point.lng >= this.getWest() && point.lng <= this.getEast();
   }
   intersects(value) {
     if (!this.isValid()) return false;
-    const other = value instanceof LatLngBounds ? value : new LatLngBounds(value);
+    let other;
+    try {
+      other = value instanceof LatLngBounds ? value : new LatLngBounds(value);
+    } catch (e) {
+      return false;
+    }
     if (!other.isValid()) return false;
     return Math.max(this.getSouth(), other.getSouth()) <= Math.min(this.getNorth(), other.getNorth())
       && Math.max(this.getWest(), other.getWest()) <= Math.min(this.getEast(), other.getEast());
@@ -345,7 +456,15 @@ export class LatLngBounds extends Array {
     const width = (this.getEast() - this.getWest()) * bufferRatio;
     return new LatLngBounds([this.getSouth() - height, this.getWest() - width], [this.getNorth() + height, this.getEast() + width]);
   }
-  equals(value, maxMargin = 1e-9) { const other = value instanceof LatLngBounds ? value : new LatLngBounds(value); return this.isValid() && other.isValid() && this._southWest.equals(other._southWest, maxMargin) && this._northEast.equals(other._northEast, maxMargin); }
+  equals(value, maxMargin = 1e-9) {
+    let other;
+    try {
+      other = value instanceof LatLngBounds ? value : new LatLngBounds(value);
+    } catch (e) {
+      return false;
+    }
+    return this.isValid() && other.isValid() && this._southWest.equals(other._southWest, maxMargin) && this._northEast.equals(other._northEast, maxMargin);
+  }
   toArray() { return this.isValid() ? [this._southWest.toArray(), this._northEast.toArray()] : []; }
   toBBox() { return this.isValid() ? [this.getWest(), this.getSouth(), this.getEast(), this.getNorth()].join(',') : ''; }
   toString() { return this.isValid() ? `LatLngBounds(${this._southWest.toString()}, ${this._northEast.toString()})` : 'LatLngBounds(INVALID)'; }
@@ -359,13 +478,28 @@ export class Transformation {
     this._d = finiteNumber(d, 'd');
   }
   transform(point, scale = 1) { const p = asPoint(point); return new Point(scale * (this._a * p.x + this._b), scale * (this._c * p.y + this._d)); }
-  untransform(point, scale = 1) { const p = asPoint(point); return new Point((p.x / scale - this._b) / this._a, (p.y / scale - this._d) / this._c); }
+  untransform(point, scale = 1) {
+    if (this._a === 0 || this._c === 0) {
+      throw new RangeError('Transformation coefficients a and c must be non-zero');
+    }
+    const numericScale = Number(scale);
+    if (!Number.isFinite(numericScale) || numericScale === 0) {
+      throw new RangeError('Transformation scale must be a finite non-zero number');
+    }
+    const p = asPoint(point);
+    return new Point((p.x / numericScale - this._b) / this._a, (p.y / numericScale - this._d) / this._c);
+  }
 }
 
 export function wrapNum(value, range, includeMax = false) {
   const [min, max] = range;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || !Number.isFinite(min) || !Number.isFinite(max)) return NaN;
   const d = max - min;
-  return value === max && includeMax ? value : ((value - min) % d + d) % d + min;
+  if (!(d > 0)) {
+    throw new RangeError('wrapNum requires a range with max > min');
+  }
+  return numeric === max && includeMax ? numeric : ((numeric - min) % d + d) % d + min;
 }
 
 export function latLng(lat, lng, alt) { return asLatLng(lat, lng, alt); }
@@ -382,8 +516,8 @@ const earthCrs = {
   wrapLat: [-MAX_MERCATOR_LATITUDE, MAX_MERCATOR_LATITUDE],
   R: EARTH_RADIUS,
   distance: (a, b) => asLatLng(a).distanceTo(b),
-  scale: (zoom) => 256 * Math.pow(2, zoom),
-  zoom: (scale) => Math.log(scale / 256) / Math.LN2,
+  scale: crsScale,
+  zoom: crsZoom,
   project: sphericalMercatorProject,
   unproject: sphericalMercatorUnproject,
   transformation: new Transformation(0.5 / Math.PI, 0.5, -0.5 / Math.PI, 0.5)
@@ -396,15 +530,15 @@ export const CRS = {
     code: 'EPSG:4326',
     wrapLng: [-180, 180],
     distance: (a, b) => asLatLng(a).distanceTo(b),
-    scale: (zoom) => 256 * Math.pow(2, zoom),
-    zoom: (scale) => Math.log(scale / 256) / Math.LN2,
+    scale: crsScale,
+    zoom: crsZoom,
     project: (value) => { const p = asLatLng(value); return new Point(p.lng, p.lat); },
     unproject: (value) => { const p = asPoint(value); return new LatLng(p.y, p.x); }
   },
   Simple: {
     code: 'SR:ORG:68:4',
-    scale: (zoom) => Math.pow(2, zoom),
-    zoom: (scale) => Math.log(scale) / Math.LN2,
+    scale: (zoom) => Math.pow(2, Number(zoom)),
+    zoom: (scale) => Math.log(Number(scale)) / Math.LN2,
     project: (value) => { const p = asLatLng(value); return new Point(p.lng, p.lat); },
     unproject: (value) => { const p = asPoint(value); return new LatLng(p.y, p.x); }
   }
@@ -413,7 +547,7 @@ export const CRS = {
 export const Projection = {
   LonLat: { project: CRS.EPSG4326.project, unproject: CRS.EPSG4326.unproject },
   SphericalMercator: { project: sphericalMercatorProject, unproject: sphericalMercatorUnproject },
-  Mercator: { project: sphericalMercatorProject, unproject: sphericalMercatorUnproject }
+  Mercator: { project: ellipticalMercatorProject, unproject: ellipticalMercatorUnproject }
 };
 
 export const Browser = {
@@ -437,6 +571,9 @@ export const Browser = {
 
 export const DomUtil = {
   create(tagName, className, container) {
+    if (typeof document === 'undefined') {
+      throw new Error('DomUtil.create requires a DOM: document is undefined (SSR)');
+    }
     const element = document.createElement(tagName);
     if (className) element.className = className;
     if (container) container.appendChild(element);
@@ -452,7 +589,11 @@ export const DomUtil = {
   getPosition(element) { return element ? new Point(parseFloat(element.style.left) || 0, parseFloat(element.style.top) || 0) : new Point(); },
   toFront(element) { if (element && element.parentNode) element.parentNode.appendChild(element); },
   toBack(element) { if (element && element.parentNode) element.parentNode.insertBefore(element, element.parentNode.firstChild); },
-  getStyle(element, name) { return element ? getComputedStyle(element)[name] : ''; }
+  getStyle(element, name) {
+    if (!element) return '';
+    if (typeof getComputedStyle === 'undefined') return '';
+    return getComputedStyle(element)[name];
+  }
 };
 
 const boundDomHandlers = new WeakMap();
@@ -489,9 +630,23 @@ export const DomEvent = {
   stopPropagation(event) { if (event) event.stopPropagation(); return this; },
   preventDefault(event) { if (event) event.preventDefault(); return this; },
   stop(event) { this.preventDefault(event); this.stopPropagation(event); return this; },
-  disableClickPropagation(element) { for (const type of ['mousedown', 'touchstart', 'click', 'dblclick', 'contextmenu']) element.addEventListener(type, this.stopPropagation); return this; },
-  disableScrollPropagation(element) { for (const type of ['wheel', 'mousewheel', 'touchmove']) element.addEventListener(type, this.stopPropagation); return this; },
-  getMousePosition(event, container) { const rect = container.getBoundingClientRect(); return new Point(event.clientX - rect.left, event.clientY - rect.top); },
+  disableClickPropagation(element) {
+    if (!element || typeof element.addEventListener !== 'function') return this;
+    for (const type of ['mousedown', 'touchstart', 'click', 'dblclick', 'contextmenu']) element.addEventListener(type, this.stopPropagation);
+    return this;
+  },
+  disableScrollPropagation(element) {
+    if (!element || typeof element.addEventListener !== 'function') return this;
+    for (const type of ['wheel', 'mousewheel', 'touchmove']) element.addEventListener(type, this.stopPropagation);
+    return this;
+  },
+  getMousePosition(event, container) {
+    if (!container || typeof container.getBoundingClientRect !== 'function') {
+      throw new TypeError('DomEvent.getMousePosition requires a container element');
+    }
+    const rect = container.getBoundingClientRect();
+    return new Point(event.clientX - rect.left, event.clientY - rect.top);
+  },
   // Leaflet v1.9.4 parity (DomEvent.getWheelDelta): normalized to vertical
   // pixels scrolled (negative if scrolling down). deltaMode 0 = pixels
   // (scaled by device-pixel factor), 1 = lines (x20), 2 = pages (x60);

@@ -961,6 +961,15 @@ impl RustyleafMap {
 
     #[wasm_bindgen]
     pub fn resize(&mut self, width: u32, height: u32) -> Result<(), JsValue> {
+        // A zero viewport yields an inf projection matrix (2.0/0) and a
+        // 0-size GL viewport; giant sizes OOM the canvas. Reject both.
+        const MAX_VIEWPORT_DIM: u32 = 8192;
+        if width == 0 || height == 0 {
+            return Err(RustyleafError::ResourceError("resize dimensions must be non-zero".into()).into());
+        }
+        if width > MAX_VIEWPORT_DIM || height > MAX_VIEWPORT_DIM {
+            return Err(RustyleafError::ResourceError("resize dimensions exceed the 8192px cap".into()).into());
+        }
         self.needs_redraw = true;
         self.width = width;
         self.height = height;
@@ -1316,12 +1325,16 @@ impl RustyleafMap {
         
         let (sw_lat, sw_lng) = self.viewport().pixel_to_lat_lng(start_x, end_y, zoom);
         let (ne_lat, ne_lng) = self.viewport().pixel_to_lat_lng(end_x, start_y, zoom);
-        
+        // Wrap longitudes so panning past the antimeridian does not return
+        // e.g. ne_lng=190, which breaks JS sw<=ne bounds logic.
+        fn wrap_lng(lng: f64) -> f64 {
+            ((lng + 180.0) % 360.0 + 360.0) % 360.0 - 180.0
+        }
         let arr = Array::new();
         arr.push(&JsValue::from_f64(sw_lat));
-        arr.push(&JsValue::from_f64(sw_lng));
+        arr.push(&JsValue::from_f64(wrap_lng(sw_lng)));
         arr.push(&JsValue::from_f64(ne_lat));
-        arr.push(&JsValue::from_f64(ne_lng));
+        arr.push(&JsValue::from_f64(wrap_lng(ne_lng)));
         arr
     }
 
@@ -1355,20 +1368,34 @@ impl RustyleafMap {
             return Err(RustyleafError::InvalidCoordinate { lat: ne_lat, lng: ne_lng }.into());
         }
         
-        // Validate that bounds are valid (ne > sw)
+        // Validate that bounds are valid (ne > sw). Longitude wraps at the
+        // antimeridian, so ne_lng <= sw_lng means a Fiji-style crossing box:
+        // normalize the span instead of throwing.
         if ne_lat <= sw_lat {
             return Err(RustyleafError::InvalidCoordinate { lat: ne_lat, lng: ne_lng }.into());
         }
-        if ne_lng <= sw_lng {
+        let span_lng = if ne_lng <= sw_lng {
+            (ne_lng + 360.0) - sw_lng
+        } else {
+            ne_lng - sw_lng
+        };
+        if !(span_lng > 0.0) || span_lng >= 360.0 {
             return Err(RustyleafError::InvalidCoordinate { lat: ne_lat, lng: ne_lng }.into());
         }
         
         // Calculate center of bounds
         let center_lat = (sw_lat + ne_lat) / 2.0;
-        let center_lng = (sw_lng + ne_lng) / 2.0;
+        // Center of a crossing box sits past 180: wrap it back.
+        let mut center_lng = sw_lng + span_lng / 2.0;
+        if center_lng > 180.0 {
+            center_lng -= 360.0;
+        }
         
-        // Calculate appropriate zoom level to fit bounds in viewport
-        let zoom = self.calculate_fit_zoom(sw_lat, sw_lng, ne_lat, ne_lng);
+        // Calculate appropriate zoom level to fit bounds in viewport.
+        // For antimeridian-crossing boxes pass the wrapped eastern edge so
+        // the zoom reflects the true (small) span, not the whole world.
+        let fit_ne_lng = if ne_lng <= sw_lng { ne_lng + 360.0 } else { ne_lng };
+        let zoom = self.calculate_fit_zoom(sw_lat, sw_lng, ne_lat, fit_ne_lng);
         
         // Apply the new view
         self.set_view(center_lat, center_lng, zoom);
@@ -1891,6 +1918,9 @@ impl RustyleafMap {
 
     #[wasm_bindgen]
     pub fn update_marker(&mut self, id: u32, lat: f64, lng: f64) {
+        if !lat.is_finite() || !lng.is_finite() {
+            return;
+        }
         self.needs_redraw = true;
         if let Some(m) = self.markers.get_mut(id as usize).and_then(|m| m.as_mut()) {
             m.lat = lat;
@@ -1910,9 +1940,12 @@ impl RustyleafMap {
         a: f32,
         z_order: i32,
     ) {
+        if !size.is_finite() || !r.is_finite() || !g.is_finite() || !b.is_finite() || !a.is_finite() {
+            return;
+        }
         if let Some(m) = self.markers.get_mut(id as usize).and_then(|m| m.as_mut()) {
-            m.size = size;
-            m.color = [r, g, b, a];
+            m.size = size.clamp(1.0, 256.0);
+            m.color = [r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0), a.clamp(0.0, 1.0)];
             m.z_order = z_order;
             // Style change must schedule a draw (R-24); siblings already do.
             self.needs_redraw = true;
@@ -2956,6 +2989,11 @@ impl RustyleafMap {
 
         let x = arr[0].as_f64().ok_or_else(|| RustyleafError::GeoJsonParse("Invalid x coordinate".into()))?;
         let y = arr[1].as_f64().ok_or_else(|| RustyleafError::GeoJsonParse("Invalid y coordinate".into()))?;
+        // NaN/Inf coordinates would poison caches, projection, and hit-test
+        // downstream — reject them at parse time like the vector-layer paths do.
+        if !x.is_finite() || !y.is_finite() {
+            return Err(RustyleafError::GeoJsonParse("Non-finite coordinate".into()).into());
+        }
 
         Ok([x, y])
     }

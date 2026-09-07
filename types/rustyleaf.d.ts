@@ -140,6 +140,11 @@ export interface MapOptions {
   maxBounds?: LatLngBoundsLike | null;
   zoomDelta?: number;
   zoomSnap?: number;
+  /**
+   * Accepted for Leaflet API compatibility but currently ignored: the
+   * renderer is EPSG:3857-only. Passing CRS.Simple (or any other CRS) does
+   * not change rendering. Kept so Leaflet-oriented code typechecks.
+   */
   crs?: CRSLike;
   layers?: GroupableLayer[];
 }
@@ -247,6 +252,9 @@ export interface PopupOptions {
   closeButton?: boolean;
   autoClose?: boolean;
   className?: string;
+  /** Opt-in to HTML parsing. String content is set as text by default;
+   * only set this when the string is trusted (XSS otherwise). */
+  allowHTML?: boolean;
 }
 
 // Icon options
@@ -317,7 +325,8 @@ export declare class Marker {
   setDraggable(draggable: boolean): this;
   isDraggable(): boolean;
   on(event: 'click' | 'mouseover' | 'mouseout' | 'dragstart' | 'drag' | 'dragend' | 'add' | 'remove', callback: (...args: any[]) => void): this;
-  off(event: string, callback: (...args: any[]) => void): this;
+  off(event: string, callback?: (...args: any[]) => void): this;
+  once(event: string, callback: (...args: any[]) => void): this;
   fire(event: string, data?: any): this;
   addTo(map: Map): this;
   remove(): this;
@@ -403,8 +412,8 @@ export declare class Map {
    * load, locationfound, locationerror. click/hover events carry `feature`
    * (hit-tested meta) when a feature is under the cursor.
    */
-  on(event: string, callback: (...args: any[]) => void): this;
-  off(event: string, callback: (...args: any[]) => void): this;
+  on(event: string, callback: (...args: any[]) => void, context?: any): this;
+  off(event: string, callback?: (...args: any[]) => void): this;
   once(event: string, callback: (...args: any[]) => void, context?: any): this;
   remove(): this;
   destroy(): this;
@@ -444,6 +453,9 @@ export declare class WMSTileLayer extends TileLayer {
     attribution?: string;
   });
   wmsParams: Record<string, string | number>;
+  /** Merge WMS parameters (layers, styles, format, ...) and refresh tiles.
+   * Only known WMS keys are merged; `__proto__` and other dunder keys are ignored. */
+  setParams(params: Record<string, any>): this;
 }
 
 // Programmable DOM tiles: subclass and override createTile(coords).
@@ -542,7 +554,7 @@ export declare class Circle {
   setLatLng(latlng: LatLngLike): this;
   getRadius(): number;
   setRadius(radius: number): this;
-  getBounds(): LatLngBounds;
+  getBounds(): LatLngBoundsValue;
   on(event: 'click' | 'hover', callback: (...args: any[]) => void): this;
   setStyle(style: Record<string, any>): this;
   getStyle(): Record<string, any>;
@@ -610,7 +622,7 @@ export declare class LayerGroup {
 export declare class FeatureGroup extends LayerGroup {
   on(event: string, callback: (...args: any[]) => void): this;
   off(event: string, callback?: (...args: any[]) => void): this;
-  getBounds(): LatLngBounds | null;
+  getBounds(): LatLngBoundsValue | null;
   setStyle(style: Record<string, any>): this;
   bringToFront(): this;
   bringToBack(): this;
@@ -623,7 +635,7 @@ export declare class GeoJSONLayer {
 
   loadData(geojson: any): this;
   addData(geojson: any): this;
-  loadUrl(url: string): Promise<this>;
+  loadUrl(url: string, options?: { signal?: AbortSignal; timeout?: number; maxBytes?: number }): Promise<this>;
   loadUrlStreaming(url: string, options?: GeoJSONStreamingOptions): Promise<this>;
   loadFile(file: File, options?: GeoJSONStreamingOptions): Promise<this>;
   loadFromUrl(url: string, options?: {
@@ -631,6 +643,8 @@ export declare class GeoJSONLayer {
     completeCallback?: (r: { totalFeatures: number; totalBytes: number }) => void;
     errorCallback?: (e: { error: Error; message: string }) => void;
     signal?: AbortSignal;
+    timeout?: number;
+    maxBytes?: number;
   }): Promise<this>;
   processChunk(chunk: string, isFinal: boolean): void;
   getFeatureCount(): number;
@@ -647,11 +661,12 @@ export declare class GeoJSONLayer {
   resetStyle(layer?: GeoJSONFeatureHandle | GroupableLayer): this;
   toGeoJSON(): any;
   remove(): this;
-  getBounds(): LatLngBounds | null;
+  getBounds(): LatLngBoundsValue | null;
   getFeaturesInBounds(bounds: LatLngBounds): any[];
   clear(): this;
   addFeature(feature: any): this;
   addFeatures(features: any[]): this;
+  invokeFeatureMethod(methodName: string, ...args: any[]): this;
 }
 
 // ==================== Popup ====================
@@ -675,7 +690,7 @@ export declare class Popup {
 // ==================== Tooltip ====================
 
 export declare class Tooltip {
-  constructor(options?: { content?: string; direction?: string; opacity?: number; className?: string; sticky?: boolean; offset?: [number, number] });
+  constructor(options?: { content?: string; direction?: string; opacity?: number; className?: string; sticky?: boolean; offset?: [number, number]; allowHTML?: boolean });
 
   setContent(content: string | HTMLElement): this;
   getTooltipContent(): string;
@@ -699,6 +714,10 @@ export declare class Control {
   constructor(options?: ControlOptions);
   getPosition(): string;
   setPosition(position: string): this;
+  /** Build the control's DOM. Override in subclasses (Leaflet pattern). */
+  onAdd(map: Map): HTMLElement;
+  /** Tear down anything onAdd created. Override in subclasses. */
+  onRemove(map: Map): void;
   addTo(map: Map): this;
   remove(): this;
   getContainer(): HTMLElement | null;
@@ -822,7 +841,7 @@ export declare function marker(latlng: LatLngLike, options?: MarkerOptions): Mar
 export declare function icon(options: IconOptions): Icon;
 export declare function divIcon(options?: DivIconOptions): DivIcon;
 export declare function popup(options?: PopupOptions, source?: any): Popup;
-export declare function tooltip(options?: { content?: any; direction?: string; opacity?: number; className?: string; sticky?: boolean; offset?: [number, number] }): Tooltip;
+export declare function tooltip(options?: { content?: any; direction?: string; opacity?: number; className?: string; sticky?: boolean; offset?: [number, number]; allowHTML?: boolean }): Tooltip;
 export declare function circle(latlng: LatLngLike, options?: ShapeOptions & { radius?: number }): Circle;
 export declare function circleMarker(latlng: LatLngLike, options?: ShapeOptions & { radius?: number }): CircleMarker;
 export declare function rectangle(bounds: LatLngBoundsLike, options?: ShapeOptions): Rectangle;
@@ -916,3 +935,6 @@ declare const _default: {
   wrapNum: typeof wrapNum;
 };
 export default _default;
+
+/** Leaflet-style namespace object (also available as the default export). */
+export declare const L: typeof _default;

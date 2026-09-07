@@ -19,12 +19,19 @@ pub struct Viewport {
 
 impl Viewport {
     pub fn lat_lng_to_pixel(&self, lat: f64, lng: f64, zoom: u32) -> (f64, f64) {
+        if !lat.is_finite() || !lng.is_finite() {
+            return (f64::NAN, f64::NAN);
+        }
         let clamped_lat = lat.clamp(-85.05112878, 85.05112878);
+        // Wrap longitude so unwrapped inputs (e.g. 1e10 from unproject or
+        // accumulated pan deltas) cannot produce huge/inf screen coords that
+        // overflow the f32 vertex path.
+        let wrapped_lng = ((lng + 180.0) % 360.0 + 360.0) % 360.0 - 180.0;
 
         let zoom = zoom.min(30);
         let n = (1u64 << zoom) as f64;
 
-        let x_tile = (lng + 180.0) / 360.0 * n;
+        let x_tile = (wrapped_lng + 180.0) / 360.0 * n;
 
         let lat_rad = clamped_lat.to_radians();
         let y_tile = (1.0 - ((std::f64::consts::FRAC_PI_4 + lat_rad / 2.0).tan().ln() / std::f64::consts::PI)) / 2.0 * n;

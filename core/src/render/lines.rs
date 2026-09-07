@@ -101,6 +101,8 @@ pub fn render_lines(
 
         let projection_matrix = super::screen_projection_matrix(viewport);
         let program = gl_state.programs.line_gpu_program.inner();
+        context.enable(WebGl2RenderingContext::BLEND);
+        context.blend_func(WebGl2RenderingContext::SRC_ALPHA, WebGl2RenderingContext::ONE_MINUS_SRC_ALPHA);
         let u_matrix = context.get_uniform_location(program, "u_matrix");
         if let Some(loc) = u_matrix.as_ref() {
             context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
@@ -127,6 +129,7 @@ pub fn render_lines(
             6,
             capped_draw_count(instance_count),
         );
+        context.disable(WebGl2RenderingContext::BLEND);
     }
 
     Ok(())

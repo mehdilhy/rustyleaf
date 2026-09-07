@@ -121,6 +121,9 @@ pub fn render_points(
             None => continue,
         };
         context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(buffer.inner()));
+        // Packed RGBA point colors carry alpha: enable blending for this pass.
+        context.enable(WebGl2RenderingContext::BLEND);
+        context.blend_func(WebGl2RenderingContext::SRC_ALPHA, WebGl2RenderingContext::ONE_MINUS_SRC_ALPHA);
         context.enable_vertex_attrib_array(0);
         context.vertex_attrib_pointer_with_i32(0, 2, WebGl2RenderingContext::FLOAT, false, stride, 0);
         context.enable_vertex_attrib_array(1);
@@ -162,6 +165,7 @@ pub fn render_points(
         }
 
         context.draw_arrays(WebGl2RenderingContext::POINTS, 0, capped_draw_count(draw_count));
+        context.disable(WebGl2RenderingContext::BLEND);
     }
 
     Ok(())

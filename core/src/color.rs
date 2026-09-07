@@ -1,6 +1,12 @@
 pub fn parse_color(color_str: &str) -> [f32; 4] {
     let s = color_str.trim().to_lowercase();
     if let Some(stripped) = s.strip_prefix('#') {
+        // Byte-slicing below is only safe for ASCII hex. A multibyte string
+        // with byte-len 3/4 (e.g. "#éx") would slice mid-char and panic,
+        // trapping the whole WASM instance — reject it first.
+        if !stripped.is_ascii() {
+            return [0.0, 0.0, 0.0, 1.0];
+        }
         if stripped.len() == 6 {
             if let Ok(val) = u32::from_str_radix(stripped, 16) {
                 let r = ((val >> 16) & 0xff) as f32 / 255.0;
