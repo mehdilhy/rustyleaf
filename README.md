@@ -95,9 +95,12 @@ Leaflet-style) instead of showing empty gray past ±180°.
 - **WebGL2 required.** No Canvas2D or WebGL1 rendering fallback (`checkWebGLSupport`
   reports a WebGL1 "limited" level, but the renderer hard-requires a WebGL2
   context and refuses to start without one).
-- **Spherical Mercator only** — no custom CRS (EPSG:4326/3395, `SimpleCRS`).
-- Line width applies to `LineLayer`; GeoJSON-styled lines honor width only when
-  their GPU cache is built (the fallback non-cached path still draws 1px).
+- **Spherical Mercator only** — the map renders in mercator regardless of
+  `options.crs` (accepted but currently ignored); `CRS.EPSG4326`/`CRS.Simple`
+  exist only as coordinate helpers, not render paths.
+- Line width applies to `LineLayer` only (thick-line triangulation); GeoJSON
+  lines always draw 1px — the cached and non-cached GeoJSON paths both use
+  the 1px `LINES` primitive and ignore `width`.
 - No vector tiles.
 - Polygon *interiors* are hit-tested via point-in-polygon on the outer ring (holes aren't subtracted yet). `PointLayer`/`LineLayer`/`PolygonLayer` (non-GeoJSON) hit-test normally.
 - Line/polygon vertex data is cached in GPU buffers per layer, but heavy combined scenes still cost more than points alone.
