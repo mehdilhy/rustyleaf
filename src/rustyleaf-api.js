@@ -5154,7 +5154,7 @@ function scaleControl(options) { return new ScaleControl(options); }
 function layersControl(baseLayers, overlays, options) { return new LayersControl(baseLayers, overlays, options); }
 
 const L = {
-  version: '0.0.8',
+  version: '0.0.9',
   configureRustyleaf,
   checkWebGLSupport,
   Map, TileLayer, PointLayer, LineLayer, PolygonLayer, GeoJSONLayer,
