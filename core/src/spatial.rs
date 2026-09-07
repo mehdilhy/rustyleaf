@@ -95,8 +95,12 @@ pub fn rebuild_spatial_index(
     let mut feature_id: u32 = 0;
     let tolerance = 0.001; // degrees — ~111m at equator
 
+    // Hidden layers are neither drawn nor hit-testable (issue #17).
     // Index point features
     for (layer_idx, layer) in point_layers.iter().enumerate() {
+        if !layer.visible {
+            continue;
+        }
         for (point_idx, point) in layer.points.iter().enumerate() {
             let bounds = AABB::from_corners(
                 [point.lng - tolerance, point.lat - tolerance],
@@ -119,6 +123,9 @@ pub fn rebuild_spatial_index(
 
     // Index line features (simplified - index line segments)
     for (layer_idx, layer) in line_layers.iter().enumerate() {
+        if !layer.visible {
+            continue;
+        }
         for (line_idx, line) in layer.lines.iter().enumerate() {
             // One shared meta per line — segments must not deep-clone it.
             let meta = Arc::new(line.meta.clone());
@@ -153,6 +160,9 @@ pub fn rebuild_spatial_index(
     // hit_test can run a point-in-polygon refinement (Leaflet-like interior
     // clicks) instead of the old centroid-only approximation.
     for (layer_idx, layer) in polygon_layers.iter().enumerate() {
+        if !layer.visible {
+            continue;
+        }
         for (poly_idx, poly) in layer.polygons.iter().enumerate() {
             if let Some(ring) = poly.rings.first() {
                 if ring.len() >= 3 {
@@ -186,6 +196,9 @@ pub fn rebuild_spatial_index(
     // cached_polygon_triangles has no per-feature metadata after
     // triangulation, so interior clicks don't hit-test yet.
     for (layer_idx, layer) in geojson_layers.iter().enumerate() {
+        if !layer.visible {
+            continue;
+        }
         for (point_idx, point) in layer.cached_points.iter().enumerate() {
             let bounds = AABB::from_corners(
                 [point.lng - tolerance, point.lat - tolerance],
