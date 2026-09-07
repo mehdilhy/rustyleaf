@@ -1379,7 +1379,7 @@ impl RustyleafMap {
         } else {
             ne_lng - sw_lng
         };
-        if !(span_lng > 0.0) || span_lng >= 360.0 {
+        if span_lng <= 0.0 || span_lng >= 360.0 {
             return Err(RustyleafError::InvalidCoordinate { lat: ne_lat, lng: ne_lng }.into());
         }
         
