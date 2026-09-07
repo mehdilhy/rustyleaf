@@ -69,7 +69,7 @@ describe('Tooltip (real source)', () => {
 
   describe('setContent / setLatLng', () => {
     test('setContent stores content and returns this; updates live element', () => {
-      const t = new Tooltip({ content: 'first' });
+      const t = new Tooltip({ content: 'first', allowHTML: true });
       const map = makeMockMap();
       t.setLatLng([10, 20]);
       t.openOn(map as any);
@@ -78,6 +78,17 @@ describe('Tooltip (real source)', () => {
       expect(res).toBe(t);
       expect(t.getTooltipContent()).toBe('<b>second</b>');
       expect(t.element!.innerHTML).toBe('<b>second</b>');
+    });
+
+    test('string content is escaped by default (XSS safe) unless allowHTML is set', () => {
+      const t = new Tooltip({ content: 'first' });
+      const map = makeMockMap();
+      t.setLatLng([10, 20]);
+      t.openOn(map as any);
+
+      t.setContent('<b>second</b>');
+      expect(t.element!.innerHTML).toBe('&lt;b&gt;second&lt;/b&gt;');
+      expect(t.element!.textContent).toBe('<b>second</b>');
     });
 
     test('setContent before open does not touch any element', () => {
@@ -359,7 +370,7 @@ describe('Tooltip (real source)', () => {
     afterEach(() => { if (map.remove) map.remove(); });
 
     test('overlay element created with className, html string, and opacity', () => {
-      const icon = new DivIcon({ html: '<em>pin</em>', className: 'custom-pin' });
+      const icon = new DivIcon({ html: '<em>pin</em>', className: 'custom-pin', allowHTML: true });
       const marker = new Marker([48.8566, 2.3522], { icon, opacity: 0.5 });
       marker.addTo(map);
 
@@ -375,6 +386,15 @@ describe('Tooltip (real source)', () => {
       // Positioned via map.project
       expect(el.style.left).not.toBe('');
       expect(el.style.transform).toContain('translate');
+    });
+
+    test('string html is escaped by default (XSS safe) unless allowHTML is set', () => {
+      const marker = new Marker([48.8566, 2.3522], { icon: new DivIcon({ html: '<em>pin</em>' }) });
+      marker.addTo(map);
+      const el: HTMLElement = (marker as any)._domElement;
+      expect(el.textContent).toBe('<em>pin</em>');
+      expect(el.innerHTML).toBe('&lt;em&gt;pin&lt;/em&gt;');
+      marker.remove();
     });
 
     test('HTMLElement html option is appended as a child node', () => {

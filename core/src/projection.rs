@@ -1,6 +1,13 @@
 use js_sys::Array;
 use wasm_bindgen::prelude::*;
 
+/// Shared clamped-zoom helper (R-1…R-5): `zoom.round()` clamped to `0..=30`
+/// so `1u64 << zoom` can never shift-overflow (WASM trap). NaN → 0,
+/// +Inf → 30, -Inf → 0 via saturating `as i64` + clamp.
+pub fn clamp_zoom(zoom: f64) -> u32 {
+    (zoom.round() as i64).clamp(0, 30) as u32
+}
+
 pub struct Viewport {
     pub width: u32,
     pub height: u32,
@@ -12,11 +19,19 @@ pub struct Viewport {
 
 impl Viewport {
     pub fn lat_lng_to_pixel(&self, lat: f64, lng: f64, zoom: u32) -> (f64, f64) {
+        if !lat.is_finite() || !lng.is_finite() {
+            return (f64::NAN, f64::NAN);
+        }
         let clamped_lat = lat.clamp(-85.05112878, 85.05112878);
+        // Wrap longitude so unwrapped inputs (e.g. 1e10 from unproject or
+        // accumulated pan deltas) cannot produce huge/inf screen coords that
+        // overflow the f32 vertex path.
+        let wrapped_lng = ((lng + 180.0) % 360.0 + 360.0) % 360.0 - 180.0;
 
-        let n = (1u32 << zoom) as f64;
+        let zoom = zoom.min(30);
+        let n = (1u64 << zoom) as f64;
 
-        let x_tile = (lng + 180.0) / 360.0 * n;
+        let x_tile = (wrapped_lng + 180.0) / 360.0 * n;
 
         let lat_rad = clamped_lat.to_radians();
         let y_tile = (1.0 - ((std::f64::consts::FRAC_PI_4 + lat_rad / 2.0).tan().ln() / std::f64::consts::PI)) / 2.0 * n;
@@ -33,7 +48,8 @@ impl Viewport {
     }
 
     pub fn pixel_to_lat_lng(&self, x: f64, y: f64, zoom: u32) -> (f64, f64) {
-        let n = (1u32 << zoom) as f64;
+        let zoom = zoom.min(30);
+        let n = (1u64 << zoom) as f64;
         let tile_x = x / self.tile_size as f64;
         let tile_y = y / self.tile_size as f64;
 
@@ -47,7 +63,7 @@ impl Viewport {
     }
 
     pub fn lat_lng_to_screen(&self, lat: f64, lng: f64) -> (f64, f64) {
-        let zoom = self.zoom.round() as u32;
+        let zoom = clamp_zoom(self.zoom);
         let center_pixel = self.lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
         let start_x = center_pixel.0 - (self.width as f64 / 2.0);
         let start_y = center_pixel.1 - (self.height as f64 / 2.0);
@@ -58,7 +74,7 @@ impl Viewport {
     }
 
     pub fn screen_xy(&self, lat: f64, lng: f64) -> Array {
-        let zoom = self.zoom.round() as u32;
+        let zoom = clamp_zoom(self.zoom);
         let center_pixel = self.lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
         let start_x = center_pixel.0 - (self.width as f64 / 2.0);
         let start_y = center_pixel.1 - (self.height as f64 / 2.0);

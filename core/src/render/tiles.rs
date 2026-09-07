@@ -3,7 +3,7 @@ use web_sys::{WebGl2RenderingContext, WebGlTexture, WebGlUniformLocation};
 use js_sys::Float32Array;
 
 use crate::tiles::{TileCoord, TileLoader};
-use crate::projection::Viewport;
+use crate::projection::{Viewport, clamp_zoom};
 use crate::WebGlState;
 
 #[allow(clippy::too_many_arguments)]
@@ -50,7 +50,7 @@ pub fn render_tiles(
     viewport: &Viewport,
     projection_matrix: &[f32; 16],
 ) -> Result<Vec<(String, TileCoord)>, JsValue> {
-    let tile_zoom = viewport.zoom.round() as u32;
+    let tile_zoom = clamp_zoom(viewport.zoom);
 
     let center_pixel = viewport.lat_lng_to_pixel(viewport.center_lat, viewport.center_lng, tile_zoom);
 

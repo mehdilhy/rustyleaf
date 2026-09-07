@@ -22,6 +22,10 @@ pub struct GeoJSONLayer {
     // Wall-clock (ms) of the last render-cache rebuild — prevents
     // back-to-back O(n) rebuilds from starving the render thread.
     pub(crate) last_rebuilt_at_ms: f64,
+    // Throttle-aware dirty flag (R-17): true when a chunk was ingested but
+    // the cache rebuild was throttled. The render loop rebuilds on its next
+    // time-slice instead of falling back to per-frame triangulation.
+    pub(crate) needs_rebuild: bool,
     pub(crate) polygon_vertex_buffer: RefCell<Option<OwnedBuffer>>,
     pub(crate) polygon_vertex_count: Cell<usize>,
     pub(crate) line_vertex_buffer: RefCell<Option<OwnedBuffer>>,
@@ -33,6 +37,7 @@ pub struct GeoJSONLayer {
 #[derive(Clone)]
 pub struct PolygonHit {
     pub outer_ring: Vec<[f64; 2]>, // [lat, lng] pairs
+    pub holes: Vec<Vec<[f64; 2]>>, // interior rings ([lat, lng] pairs)
     pub meta: serde_json::Value,
 }
 

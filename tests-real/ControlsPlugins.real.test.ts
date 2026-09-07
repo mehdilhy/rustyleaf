@@ -273,9 +273,18 @@ describe('LayersControl (lines ~4147-4223, incl. 4152-4155, 4172-4174, 4212-4215
     expect(inputs[0].type).toBe('radio');
     expect(inputs[0].name).toBe('rustyleaf-base-layer');
     expect(inputs[1].type).toBe('checkbox');
-    expect(inputs.every((i) => i.checked)).toBe(true);
+    // Checked state reflects actual map membership (not hard-coded true):
+    // neither fake layer is attached yet, so both render unchecked.
+    expect(inputs.every((i) => !i.checked)).toBe(true);
     expect(root!.textContent).toContain('B');
     expect(root!.textContent).toContain('O');
+
+    // Attaching a layer fires layeradd, which re-renders with it checked.
+    (map as any)._notifyLayerAdd(over1);
+    const refreshed = Array.from(root!.querySelectorAll('input')) as HTMLInputElement[];
+    expect(refreshed[1].checked).toBe(true);
+    expect(refreshed[0].checked).toBe(false);
+    map.remove();
   });
 
   test('works with no initial layers', () => {
