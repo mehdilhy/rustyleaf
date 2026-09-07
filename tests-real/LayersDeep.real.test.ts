@@ -124,15 +124,15 @@ describe('TileLayer option plumbing + cleanup (real source)', () => {
 
     let attrib = map.containerElement.querySelector('.rustyleaf-attribution');
     expect(attrib).not.toBeNull();
-    expect(attrib.innerHTML).toBe('© A'); // deduped
+    expect(attrib.textContent).toBe('© A'); // deduped
 
     const t3 = new TileLayer('https://c/{z}/{x}/{y}.png', { attribution: '© C' });
     t3.addTo(map);
     attrib = map.containerElement.querySelector('.rustyleaf-attribution');
-    expect(attrib.innerHTML.split(' | ').sort()).toEqual(['© A', '© C']);
+    expect(attrib.textContent!.split(' | ').sort()).toEqual(['© A', '© C']);
 
     t1.remove();
-    expect(attrib.innerHTML).toBe('© A | © C'.replace('© A | ', '')); // '© C'
+    expect(attrib.textContent).toBe('© A | © C'.replace('© A | ', '')); // '© C'
     expect(t1._attributionElement).toBeNull();
 
     // Second remove() is a no-op (already detached)

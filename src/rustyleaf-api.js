@@ -19,7 +19,8 @@ import {
   bounds,
   latLng,
   latLngBounds,
-  point
+  point,
+  wrapNum
 } from './leaflet-compat.js';
 
 // True when the WASM instance is already wired into the bg glue module.
@@ -53,7 +54,7 @@ let __rustyleaf_wasm_url = null;
 // URL (e.g. '/rustyleaf_core_bg.wasm' served from your public dir) when the
 // default bundler resolution doesn't produce a fetchable URL.
 function configureRustyleaf({ wasmUrl } = {}) {
-  if (wasmUrl) __rustyleaf_wasm_url = wasmUrl;
+  if (wasmUrl) __rustyleaf_wasm_url = __rustyleafAssertSameOriginWasmUrl(wasmUrl);
 }
 
 // Resolve the wasm URL. Order:
@@ -67,8 +68,10 @@ function __rustyleafResolveWasmUrl() {
   if (__rustyleaf_wasm_url) return __rustyleaf_wasm_url;
   // Pre-import global hook: lets consumers set the URL before the module
   // evaluates (when the top-level wasm fetch would otherwise start too early).
+  // J-6: validated same-origin here — an attacker-controlled global must not
+  // point the page at a hostile wasm binary.
   if (typeof globalThis !== 'undefined' && globalThis.__rustyleafWasmUrl) {
-    return globalThis.__rustyleafWasmUrl;
+    return __rustyleafAssertSameOriginWasmUrl(globalThis.__rustyleafWasmUrl);
   }
   try {
     // The bundler rewrites `new URL(..., import.meta.url)` into an asset URL
@@ -131,6 +134,163 @@ async function __ensureRustyleafWasmReady() {
 // Block module evaluation until WASM is ready
 await __ensureRustyleafWasmReady();
 
+// ---------- Shared security / resource-limit helpers (J-section fixes) ----------
+
+// Default cap for GeoJSON payloads retained in JS memory (J-15/J-18).
+// Streaming paths check the Content-Length header (fail fast) and the running
+// total (fail safe). Override per layer via options.maxBytes.
+const GEOJSON_DEFAULT_MAX_BYTES = 50 * 1024 * 1024; // 50MB
+
+// Upper bound for Circle / CircleMarker radii (J-17).
+const MAX_CIRCLE_RADIUS = 1e7;
+
+// J-6: the wasm binary runs with full page privileges once instantiated, so an
+// attacker-controlled URL is arbitrary code execution. Only same-origin (or
+// relative, which resolves same-origin) override URLs are allowed. The
+// bundler-derived default inherits trust from import.meta.url and is exempt.
+function __rustyleafAssertSameOriginWasmUrl(wasmUrl) {
+  const raw = String(wasmUrl);
+  const loc = (typeof globalThis !== 'undefined' && globalThis.location && globalThis.location.href)
+    ? globalThis.location
+    : null;
+  if (!loc) return raw; // SSR/Node without a location: nothing to compare against.
+  let parsed;
+  try {
+    parsed = new URL(raw, loc.href);
+  } catch (e) {
+    throw new Error(`Rustyleaf: invalid wasmUrl: ${raw}`);
+  }
+  if (parsed.protocol === 'blob:') return raw; // page-created blob URL: same-origin by construction.
+  const pageOrigin = loc.origin && loc.origin !== 'null' ? loc.origin : null;
+  if (!pageOrigin) return raw; // opaque origin (e.g. file://): cannot verify, allow.
+  if (parsed.origin !== pageOrigin) {
+    throw new Error(
+      `Rustyleaf: refusing cross-origin wasmUrl (${raw}). ` +
+      `Serve rustyleaf_core_bg.wasm from the same origin (${pageOrigin}).`
+    );
+  }
+  return raw;
+}
+
+// J-18: combine an explicit AbortSignal with a timeout (ms) into a single
+// signal. Prefers AbortSignal.timeout/any when available, with an
+// AbortController fallback. Returns { signal, cleanup } — call cleanup() once
+// the fetch settles to clear any fallback timer.
+function __rustyleafAbortForLoad(signal, timeout) {
+  const noop = () => {};
+  const ms = timeout === null || timeout === undefined ? NaN : Number(timeout);
+  const wantTimeout = Number.isFinite(ms) && ms > 0;
+  if (!signal && !wantTimeout) return { signal: null, cleanup: noop };
+  const canTimeout = typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function';
+  const canAny = typeof AbortSignal !== 'undefined' && typeof AbortSignal.any === 'function';
+  if (canTimeout) {
+    if (wantTimeout && signal) {
+      return { signal: canAny ? AbortSignal.any([signal, AbortSignal.timeout(ms)]) : signal, cleanup: noop };
+    }
+    return { signal: signal || AbortSignal.timeout(ms), cleanup: noop };
+  }
+  if (typeof AbortController !== 'undefined') {
+    const controller = new AbortController();
+    let timer = null;
+    if (signal) {
+      if (signal.aborted) controller.abort(signal.reason);
+      else signal.addEventListener('abort', () => controller.abort(signal.reason), { once: true });
+    }
+    if (wantTimeout) {
+      timer = setTimeout(() => controller.abort(new Error(`Request timed out after ${ms}ms`)), ms);
+    }
+    return { signal: controller.signal, cleanup: () => { if (timer !== null) clearTimeout(timer); } };
+  }
+  return { signal: signal || null, cleanup: noop };
+}
+
+// J-7: reject dangerous URL schemes in tile templates. Non-string and empty
+// templates are tolerated (legacy callers pass null/numbers).
+function __assertSafeTileUrlTemplate(urlTemplate) {
+  if (typeof urlTemplate !== 'string') return;
+  const raw = urlTemplate.trim();
+  if (!raw) return;
+  const match = raw.match(/^([a-zA-Z][a-zA-Z0-9+.-]*)\s*:/);
+  if (match) {
+    const scheme = match[1].toLowerCase();
+    if (scheme === 'javascript' || scheme === 'vbscript' || scheme === 'file') {
+      throw new Error(`TileLayer: refusing tile URL template with '${scheme}:' scheme`);
+    }
+  }
+}
+
+// J-8: ground-overlay sources are assigned to <img>/<video> src. Allow only
+// http(s), blob, relative URLs, and image/video data: URLs. Empty values
+// (e.g. SVGOverlay, which renders a caller-provided element) are allowed.
+function __assertAllowedOverlayUrl(url) {
+  if (url === null || url === undefined || url === '') return;
+  const raw = String(url);
+  const trimmed = raw.trim();
+  if (!trimmed) return;
+  const match = trimmed.match(/^([a-zA-Z][a-zA-Z0-9+.-]*)\s*:/);
+  if (!match) return; // relative URL (no scheme): inherits the page origin.
+  const scheme = match[1].toLowerCase();
+  if (scheme === 'http' || scheme === 'https' || scheme === 'blob') return;
+  if (scheme === 'data') {
+    if (/^data\s*:\s*image\//i.test(trimmed) || /^data\s*:\s*video\//i.test(trimmed)) return;
+    throw new Error('ImageOverlay: refusing data: URL that is not image/* or video/*');
+  }
+  throw new Error(
+    `ImageOverlay: refusing overlay URL with '${scheme}:' scheme ` +
+    '(allowed: http(s), blob, relative, data:image/*, data:video/*)'
+  );
+}
+
+// J-9: validate the WMS base URL (http/https only) and merge parameters with
+// URL semantics so pre-existing query strings are preserved and fragments are
+// dropped instead of smuggled. The per-tile {bbox-epsg-3857} token is appended
+// literally AFTER serialization (URLSearchParams would percent-encode the
+// braces and the Rust tile loader matches the raw token).
+function __buildWmsTileUrl(baseUrl, params) {
+  const raw = String(baseUrl);
+  const base = (typeof globalThis !== 'undefined' && globalThis.location && globalThis.location.href)
+    ? globalThis.location.href
+    : 'http://localhost/';
+  let parsed;
+  try {
+    parsed = new URL(raw, base);
+  } catch (e) {
+    throw new Error(`WMSTileLayer: invalid baseUrl: ${raw}`);
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`WMSTileLayer: baseUrl must use http(s): ${raw}`);
+  }
+  parsed.hash = '';
+  const serialized = parsed.toString();
+  const sep = serialized.includes('?') ? '&' : '?';
+  const query = Object.entries(params)
+    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`)
+    .join('&');
+  return `${serialized}${sep}${query}&bbox={bbox-epsg-3857}`;
+}
+
+// J-4/J-5: render attribution parts as text (never parsed as HTML), joined by
+// literal ' | ' text nodes, so attribution strings cannot inject markup.
+function __renderAttributionParts(container, parts) {
+  while (container.firstChild) container.removeChild(container.firstChild);
+  parts.forEach((part, index) => {
+    if (index > 0) container.appendChild(document.createTextNode(' | '));
+    const span = document.createElement('span');
+    span.textContent = part;
+    container.appendChild(span);
+  });
+}
+
+// J-17: shared Circle / CircleMarker radius validation (0 = degenerate point is
+// allowed; negatives/NaN/Infinity/huge values are rejected).
+function __validateCircleRadius(radius) {
+  const value = Number(radius);
+  if (!Number.isFinite(value) || value < 0 || value > MAX_CIRCLE_RADIUS) {
+    throw new RangeError(`Invalid radius: expected a finite number in [0, ${MAX_CIRCLE_RADIUS}]`);
+  }
+  return value;
+}
+
 // WebGL support check utility
 function checkWebGLSupport() {
   try {
@@ -183,6 +343,13 @@ class Map {
     options = options || {};
     this.options = options;
 
+    // J-11: tracked DOM listeners so remove() can detach everything.
+    this._canvasListeners = [];
+    this._windowListeners = [];
+    // J-12: touch long-press timer, hoisted from the _setupTouchHandlers
+    // closure so remove() can cancel it.
+    this._longPressTimer = null;
+
     // Handle container parameter
     if (typeof container === 'string') {
       this.containerElement = document.getElementById(container);
@@ -215,8 +382,8 @@ class Map {
     this.containerElement.innerHTML = '';
     this.containerElement.appendChild(this.canvas);
 
-    // Context loss recovery
-    this.canvas.addEventListener('webglcontextlost', (event) => {
+    // Context loss recovery (tracked for J-11 teardown in remove()).
+    const handleContextLost = (event) => {
       event.preventDefault();
       console.warn('Rustyleaf: WebGL context lost. Attempting recovery...');
       if (this.wasmMap && this.wasmMap.handle_context_lost) {
@@ -224,9 +391,10 @@ class Map {
       }
       this._needsRestore = true;
       this._stopRenderLoop();
-    });
+    };
+    this._trackCanvasListener('webglcontextlost', handleContextLost);
 
-    this.canvas.addEventListener('webglcontextrestored', () => {
+    const handleContextRestored = () => {
       console.log('Rustyleaf: WebGL context restored. Reinitializing...');
       if (this.wasmMap && this.wasmMap.handle_context_restored) {
         this.wasmMap.init_canvas(this.canvas.id);
@@ -234,7 +402,8 @@ class Map {
       }
       this._needsRestore = false;
       this._startRenderLoop();
-    });
+    };
+    this._trackCanvasListener('webglcontextrestored', handleContextRestored);
 
     // Check WebGL compatibility before initializing
     const webglSupport = checkWebGLSupport();
@@ -540,13 +709,29 @@ class Map {
   }
   
   setMinZoom(minZoom) {
-    this._minZoom = Number(minZoom);
+    const value = Number(minZoom);
+    if (!Number.isFinite(value) || value < 0 || value > 24) {
+      throw new RangeError(`Invalid minZoom: expected a finite number between 0 and 24 (got ${minZoom})`);
+    }
+    const max = this._maxZoom !== undefined ? this._maxZoom : 18;
+    if (value > max) {
+      throw new RangeError(`Invalid minZoom: ${value} exceeds current maxZoom ${max}`);
+    }
+    this._minZoom = value;
     this.wasmMap.set_min_zoom(this._minZoom);
     return this;
   }
-  
+
   setMaxZoom(maxZoom) {
-    this._maxZoom = Number(maxZoom);
+    const value = Number(maxZoom);
+    if (!Number.isFinite(value) || value < 0 || value > 24) {
+      throw new RangeError(`Invalid maxZoom: expected a finite number between 0 and 24 (got ${maxZoom})`);
+    }
+    const min = this._minZoom !== undefined ? this._minZoom : 0;
+    if (value < min) {
+      throw new RangeError(`Invalid maxZoom: ${value} is below current minZoom ${min}`);
+    }
+    this._maxZoom = value;
     this.wasmMap.set_max_zoom(this._maxZoom);
     return this;
   }
@@ -958,6 +1143,36 @@ class Map {
     return this;
   }
 
+  // J-11: register + track a canvas listener so remove() can detach it.
+  _trackCanvasListener(type, handler, listenerOptions) {
+    this._canvasListeners = this._canvasListeners || [];
+    this.canvas.addEventListener(type, handler, listenerOptions);
+    this._canvasListeners.push([type, handler, listenerOptions]);
+  }
+
+  // J-11: register + track a window listener so remove() can detach it.
+  _trackWindowListener(type, handler, listenerOptions) {
+    this._windowListeners = this._windowListeners || [];
+    window.addEventListener(type, handler, listenerOptions);
+    this._windowListeners.push([type, handler, listenerOptions]);
+  }
+
+  // J-11: detach every tracked canvas/window listener (called from remove()).
+  _removeTrackedListeners() {
+    if (this.canvas && Array.isArray(this._canvasListeners)) {
+      for (const [type, handler, listenerOptions] of this._canvasListeners) {
+        try { this.canvas.removeEventListener(type, handler, listenerOptions); } catch (e) { /* best-effort */ }
+      }
+    }
+    this._canvasListeners = [];
+    if (typeof window !== 'undefined' && Array.isArray(this._windowListeners)) {
+      for (const [type, handler, listenerOptions] of this._windowListeners) {
+        try { window.removeEventListener(type, handler, listenerOptions); } catch (e) { /* best-effort */ }
+      }
+    }
+    this._windowListeners = [];
+  }
+
   _setupEventHandlers() {
     let isDragging = false;
     let dragStartX, dragStartY;
@@ -1010,7 +1225,7 @@ class Map {
       }
     };
 
-    this.canvas.addEventListener('mousedown', (e) => {
+    const handleMouseDown = (e) => {
       if (e.button === 0 && e.shiftKey) { // Shift-drag = box zoom
         e.preventDefault();
         this._startBoxZoom(e);
@@ -1064,24 +1279,27 @@ class Map {
 
         this.wasmMap.handle_mouse_down(dragStartX, dragStartY);
       }
-    });
+    };
+    this._trackCanvasListener('mousedown', handleMouseDown);
 
     // Hover cursor feedback
-    this.canvas.addEventListener('mouseenter', () => {
+    const handleMouseEnter = () => {
       if (!isDragging) {
         this.canvas.style.cursor = 'grab';
       }
-    });
+    };
+    this._trackCanvasListener('mouseenter', handleMouseEnter);
 
-    this.canvas.addEventListener('mouseleave', () => {
+    const handleMouseLeave = () => {
       if (!isDragging) {
         this.canvas.style.cursor = 'default';
       }
-    });
+    };
+    this._trackCanvasListener('mouseleave', handleMouseLeave);
 
     // Hover hit-testing (throttled to one hit-test per frame)
     let hoverPending = false;
-    this.canvas.addEventListener('mousemove', (e) => {
+    const handleMouseMove = (e) => {
       if (isDragging || hoverPending || !this.wasmMap.handle_mouse_hover) return;
       hoverPending = true;
       requestAnimationFrame(() => {
@@ -1095,22 +1313,25 @@ class Map {
         this._updateMarkerHover(canvasX, canvasY);
         this.wasmMap.handle_mouse_hover(canvasX, canvasY);
       });
-    });
+    };
+    this._trackCanvasListener('mousemove', handleMouseMove);
 
-    this.canvas.addEventListener('wheel', (e) => {
+    const handleWheel = (e) => {
       e.preventDefault();
       this.wasmMap.on_wheel(e.deltaY, e.clientX, e.clientY);
-    });
+    };
+    this._trackCanvasListener('wheel', handleWheel);
 
-    this.canvas.addEventListener('contextmenu', (e) => {
+    const handleContextMenu = (e) => {
       e.preventDefault();
       this.wasmMap.handle_contextmenu(e.clientX, e.clientY);
-    });
+    };
+    this._trackCanvasListener('contextmenu', handleContextMenu);
 
     this._resizeHandler = () => {
       this._handleResize();
     };
-    window.addEventListener('resize', this._resizeHandler);
+    this._trackWindowListener('resize', this._resizeHandler);
 
     this._setupKeyboardHandlers();
     this._setupTouchHandlers();
@@ -1184,7 +1405,7 @@ class Map {
     this.canvas.tabIndex = 0;
     this.canvas.style.outline = 'none';
     const PAN_PX = 60;
-    this.canvas.addEventListener('keydown', (e) => {
+    const handleKeyDown = (e) => {
       switch (e.key) {
       case 'ArrowUp': this.panBy(0, -PAN_PX); break;
       case 'ArrowDown': this.panBy(0, PAN_PX); break;
@@ -1195,7 +1416,8 @@ class Map {
       default: return;
       }
       e.preventDefault();
-    });
+    };
+    this._trackCanvasListener('keydown', handleKeyDown);
   }
 
   // One-finger pan reuses the wasm mouse-drag pipeline (incl. momentum);
@@ -1206,10 +1428,11 @@ class Map {
     let touchMode = null; // 'pan' | 'pinch'
     let lastDist = 0;
 
-    // Double-tap + long-press state
+    // Double-tap + long-press state. The timer handle lives on the map
+    // instance (J-12) so remove() can cancel a press that outlives the map.
     let tapStart = null;      // { x, y, time } of current one-finger touch
     let lastTap = null;       // { x, y, time } of previous completed quick tap
-    let longPressTimer = null;
+    this._longPressTimer = null;
     let longPressFired = false;
     const LONG_PRESS_MS = 500;
     const DOUBLE_TAP_MS = 300;
@@ -1226,9 +1449,9 @@ class Map {
 
     // Helpers for double-tap / long-press
     const clearLongPress = () => {
-      if (longPressTimer !== null) {
-        clearTimeout(longPressTimer);
-        longPressTimer = null;
+      if (this._longPressTimer !== null) {
+        clearTimeout(this._longPressTimer);
+        this._longPressTimer = null;
       }
     };
     // CSS-pixel distance between two touch positions (for tap-move slop)
@@ -1237,7 +1460,7 @@ class Map {
       return [t.clientX - rect.left, t.clientY - rect.top];
     };
 
-    this.canvas.addEventListener('touchstart', (e) => {
+    const handleTouchStart = (e) => {
       e.preventDefault();
       if (e.touches.length === 1) {
         touchMode = 'pan';
@@ -1255,8 +1478,8 @@ class Map {
           tapStart = { x: tapX, y: tapY, time: performance.now() };
         }
         clearLongPress();
-        longPressTimer = setTimeout(() => {
-          longPressTimer = null;
+        this._longPressTimer = setTimeout(() => {
+          this._longPressTimer = null;
           if (touchMode !== 'pan' || this._destroyed) return;
           longPressFired = true;
           const [cx, cy] = canvasPoint(t);
@@ -1271,13 +1494,14 @@ class Map {
         touchMode = 'pinch';
         lastDist = dist(e.touches[0], e.touches[1]);
       }
-    }, { passive: false });
+    };
+    this._trackCanvasListener('touchstart', handleTouchStart, { passive: false });
 
-    this.canvas.addEventListener('touchmove', (e) => {
+    const handleTouchMove = (e) => {
       e.preventDefault();
       if (touchMode === 'pan' && e.touches.length === 1) {
         // Cancel long-press once the finger moves beyond the tap slop
-        if (longPressTimer !== null && tapStart) {
+        if (this._longPressTimer !== null && tapStart) {
           const [sx, sy] = cssPoint(e.touches[0]);
           if (Math.hypot(sx - tapStart.x, sy - tapStart.y) > MOVE_SLOP_PX) {
             clearLongPress();
@@ -1296,7 +1520,8 @@ class Map {
         }
         lastDist = d;
       }
-    }, { passive: false });
+    };
+    this._trackCanvasListener('touchmove', handleTouchMove, { passive: false });
 
     const endTouch = (e) => {
       e.preventDefault();
@@ -1345,8 +1570,8 @@ class Map {
           tapStart = { x: tapX, y: tapY, time: performance.now() };
         }
         clearLongPress();
-        longPressTimer = setTimeout(() => {
-          longPressTimer = null;
+        this._longPressTimer = setTimeout(() => {
+          this._longPressTimer = null;
           if (touchMode !== 'pan' || this._destroyed) return;
           longPressFired = true;
           const [cx, cy] = canvasPoint(t);
@@ -1354,8 +1579,8 @@ class Map {
         }, LONG_PRESS_MS);
       }
     };
-    this.canvas.addEventListener('touchend', endTouch, { passive: false });
-    this.canvas.addEventListener('touchcancel', endTouch, { passive: false });
+    this._trackCanvasListener('touchend', endTouch, { passive: false });
+    this._trackCanvasListener('touchcancel', endTouch, { passive: false });
   }
 
   // Shift-drag rectangle → fitBounds (Leaflet box zoom)
@@ -1441,6 +1666,28 @@ class Map {
     if (this._destroyed) return this;
     this._destroyed = true;
 
+    // J-13: stop geolocation tracking first — callbacks must not fire on a
+    // destroyed map.
+    this.stopLocate();
+
+    // J-10: detach every map-level listener (WASM + local) before freeing the
+    // core, so callbacks cannot fire post-destroy and closures are released.
+    if (this._listeners) {
+      for (const key of Object.keys(this._listeners)) {
+        try { this.off(key); } catch (e) { /* best-effort teardown */ }
+      }
+    }
+
+    // J-12: cancel a pending touch long-press so its closure cannot outlive
+    // the map.
+    if (this._longPressTimer !== null && this._longPressTimer !== undefined) {
+      clearTimeout(this._longPressTimer);
+      this._longPressTimer = null;
+    }
+
+    // J-11: detach all tracked canvas/window DOM listeners.
+    this._removeTrackedListeners();
+
     if (this._flyTimer) {
       clearInterval(this._flyTimer);
       this._flyTimer = null;
@@ -1525,6 +1772,7 @@ Map.checkWebGLSupport = checkWebGLSupport;
 // TileLayer with Leaflet-style API
 class TileLayer {
   constructor(urlTemplate, options = {}) {
+    __assertSafeTileUrlTemplate(urlTemplate); // J-7: reject javascript:/file: templates.
     this.wasmTileLayer = new TileLayerApi(urlTemplate);
     this.options = options;
     this._urlTemplate = urlTemplate || '';
@@ -1561,10 +1809,12 @@ class TileLayer {
         }
         map.containerElement.appendChild(attrib);
       }
-      const parts = attrib.innerHTML ? attrib.innerHTML.split(' | ') : [];
-      if (!parts.includes(options.attribution)) {
-        parts.push(options.attribution);
-        attrib.innerHTML = parts.join(' | ');
+      // J-4: attribution strings are text, never HTML — rebuild the container
+      // from textContent with text nodes instead of innerHTML read-modify-write.
+      const current = attrib.textContent ? attrib.textContent.split(' | ') : [];
+      if (!current.includes(options.attribution)) {
+        current.push(options.attribution);
+        __renderAttributionParts(attrib, current);
       }
       this._attributionElement = attrib;
     }
@@ -1581,9 +1831,12 @@ class TileLayer {
         this._map.wasmMap.remove_tile_layer();
       }
       if (this._attributionElement && this.options && this.options.attribution) {
-        const parts = this._attributionElement.innerHTML.split(' | ')
-          .filter((p) => p !== this.options.attribution);
-        this._attributionElement.innerHTML = parts.join(' | ');
+        // J-4: remove by text comparison, then re-render as text nodes.
+        const text = this._attributionElement.textContent || '';
+        const remaining = text
+          ? text.split(' | ').filter((p) => p !== this.options.attribution)
+          : [];
+        __renderAttributionParts(this._attributionElement, remaining);
         this._attributionElement = null;
       }
       if (this._map._notifyLayerRemove) this._map._notifyLayerRemove(this);
@@ -1604,10 +1857,16 @@ class TileLayer {
       : ['a', 'b', 'c'];
     const index = Math.abs(Number(coords.x || 0) + Number(coords.y || 0)) % Math.max(1, subdomains.length);
     const data = { ...options, ...coords, s: subdomains[index], r: options.detectRetina ? '@2x' : '' };
-    return String(this._urlTemplate).replace(/\{([\w-]+)\}/g, (match, key) => data[key] === undefined ? match : data[key]);
+    // J-7: encode substituted values so path/query metacharacters (/, ?, &, #)
+    // cannot break out of the template. '@' is preserved for '@2x' retina tokens.
+    return String(this._urlTemplate).replace(/\{([\w-]+)\}/g, (match, key) => {
+      if (data[key] === undefined) return match;
+      return encodeURIComponent(String(data[key])).replace(/%40/gi, '@');
+    });
   }
 
   setUrl(url, noRedraw = false) {
+    __assertSafeTileUrlTemplate(url); // J-7: reject javascript:/file: templates.
     this._urlTemplate = url || '';
     if (this.wasmTileLayer) {
       if ('urlTemplate' in this.wasmTileLayer) this.wasmTileLayer.urlTemplate = this._urlTemplate;
@@ -2150,15 +2409,21 @@ class Popup {
 
   _updateContent() {
     if (!this.contentWrapper) return;
-    
+
     if (typeof this.content === 'string') {
-      this.contentWrapper.innerHTML = this.content;
+      // J-1: string content is text by default; innerHTML only behind an
+      // explicit allowHTML opt-in (caller asserts the string is trusted).
+      if (this.options && this.options.allowHTML) {
+        this.contentWrapper.innerHTML = this.content;
+      } else {
+        this.contentWrapper.textContent = this.content;
+      }
     } else if (this.content instanceof HTMLElement) {
       this.contentWrapper.innerHTML = '';
       this.contentWrapper.appendChild(this.content);
     }
   }
-  
+
   _updatePosition() {
     if (!this.map || !this.latlng) return;
     
@@ -2566,13 +2831,13 @@ class Circle extends Shape {
     super(options);
     const value = latLng(latlng);
     this._latlng = [value.lat, value.lng];
-    this._radius = options.radius !== undefined ? options.radius : 10;
+    this._radius = options.radius !== undefined ? __validateCircleRadius(options.radius) : 10;
   }
 
   getLatLng() { return new LatLng(this._latlng[0], this._latlng[1]); }
   setLatLng(latlng) { const value = latLng(latlng); this._latlng = [value.lat, value.lng]; return this.redraw(); }
   getRadius() { return this._radius; }
-  setRadius(radius) { this._radius = radius; return this.redraw(); }
+  setRadius(radius) { this._radius = __validateCircleRadius(radius); return this.redraw(); }
 
   _delta() {
     const dLat = this._radius / METERS_PER_DEG_LAT;
@@ -2617,13 +2882,13 @@ class CircleMarker extends Shape {
     super(options);
     const value = latLng(latlng);
     this._latlng = [value.lat, value.lng];
-    this._radius = options.radius !== undefined ? options.radius : 10;
+    this._radius = options.radius !== undefined ? __validateCircleRadius(options.radius) : 10;
   }
 
   getLatLng() { return new LatLng(this._latlng[0], this._latlng[1]); }
   setLatLng(latlng) { const value = latLng(latlng); this._latlng = [value.lat, value.lng]; return this.redraw(); }
   getRadius() { return this._radius; }
-  setRadius(radius) { this._radius = radius; return this.redraw(); }
+  setRadius(radius) { this._radius = __validateCircleRadius(radius); return this.redraw(); }
 
   getBounds() {
     const value = latLng(this._latlng);
@@ -2819,6 +3084,7 @@ function deferCallback(fn) {
 class ImageOverlay {
   constructor(url, bounds, options = {}) {
     options = options || {};
+    __assertAllowedOverlayUrl(url); // J-8: allowlist http(s)/blob/relative/data:image|video.
     this._url = url;
     this.options = options;
     this._element = null;
@@ -2843,6 +3109,7 @@ class ImageOverlay {
   }
 
   setUrl(url) {
+    __assertAllowedOverlayUrl(url); // J-8
     this._url = url;
     if (this._element) this._element.setAttribute('src', url);
     return this;
@@ -2958,6 +3225,7 @@ class VideoOverlay extends ImageOverlay {
   }
 
   setUrl(url) {
+    __assertAllowedOverlayUrl(url); // J-8
     this._url = url;
     if (this._element) this._element.src = url;
     return this;
@@ -3283,12 +3551,33 @@ class GeoJSONLayer {
     return this;
   }
 
-  // Load GeoJSON from URL
-  loadUrl(url) {
-    return fetch(url)
+  // Load GeoJSON from URL.
+  //
+  // Rejection contract (J-18): the returned promise rejects on network
+  // failure, non-2xx status, over-limit payloads, timeout/abort, or invalid
+  // JSON — callers must observe it with .catch / try-await.
+  // Options: { signal (AbortSignal), timeout (ms), maxBytes (payload cap,
+  // enforced against Content-Length when the server sends it) }.
+  loadUrl(url, options = {}) {
+    const opts = options || {};
+    const rawMax = opts.maxBytes !== undefined ? Number(opts.maxBytes) : GEOJSON_DEFAULT_MAX_BYTES;
+    const max = Number.isFinite(rawMax) && rawMax > 0 ? rawMax : GEOJSON_DEFAULT_MAX_BYTES;
+    const { signal, cleanup } = __rustyleafAbortForLoad(opts.signal || null, opts.timeout);
+    // No second fetch arg unless cancellation was requested (keeps the
+    // single-arg fetch(url) shape existing callers/tests assert).
+    const fetched = signal ? fetch(url, { signal }) : fetch(url);
+    return fetched
       .then(response => {
         if (!response.ok) {
           throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        const header = response.headers && typeof response.headers.get === 'function'
+          ? Number(response.headers.get('Content-Length'))
+          : NaN;
+        if (Number.isFinite(header) && header > max) {
+          throw new Error(
+            `GeoJSON payload too large: Content-Length ${header} exceeds the ${max}-byte cap (options.maxBytes to raise).`
+          );
         }
         return response.json();
       })
@@ -3296,7 +3585,11 @@ class GeoJSONLayer {
         // Ensure data is parsed into WASM and stored locally
         this.loadData(data);
         return this;
-      });
+      })
+      .then(
+        (value) => { cleanup(); return value; },
+        (error) => { cleanup(); throw error; }
+      );
   }
 
   // Load GeoJSON from URL with streaming support for large files
@@ -3463,6 +3756,17 @@ class GeoJSONLayer {
   // Process a single chunk of GeoJSON data
   processChunk(chunk, isFinal) {
     if (this.map && this.layerIndex !== undefined) {
+      // J-15: cap the retained client-side copy (query APIs need it, but a
+      // hostile/large stream must not OOM the tab). String length (UTF-16
+      // units) is a conservative proxy for bytes. Override via options.maxBytes.
+      const max = this._geojsonMaxBytes();
+      const incoming = typeof chunk === 'string' ? chunk.length : 0;
+      const retained = this._streamedText ? this._streamedText.length : 0;
+      if (retained + incoming > max) {
+        throw new Error(
+          `GeoJSON stream exceeded the ${max}-byte cap (options.maxBytes to raise).`
+        );
+      }
       // Keep a client-side copy so query APIs (getFeaturesInBounds/getBounds)
       // work for streamed layers too.
       this._streamedText = (this._streamedText || '') + chunk;
@@ -3478,6 +3782,15 @@ class GeoJSONLayer {
         console.warn('Failed to process GeoJSON chunk:', error);
       }
     }
+  }
+
+  // J-15/J-18: per-layer streaming cap in bytes (approximated via string
+  // length). Falls back to GEOJSON_DEFAULT_MAX_BYTES on missing/invalid input.
+  _geojsonMaxBytes() {
+    const raw = this.options && this.options.maxBytes !== undefined
+      ? Number(this.options.maxBytes)
+      : GEOJSON_DEFAULT_MAX_BYTES;
+    return Number.isFinite(raw) && raw > 0 ? raw : GEOJSON_DEFAULT_MAX_BYTES;
   }
 
   // Get current feature count
@@ -3697,6 +4010,13 @@ class GeoJSONLayer {
 
   // Hide the layer (the map reference is kept so addTo can re-show it)
   remove() {
+    // J-14: cancel the deferred-load retry timer and drop the retained payload
+    // so a load/remove cycle cannot leak timers or full GeoJSON strings.
+    if (this._pendingTimer) {
+      clearInterval(this._pendingTimer);
+      this._pendingTimer = null;
+    }
+    this._pendingGeoJSONText = null;
     if (this.map && this.layerIndex !== undefined) {
       this.map.wasmMap.set_geojson_layer_visible(this.layerIndex, false);
       if (typeof this.map.wasmMap.free_geojson_layer_gpu === 'function') {
@@ -3760,6 +4080,12 @@ class GeoJSONLayer {
     this.dataLoaded = false;
     this._processedGeoJSON = null;
     this._streamedText = null;
+    // J-14: same pending-load teardown as remove().
+    if (this._pendingTimer) {
+      clearInterval(this._pendingTimer);
+      this._pendingTimer = null;
+    }
+    this._pendingGeoJSONText = null;
     this._featureStyles = [];
     this._featureHandles = [];
     this._featureLayerFeatures = [];
@@ -3778,42 +4104,93 @@ class GeoJSONLayer {
     return this;
   }
 
-  // Load GeoJSON from a File object (for file uploads)
+  // Load GeoJSON from a File object (for file uploads).
+  // Byte-accurate chunking (J-20): Blob.slice uses byte offsets and a
+  // streaming TextDecoder reassembles multi-byte characters split across
+  // chunk boundaries, so CJK/emoji payloads no longer skip, overlap, or end
+  // early. Options: { chunkSize, progressCallback, completeCallback,
+  // errorCallback, maxBytes }.
   loadFile(file, options = {}) {
     const {
       chunkSize = 1024 * 1024, // 1MB chunks
       progressCallback = null,
       completeCallback = null,
-      errorCallback = null
-    } = options;
+      errorCallback = null,
+      maxBytes = GEOJSON_DEFAULT_MAX_BYTES
+    } = options || {};
+    const max = Number.isFinite(Number(maxBytes)) && Number(maxBytes) > 0
+      ? Number(maxBytes)
+      : GEOJSON_DEFAULT_MAX_BYTES;
 
     return new Promise((resolve, reject) => {
+      if (file.size > max) {
+        const error = new Error(
+          `GeoJSON file too large: ${file.size} bytes exceeds the ${max}-byte cap (options.maxBytes to raise).`
+        );
+        if (errorCallback) errorCallback(error);
+        reject(error);
+        return;
+      }
       const reader = new FileReader();
-      let offset = 0;
-      
+      const decoder = new TextDecoder();
+      let offset = 0; // byte offset into the file
+      let lastSliceSize = 0;
+
       const readChunk = () => {
         const slice = file.slice(offset, offset + chunkSize);
-        reader.readAsText(slice);
+        lastSliceSize = slice.size;
+        if (typeof reader.readAsArrayBuffer === 'function') {
+          reader.readAsArrayBuffer(slice);
+        } else {
+          // Fallback for legacy FileReader implementations (e.g. test
+          // doubles exposing only readAsText): byte offsets still advance by
+          // slice.size, but split multi-byte characters cannot be stitched.
+          reader.readAsText(slice);
+        }
       };
-      
+
       reader.onload = (e) => {
-        const chunk = e.target.result;
-        offset += chunk.length;
-        
+        const result = e.target.result;
+        let chunk;
+        if (typeof result === 'string') {
+          // Legacy text path: advance by the byte size of the slice we read.
+          offset += lastSliceSize;
+          chunk = result;
+        } else {
+          const buffer = result || new ArrayBuffer(0);
+          offset += buffer.byteLength; // J-20: track bytes, not UTF-16 units.
+          // Streaming decode stitches characters split across slices; the
+          // final call flushes the decoder.
+          try {
+            chunk = decoder.decode(buffer, { stream: offset < file.size });
+          } catch (error) {
+            if (errorCallback) errorCallback(error);
+            reject(error);
+            return;
+          }
+        }
+        const isFinal = offset >= file.size;
+
         // Process chunk
-        this.processChunk(chunk, offset >= file.size);
-        
+        try {
+          this.processChunk(chunk, isFinal);
+        } catch (error) {
+          if (errorCallback) errorCallback(error);
+          reject(error);
+          return;
+        }
+
         // Report progress
         if (progressCallback) {
           progressCallback({
             loaded: offset,
             total: file.size,
-            percentage: Math.round((offset / file.size) * 100),
+            percentage: file.size ? Math.round((offset / file.size) * 100) : 0,
             featureCount: this.getFeatureCount()
           });
         }
-        
-        if (offset < file.size) {
+
+        if (!isFinal) {
           readChunk();
         } else {
           if (completeCallback) {
@@ -3826,7 +4203,7 @@ class GeoJSONLayer {
           resolve(this);
         }
       };
-      
+
       reader.onerror = () => {
         const error = new Error('Failed to read file');
         if (errorCallback) {
@@ -3834,27 +4211,53 @@ class GeoJSONLayer {
         }
         reject(error);
       };
-      
+
       readChunk();
     });
   }
 
-  // Load GeoJSON from a URL, then parse/triangulate it in the WASM core
+  // Load GeoJSON from a URL, then parse/triangulate it in the WASM core.
+  //
+  // Error contract (J-19): BOTH happen — `errorCallback` is invoked AND the
+  // returned promise rejects — so callers must pick one handling style (await
+  // .catch OR errorCallback) to avoid double-reporting (e.g. two toasts).
+  // Options: { progressCallback, completeCallback, errorCallback,
+  // signal (AbortSignal), timeout (ms), maxBytes (payload cap) }.
   async loadFromUrl(url, options = {}) {
     const {
       progressCallback = null,
       completeCallback = null,
       errorCallback = null,
-      signal = null
-    } = options;
+      signal = null,
+      timeout = null,
+      maxBytes = GEOJSON_DEFAULT_MAX_BYTES
+    } = options || {};
+    const max = Number.isFinite(Number(maxBytes)) && Number(maxBytes) > 0
+      ? Number(maxBytes)
+      : GEOJSON_DEFAULT_MAX_BYTES;
+    // Preserve signal identity when no timeout is requested so callers can
+    // assert fetch received their exact signal; only build a combined signal
+    // when a timeout must be merged in.
+    const wantTimeout = timeout !== null && timeout !== undefined && Number.isFinite(Number(timeout)) && Number(timeout) > 0;
+    const combined = wantTimeout ? __rustyleafAbortForLoad(signal, timeout) : { signal, cleanup: () => {} };
+    const { signal: fetchSignal, cleanup } = combined;
 
     try {
-      const response = await fetch(url, signal ? { signal } : undefined);
+      // No second fetch arg unless cancellation was requested (keeps the
+      // legacy fetch(url, undefined) shape existing callers/tests assert).
+      const response = await (fetchSignal ? fetch(url, { signal: fetchSignal }) : fetch(url, undefined));
       if (!response.ok) {
         throw new Error(`Failed to fetch GeoJSON: HTTP ${response.status} ${response.statusText}`);
       }
 
-      const contentLength = Number(response.headers.get('content-length')) || 0;
+      const contentLength = response.headers && typeof response.headers.get === 'function'
+        ? Number(response.headers.get('content-length')) || 0
+        : 0;
+      if (contentLength > max) {
+        throw new Error(
+          `GeoJSON payload too large: Content-Length ${contentLength} exceeds the ${max}-byte cap (options.maxBytes to raise).`
+        );
+      }
       let text;
       if (progressCallback && response.body) {
         const reader = response.body.getReader();
@@ -3865,6 +4268,11 @@ class GeoJSONLayer {
           if (done) break;
           chunks.push(value);
           loaded += value.length;
+          if (loaded > max) {
+            throw new Error(
+              `GeoJSON payload exceeded the ${max}-byte cap while downloading (options.maxBytes to raise).`
+            );
+          }
           progressCallback({
             loaded,
             total: contentLength,
@@ -3880,6 +4288,11 @@ class GeoJSONLayer {
         text = new TextDecoder().decode(buffer);
       } else {
         text = await response.text();
+        if (text.length > max) {
+          throw new Error(
+            `GeoJSON payload exceeded the ${max}-byte cap (${text.length} chars; options.maxBytes to raise).`
+          );
+        }
       }
 
       this.loadData(text);
@@ -3896,6 +4309,8 @@ class GeoJSONLayer {
         errorCallback({ error, message: 'Failed to load GeoJSON from URL' });
       }
       throw error;
+    } finally {
+      cleanup();
     }
   }
 
@@ -4151,8 +4566,14 @@ class Marker {
       + (this._icon.options.className ? ' ' + this._icon.options.className : '');
     el.style.cssText = 'position:absolute;z-index:700;pointer-events:auto;';
     const html = this._icon.options.html;
-    if (typeof html === 'string') el.innerHTML = html;
-    else if (html instanceof HTMLElement) el.appendChild(html);
+    // J-3 (trusted-HTML contract): a string `html` is inserted as plain text
+    // unless the DivIcon was created with `allowHTML: true`, in which case the
+    // caller asserts the string is pre-sanitized/trusted HTML. HTMLElements
+    // are mounted as-is.
+    if (typeof html === 'string') {
+      if (this._icon.options && this._icon.options.allowHTML === true) el.innerHTML = html;
+      else el.textContent = html;
+    } else if (html instanceof HTMLElement) el.appendChild(html);
     if (this._opacity < 1) el.style.opacity = String(this._opacity);
     el.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -4448,7 +4869,13 @@ class Tooltip {
   _updateContent() {
     if (!this.element) return;
     if (typeof this.content === 'string') {
-      this.element.innerHTML = this.content;
+      // J-2: string content is text by default; innerHTML only behind an
+      // explicit allowHTML opt-in (caller asserts the string is trusted).
+      if (this.options && this.options.allowHTML) {
+        this.element.innerHTML = this.content;
+      } else {
+        this.element.textContent = this.content;
+      }
     } else if (this.content instanceof HTMLElement) {
       this.element.innerHTML = '';
       this.element.appendChild(this.content);
@@ -4607,7 +5034,8 @@ class AttributionControl extends Control {
     const parts = [];
     if (this._prefix) parts.push(this._prefix);
     parts.push.apply(parts, this._attributions);
-    this._container.innerHTML = parts.join(' | ');
+    // J-5: render each part as text with literal ' | ' separators (no innerHTML).
+    __renderAttributionParts(this._container, parts);
   }
 }
 
@@ -4728,11 +5156,8 @@ class WMSTileLayer extends TileLayer {
       height: options.tileSize || 256,
     };
     params[params.version === '1.3.0' ? 'crs' : 'srs'] = 'EPSG:3857';
-    const sep = baseUrl.includes('?') ? '&' : '?';
-    const query = Object.entries(params)
-      .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
-      .join('&');
-    super(`${baseUrl}${sep}${query}&bbox={bbox-epsg-3857}`, options);
+    // J-9: baseUrl validated (http/https) and params merged with URL semantics.
+    super(__buildWmsTileUrl(baseUrl, params), options);
     this.wmsParams = params;
     this._baseUrl = baseUrl;
   }
@@ -4742,11 +5167,7 @@ class WMSTileLayer extends TileLayer {
     Object.assign(this.wmsParams, params);
     const p = this.wmsParams;
     p[p.version === '1.3.0' ? 'crs' : 'srs'] = 'EPSG:3857';
-    const sep = this._baseUrl.includes('?') ? '&' : '?';
-    const query = Object.entries(p)
-      .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
-      .join('&');
-    const newUrl = `${this._baseUrl}${sep}${query}&bbox={bbox-epsg-3857}`;
+    const newUrl = __buildWmsTileUrl(this._baseUrl, p); // J-9
     if (this._map && this._map.wasmMap && typeof this._map.wasmMap.add_tile_layer === 'function') {
       // Replace the layer in the Rust core with the updated template.
       if (typeof this._map.wasmMap.remove_tile_layer === 'function') {
@@ -5169,7 +5590,7 @@ const L = {
   featureGroup, imageOverlay, videoOverlay, svgOverlay, gridLayer,
   wmsTileLayer, control, zoomControl, attributionControl, scaleControl,
   layersControl,
-  latLng, latLngBounds, point, bounds
+  latLng, latLngBounds, point, bounds, wrapNum
 };
 
 // Named exports mirror the default `L` namespace for both modern ES modules
@@ -5181,7 +5602,7 @@ export {
   CircleMarker, Rectangle, LayerGroup, FeatureGroup, ImageOverlay, VideoOverlay,
   SVGOverlay, WMSTileLayer, GridLayer, Handler, Util, L,
   Browser, Bounds, CRS, DomEvent, DomUtil, LatLng, LatLngBounds, Point,
-  Projection, Transformation, bounds, latLng, latLngBounds, point,
+  Projection, Transformation, bounds, latLng, latLngBounds, point, wrapNum,
   map, tileLayer, pointLayer, lineLayer, polygonLayer, geoJSON, marker, icon,
   divIcon, popup, tooltip, circle, circleMarker, rectangle, layerGroup,
   featureGroup, imageOverlay, videoOverlay, svgOverlay, gridLayer,
