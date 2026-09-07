@@ -235,6 +235,26 @@ describe('Touch gesture handling (real source, lines ~923-1068)', () => {
     expect(lastRealArgs(wasmMock.rustyleafmap_on_wheel)).toEqual([-1, 72, 82]);
   });
 
+  test('issue #18: stationary double-tap still zooms when the canvas is offset from the viewport origin', () => {
+    // tapStart used to be stored in raw client px while move/end compare in
+    // canvas-relative px, so the rect offset alone read as finger movement.
+    jest
+      .spyOn(canvas, 'getBoundingClientRect')
+      .mockReturnValue({ left: 100, top: 200, width: canvas.width, height: canvas.height } as any);
+    startFakingTimers();
+    // same client point twice → canvas-relative (70, 80) both times
+    canvas.dispatchEvent(touchEvent('touchstart', [pt(170, 280)]));
+    canvas.dispatchEvent(touchEvent('touchend', [], [pt(170, 280)]));
+    expect(wasmMock.rustyleafmap_on_wheel).not.toHaveBeenCalled();
+
+    tick(100);
+
+    canvas.dispatchEvent(touchEvent('touchstart', [pt(170, 280)]));
+    canvas.dispatchEvent(touchEvent('touchend', [], [pt(170, 280)]));
+    expect(wasmMock.rustyleafmap_on_wheel).toHaveBeenCalledTimes(1);
+    expect(lastRealArgs(wasmMock.rustyleafmap_on_wheel)).toEqual([-1, 70, 80]);
+  });
+
   test('slow second tap (>300ms) is NOT a double-tap; distant third tap neither', () => {
     startFakingTimers();
     canvas.dispatchEvent(touchEvent('touchstart', [pt(70, 80)]));

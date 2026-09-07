@@ -101,6 +101,11 @@ pub fn render_points(
                 &vertices,
                 WebGl2RenderingContext::STATIC_DRAW,
             );
+            // Keep the CPU shadow in lockstep with the GPU buffer (issue #16):
+            // append_points_packed grows/re-uploads from this shadow, so a
+            // stale (empty) shadow would discard previously rendered points
+            // or write past an exact-size buffer.
+            *layer.gpu_shadow.borrow_mut() = vertex_data;
             layer.vertex_count.set(layer.points.len());
             layer.gpu_dirty.set(false);
         }

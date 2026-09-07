@@ -1245,9 +1245,15 @@ class Map {
         const [x, y] = canvasPoint(e.touches[0]);
         this.wasmMap.handle_mouse_down(x, y);
 
-        // Arm long-press contextmenu (cancelled by movement, pinch, or lift)
+        // Arm long-press contextmenu (cancelled by movement, pinch, or lift).
+        // Stored in canvas-relative CSS px — the same space as the cssPoint
+        // comparisons below (issue #18). Raw client coords would read the
+        // canvas's own viewport offset as finger movement.
         const t = e.touches[0];
-        tapStart = { x: t.clientX, y: t.clientY, time: performance.now() };
+        {
+          const [tapX, tapY] = cssPoint(t);
+          tapStart = { x: tapX, y: tapY, time: performance.now() };
+        }
         clearLongPress();
         longPressTimer = setTimeout(() => {
           longPressTimer = null;
@@ -1332,9 +1338,12 @@ class Map {
         const [x, y] = canvasPoint(e.touches[0]);
         this.wasmMap.handle_mouse_down(x, y);
 
-        // Re-arm long-press for the restarted pan
+        // Re-arm long-press for the restarted pan (canvas-relative, see above)
         const t = e.touches[0];
-        tapStart = { x: t.clientX, y: t.clientY, time: performance.now() };
+        {
+          const [tapX, tapY] = cssPoint(t);
+          tapStart = { x: tapX, y: tapY, time: performance.now() };
+        }
         clearLongPress();
         longPressTimer = setTimeout(() => {
           longPressTimer = null;

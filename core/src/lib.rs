@@ -285,7 +285,10 @@ pub struct RustyleafMap {
     line_layers: Vec<LineLayer>,
     polygon_layers: Vec<PolygonLayer>,
     geojson_layers: Vec<GeoJSONLayer>,
-    markers: Vec<Marker>,
+    // Stable-slot storage: removing a marker vacates its slot instead of
+    // shifting later entries, so numeric IDs handed to JS stay valid for the
+    // lifetime of the marker (issue #15). Vacant slots are reused by add_marker.
+    markers: Vec<Option<Marker>>,
     spatial_index: RTree<SpatialFeature>,
     spatial_index_dirty: bool,
     // Whether the last hover hit-test found a feature (used to emit a single
@@ -792,18 +795,24 @@ impl RustyleafMap {
             context.use_program(Some(gl_state.programs.point_program.inner()));
             context.bind_vertex_array(Some(gl_state.marker_vao.inner()));
 
-            let count = self.markers.iter().filter(|m| m.visible.get()).count();
+            let count = self.markers.iter().flatten().filter(|m| m.visible.get()).count();
             if count == 0 {
                 return Ok(());
             }
 
             // Sort by z_order so lower markers draw first (painter's algorithm).
-            let mut order: Vec<usize> = (0..self.markers.len()).collect();
-            order.sort_by_key(|&i| self.markers[i].z_order);
+            // Only live slots participate; vacant slots keep no draw state.
+            let mut order: Vec<(usize, i32)> = self.markers.iter().enumerate()
+                .filter_map(|(i, m)| m.as_ref().map(|mm| (i, mm.z_order)))
+                .collect();
+            order.sort_by_key(|&(_, z)| z);
 
             let mut vertex_data: Vec<f32> = Vec::with_capacity(count * 7);
-            for i in order {
-                let m = &self.markers[i];
+            for (i, _) in order {
+                let m = match self.markers[i].as_ref() {
+                    Some(m) => m,
+                    None => continue,
+                };
                 if !m.visible.get() {
                     continue;
                 }
@@ -1444,7 +1453,12 @@ impl RustyleafMap {
     pub fn set_point_layer_visible(&mut self, layer_index: usize, visible: bool) {
         self.needs_redraw = true;
         if let Some(layer) = self.point_layers.get_mut(layer_index) {
-            layer.visible = visible;
+            // Visibility gates hit-testing too: only dirty the spatial index
+            // when the value actually flips (issue #17 — rebuilds are costly).
+            if layer.visible != visible {
+                layer.visible = visible;
+                self.spatial_index_dirty = true;
+            }
         }
     }
 
@@ -1569,6 +1583,32 @@ impl RustyleafMap {
         }
 
         let new_count = points_data.len() / 7;
+
+        // If a full re-upload is pending (points replaced since the last
+        // render) or nothing was ever uploaded, the GPU shadow/buffer do not
+        // reflect layer.points. Just extend the CPU points here; the next
+        // render's full upload rebuilds the GPU buffer AND the shadow, so a
+        // later append always builds on consistent state (issue #16).
+        {
+            let layer = &self.point_layers[layer_index];
+            if layer.gpu_dirty.get() || layer.vertex_buffer.borrow().is_none() {
+                let layer = &mut self.point_layers[layer_index];
+                layer.points.reserve(new_count);
+                for i in (0..points_data.len()).step_by(7) {
+                    let point = &points_data[i..i + 7];
+                    layer.points.push(PointFeature {
+                        lat: point[0] as f64,
+                        lng: point[1] as f64,
+                        size: point[2],
+                        color: [point[3], point[4], point[5], point[6]],
+                        meta: serde_json::Value::Null,
+                    });
+                }
+                self.spatial_index_dirty = true;
+                return Ok(());
+            }
+        }
+
         let viewport = self.viewport();
         let layer = &mut self.point_layers[layer_index];
         layer.points.reserve(new_count);
@@ -1692,15 +1732,19 @@ impl RustyleafMap {
     #[wasm_bindgen]
     pub fn add_marker(&mut self) -> u32 {
         self.needs_redraw = true;
-        let id = self.markers.len() as u32;
-        self.markers.push(Marker::new());
-        id
+        // Reuse the lowest vacant slot so IDs stay dense; otherwise append.
+        if let Some(slot) = self.markers.iter().position(|m| m.is_none()) {
+            self.markers[slot] = Some(Marker::new());
+            return slot as u32;
+        }
+        self.markers.push(Some(Marker::new()));
+        (self.markers.len() - 1) as u32
     }
 
     #[wasm_bindgen]
     pub fn update_marker(&mut self, id: u32, lat: f64, lng: f64) {
         self.needs_redraw = true;
-        if let Some(m) = self.markers.get_mut(id as usize) {
+        if let Some(m) = self.markers.get_mut(id as usize).and_then(|m| m.as_mut()) {
             m.lat = lat;
             m.lng = lng;
         }
@@ -1718,7 +1762,7 @@ impl RustyleafMap {
         a: f32,
         z_order: i32,
     ) {
-        if let Some(m) = self.markers.get_mut(id as usize) {
+        if let Some(m) = self.markers.get_mut(id as usize).and_then(|m| m.as_mut()) {
             m.size = size;
             m.color = [r, g, b, a];
             m.z_order = z_order;
@@ -1728,7 +1772,7 @@ impl RustyleafMap {
     #[wasm_bindgen]
     pub fn set_marker_visible(&mut self, id: u32, visible: bool) {
         self.needs_redraw = true;
-        if let Some(m) = self.markers.get_mut(id as usize) {
+        if let Some(m) = self.markers.get_mut(id as usize).and_then(|m| m.as_mut()) {
             m.visible.set(visible);
         }
     }
@@ -1736,14 +1780,15 @@ impl RustyleafMap {
     #[wasm_bindgen]
     pub fn remove_marker(&mut self, id: u32) {
         self.needs_redraw = true;
-        if (id as usize) < self.markers.len() {
-            self.markers.remove(id as usize);
+        // Vacate the slot; never shift later entries (their IDs must not move).
+        if let Some(slot) = self.markers.get_mut(id as usize) {
+            *slot = None;
         }
     }
 
     #[wasm_bindgen]
     pub fn get_marker_latlng(&self, id: u32) -> Result<JsValue, JsValue> {
-        if let Some(m) = self.markers.get(id as usize) {
+        if let Some(m) = self.markers.get(id as usize).and_then(|m| m.as_ref()) {
             let arr = js_sys::Array::new();
             arr.push(&JsValue::from_f64(m.lat));
             arr.push(&JsValue::from_f64(m.lng));
@@ -1765,7 +1810,10 @@ impl RustyleafMap {
     pub fn set_line_layer_visible(&mut self, layer_index: usize, visible: bool) {
         self.needs_redraw = true;
         if let Some(layer) = self.line_layers.get_mut(layer_index) {
-            layer.visible = visible;
+            if layer.visible != visible {
+                layer.visible = visible;
+                self.spatial_index_dirty = true;
+            }
         }
     }
 
@@ -1954,7 +2002,10 @@ impl RustyleafMap {
     pub fn set_polygon_layer_visible(&mut self, layer_index: usize, visible: bool) {
         self.needs_redraw = true;
         if let Some(layer) = self.polygon_layers.get_mut(layer_index) {
-            layer.visible = visible;
+            if layer.visible != visible {
+                layer.visible = visible;
+                self.spatial_index_dirty = true;
+            }
         }
     }
 
@@ -2044,7 +2095,10 @@ impl RustyleafMap {
     pub fn set_geojson_layer_visible(&mut self, layer_index: usize, visible: bool) {
         self.needs_redraw = true;
         if let Some(layer) = self.geojson_layers.get_mut(layer_index) {
-            layer.visible = visible;
+            if layer.visible != visible {
+                layer.visible = visible;
+                self.spatial_index_dirty = true;
+            }
         }
     }
 
