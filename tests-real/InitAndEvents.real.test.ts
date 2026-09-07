@@ -45,7 +45,8 @@ function mouseEvent(type: string, opts: any = {}) {
 }
 
 // Minimal duck-typed marker for _topmostMarkerAt/_updateMarkerHover unit tests.
-// The wasm mock projects EVERY latlng to screen [400, 300].
+// The wasm mock projects the default center to screen [400, 300] and nearby
+// Paris fixtures within a few px of it.
 function fakeMarker(opts: any = {}) {
   return {
     getLatLng: () => opts.latlng || [48.85, 2.35],
@@ -375,12 +376,12 @@ describe('Marker interactivity internals (real source, ~842-897)', () => {
     map._registerMarker(low);
     map._registerMarker(high);
 
-    // screen_xy is [400,300]; radius for size 14 = max(14/2+4, 10) = 11
+    // screen_xy ~[400,300] for near-center fixtures; radius for size 14 = max(14/2+4, 10) = 11
     expect(map._topmostMarkerAt(405, 305)).toBe(high); // higher zIndexOffset wins
     expect(map._topmostMarkerAt(500, 500)).toBeNull(); // outside any radius
 
     const ghost = fakeMarker({ opacity: 0 });
-    const visibleOnly = fakeMarker({ latlng: [10, 10] }); // still projected to [400,300]
+    const visibleOnly = fakeMarker({ latlng: [48.86, 2.36] }); // near-center: projects ~[400,300]
     const empty = makeMap();
     try {
       empty._registerMarker(ghost);
@@ -601,7 +602,7 @@ describe('Tooltip move/zoom rebinding + offset (real source, ~3523-3570)', () =>
     (global as any).__lastMap = map;
     const t = new Tooltip({ content: 'offset-me', offset: [25, 25] });
     (global as any).__lastTooltip = t;
-    t.setLatLng([48.85, 2.35]).openOn(map);
+    t.setLatLng([48.8566, 2.3522]).openOn(map);
     expect(t.element.style.left).toBe('400px'); // no +25 applied
     expect(t.element.style.top).toBe('300px');  // no +25 applied
   });
@@ -611,7 +612,7 @@ describe('Tooltip move/zoom rebinding + offset (real source, ~3523-3570)', () =>
     (global as any).__lastMap = map;
     const t = new Tooltip({ content: 'anchored' });
     (global as any).__lastTooltip = t;
-    t.setLatLng([48.85, 2.35]).openOn(map);
+    t.setLatLng([48.8566, 2.3522]).openOn(map);
     await flush();
 
     wasmMock.rustyleafmap_screen_xy.mockClear();
@@ -630,7 +631,7 @@ describe('Tooltip move/zoom rebinding + offset (real source, ~3523-3570)', () =>
     (global as any).__lastMap = map;
     const t = new Tooltip({ content: 'closing' });
     (global as any).__lastTooltip = t;
-    t.setLatLng([48.85, 2.35]).openOn(map);
+    t.setLatLng([48.8566, 2.3522]).openOn(map);
     await flush();
 
     t.close();

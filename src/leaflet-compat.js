@@ -78,6 +78,10 @@ function sphericalMercatorUnproject(pointValue) {
 }
 
 export class Point extends Array {
+  // Array methods (slice/map/filter/…) construct via Symbol.species: without
+  // this they would call `new Point(len)` and throw in finiteNumber, since
+  // Point requires (x, y). Plain Arrays are the safe derived type.
+  static get [Symbol.species]() { return Array; }
   constructor(x = 0, y = 0, round = false) {
     super();
     const nextX = finiteNumber(x, 'x');
@@ -99,6 +103,10 @@ export class Point extends Array {
   trunc() { return new Point(Math.trunc(this.x), Math.trunc(this.y)); }
   distanceTo(other) { const p = asPoint(other); return Math.hypot(this.x - p.x, this.y - p.y); }
   equals(other) { const p = asPoint(other); return this.x === p.x && this.y === p.y; }
+  // Leaflet parity: Point.contains uses abs() comparison (upstream Leaflet
+  // `Point.contains` is `Math.abs(p.x) <= Math.abs(this.x) && ...`). This is
+  // intentionally sign-insensitive to match Leaflet — do NOT "fix" to a range
+  // check; use Bounds.contains for bounds semantics.
   contains(other) {
     const p = asPoint(other);
     return Math.abs(p.x) <= Math.abs(this.x) && Math.abs(p.y) <= Math.abs(this.y);
@@ -108,6 +116,7 @@ export class Point extends Array {
 }
 
 export class Bounds extends Array {
+  static get [Symbol.species]() { return Array; }
   constructor(a, b) {
     super();
     Object.defineProperties(this, {
@@ -191,6 +200,7 @@ export class Bounds extends Array {
 }
 
 export class LatLng extends Array {
+  static get [Symbol.species]() { return Array; }
   constructor(lat, lng, alt) {
     super();
     const latitude = finiteNumber(lat, 'lat');
@@ -210,7 +220,16 @@ export class LatLng extends Array {
       && (this.alt === undefined || point.alt === undefined || Math.abs(this.alt - point.alt) <= maxMargin);
   }
   toArray() { return this.alt === undefined ? [this.lat, this.lng] : [this.lat, this.lng, this.alt]; }
-  toBounds(size = 0) { return new LatLngBounds([this.lat - size, this.lng - size], [this.lat + size, this.lng + size]); }
+  // Leaflet parity: size is in meters; convert to degrees (earth circumference
+  // 40075017m; lng scaled by cos(lat)) like Leaflet's LatLng.toBounds.
+  toBounds(size = 0) {
+    const latAccuracy = 180 * size / 40075017;
+    const lngAccuracy = latAccuracy / Math.cos((Math.PI / 180) * this.lat);
+    return new LatLngBounds(
+      [this.lat - latAccuracy, this.lng - lngAccuracy],
+      [this.lat + latAccuracy, this.lng + lngAccuracy]
+    );
+  }
   distanceTo(other) {
     const point = asLatLng(other);
     const rad = Math.PI / 180;
@@ -224,6 +243,7 @@ export class LatLng extends Array {
 }
 
 export class LatLngBounds extends Array {
+  static get [Symbol.species]() { return Array; }
   constructor(southWest, northEast) {
     super();
     Object.defineProperties(this, {
@@ -278,8 +298,14 @@ export class LatLngBounds extends Array {
       this._southWest = new LatLng(point.lat, point.lng, point.alt);
       this._northEast = new LatLng(point.lat, point.lng, point.alt);
     } else {
-      this._southWest = new LatLng(Math.min(this._southWest.lat, point.lat), Math.min(this._southWest.lng, point.lng));
-      this._northEast = new LatLng(Math.max(this._northEast.lat, point.lat), Math.max(this._northEast.lng, point.lng));
+      const swAlt = this._southWest.alt !== undefined && point.alt !== undefined
+        ? Math.min(this._southWest.alt, point.alt)
+        : (this._southWest.alt !== undefined ? this._southWest.alt : point.alt);
+      const neAlt = this._northEast.alt !== undefined && point.alt !== undefined
+        ? Math.max(this._northEast.alt, point.alt)
+        : (this._northEast.alt !== undefined ? this._northEast.alt : point.alt);
+      this._southWest = new LatLng(Math.min(this._southWest.lat, point.lat), Math.min(this._southWest.lng, point.lng), swAlt);
+      this._northEast = new LatLng(Math.max(this._northEast.lat, point.lat), Math.max(this._northEast.lng, point.lng), neAlt);
     }
     this._sync();
     return this;
@@ -396,7 +422,17 @@ export const Browser = {
   safari: typeof navigator !== 'undefined' && /safari/i.test(navigator.userAgent || '') && !/chrome|chromium/i.test(navigator.userAgent || ''),
   touch: typeof window !== 'undefined' && ('ontouchstart' in window || (typeof navigator !== 'undefined' && navigator.maxTouchPoints > 0)),
   retina: typeof window !== 'undefined' && window.devicePixelRatio > 1,
-  webgl: typeof document !== 'undefined',
+  // Probe for a real WebGL context instead of assuming `document` implies WebGL
+  // (SSR-safe: guarded by typeof document + try/catch).
+  webgl: (() => {
+    if (typeof document === 'undefined') return false;
+    try {
+      const canvas = document.createElement('canvas');
+      return !!(canvas.getContext('webgl2') || canvas.getContext('webgl'));
+    } catch {
+      return false;
+    }
+  })(),
 };
 
 export const DomUtil = {
@@ -456,5 +492,26 @@ export const DomEvent = {
   disableClickPropagation(element) { for (const type of ['mousedown', 'touchstart', 'click', 'dblclick', 'contextmenu']) element.addEventListener(type, this.stopPropagation); return this; },
   disableScrollPropagation(element) { for (const type of ['wheel', 'mousewheel', 'touchmove']) element.addEventListener(type, this.stopPropagation); return this; },
   getMousePosition(event, container) { const rect = container.getBoundingClientRect(); return new Point(event.clientX - rect.left, event.clientY - rect.top); },
-  getWheelDelta(event) { return (event.deltaY || -event.wheelDelta || 0) / 60; }
+  // Leaflet v1.9.4 parity (DomEvent.getWheelDelta): normalized to vertical
+  // pixels scrolled (negative if scrolling down). deltaMode 0 = pixels
+  // (scaled by device-pixel factor), 1 = lines (x20), 2 = pages (x60);
+  // horizontal/depth wheels yield 0; legacy wheelDelta/detail fall back below.
+  getWheelDelta(event) {
+    if (!event) return 0;
+    let wheelPxFactor = 1;
+    try {
+      if (typeof window !== 'undefined' && window.devicePixelRatio) {
+        wheelPxFactor = 2 * window.devicePixelRatio;
+      }
+    } catch { wheelPxFactor = 1; }
+    const mode = event.deltaMode || 0;
+    if (event.deltaY && mode === 0) return -event.deltaY / wheelPxFactor;
+    if (event.deltaY && mode === 1) return -event.deltaY * 20;
+    if (event.deltaY && mode === 2) return -event.deltaY * 60;
+    if (event.deltaX || event.deltaZ) return 0;
+    if (event.wheelDelta) return (event.wheelDeltaY || event.wheelDelta) / 2;
+    if (event.detail && Math.abs(event.detail) < 32765) return -event.detail * 20;
+    if (event.detail) return event.detail / -32765 * 60;
+    return 0;
+  }
 };

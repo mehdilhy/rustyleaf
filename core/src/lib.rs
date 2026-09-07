@@ -107,8 +107,21 @@ mod events;
 mod layers;
 mod gl;
 mod render;
-use crate::projection::Viewport;
+use crate::projection::{Viewport, clamp_zoom};
+use crate::render::polygons::capped_draw_count;
 use crate::color::parse_color;
+
+// Allocation / ingestion caps (R-6…R-10).
+/// Max pre-allocation for a single JS-array-driven `Vec::with_capacity`.
+const MAX_PREALLOC_ELEMS: usize = 1_000_000;
+/// Max GeoJSON string accepted by `load_geojson` (32 MiB).
+const MAX_GEOJSON_BYTES: usize = 32 * 1024 * 1024;
+/// Max features accepted in a single GeoJSON document.
+const MAX_GEOJSON_FEATURES: usize = 500_000;
+/// Max retained streaming tail (`pending_chunk`) before compaction (8 MiB).
+const MAX_PENDING_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+/// Max points `reserve_points_packed` will allocate (28 bytes each → ~280 MiB).
+const MAX_RESERVE_POINTS: usize = 10_000_000;
 use crate::tiles::{TileCoord, TileLayer, TileLoader};
 use crate::spatial::{SpatialFeature, rebuild_spatial_index, hit_test as spatial_hit_test};
 use crate::input::MouseState;
@@ -285,12 +298,18 @@ pub struct RustyleafMap {
     line_layers: Vec<LineLayer>,
     polygon_layers: Vec<PolygonLayer>,
     geojson_layers: Vec<GeoJSONLayer>,
-    markers: Vec<Marker>,
+    // Stable-slot storage: removing a marker vacates its slot instead of
+    // shifting later entries, so numeric IDs handed to JS stay valid for the
+    // lifetime of the marker (issue #15). Vacant slots are reused by add_marker.
+    markers: Vec<Option<Marker>>,
     spatial_index: RTree<SpatialFeature>,
     spatial_index_dirty: bool,
     // Whether the last hover hit-test found a feature (used to emit a single
     // clearing event when the cursor leaves a feature).
     hovering: bool,
+    // Per-feature GeoJSON parse failures from the last load (R-18), exposed
+    // via `get_geojson_parse_error_count()`.
+    geojson_parse_errors: Cell<usize>,
     mouse_state: MouseState,
     // Smooth dragging with momentum
     drag_velocity: (f64, f64),
@@ -304,14 +323,21 @@ pub struct RustyleafMap {
 
 fn parse_point_features(points_data: &JsValue) -> Result<Vec<PointFeature>, JsValue> {
     let points_array = js_sys::Array::from(points_data);
-    let mut points = Vec::with_capacity(points_array.length() as usize);
+    // Cap pre-allocation from the untrusted JS length (R-6).
+    let capped = (points_array.length() as usize).min(MAX_PREALLOC_ELEMS);
+    let mut points = Vec::with_capacity(capped);
 
     for i in 0..points_array.length() {
         let point_obj = points_array.get(i);
-        let lat = js_sys::Reflect::get(&point_obj, &JsValue::from_str("lat"))?
-            .as_f64().unwrap_or(0.0);
-        let lng = js_sys::Reflect::get(&point_obj, &JsValue::from_str("lng"))?
-            .as_f64().unwrap_or(0.0);
+        // Skip malformed coords instead of collapsing to Null Island (R-16).
+        let lat = match js_sys::Reflect::get(&point_obj, &JsValue::from_str("lat"))?.as_f64() {
+            Some(v) if v.is_finite() => v,
+            _ => continue,
+        };
+        let lng = match js_sys::Reflect::get(&point_obj, &JsValue::from_str("lng"))?.as_f64() {
+            Some(v) if v.is_finite() => v,
+            _ => continue,
+        };
         let size = js_sys::Reflect::get(&point_obj, &JsValue::from_str("size"))?
             .as_f64().unwrap_or(5.0) as f32;
         let color_str = js_sys::Reflect::get(&point_obj, &JsValue::from_str("color"))?
@@ -367,6 +393,7 @@ impl RustyleafMap {
             spatial_index: RTree::new(),
             spatial_index_dirty: true,
             hovering: false,
+            geojson_parse_errors: Cell::new(0),
             mouse_state: MouseState {
                 is_dragging: false,
                 last_x: 0.0,
@@ -418,9 +445,27 @@ impl RustyleafMap {
     }
 
     pub fn set_view(&mut self, lat: f64, lng: f64, zoom: f64) {
-        self.center_lat = lat;
-        self.center_lng = lng;
-        self.zoom = zoom;
+        // Validate/clamp every FFI entry (R-5): finite checks, lat clamp,
+        // lng wrap, zoom clamped to [min_zoom, max_zoom]. Poisoned NaN/inf
+        // previously propagated into all projection/shift/tile math.
+        if !lat.is_finite() || !lng.is_finite() || !zoom.is_finite() {
+            web_sys::console::warn_1(&JsValue::from_str(
+                "rustyleaf: set_view ignored non-finite lat/lng/zoom",
+            ));
+            return;
+        }
+        self.center_lat = lat.clamp(-90.0, 90.0);
+        let mut wrapped_lng = lng;
+        // Wrap longitude into [-180, 180].
+        wrapped_lng = ((wrapped_lng + 180.0) % 360.0 + 360.0) % 360.0 - 180.0;
+        // `%` can return -0.0-adjacent edge values; clamp defensively.
+        self.center_lng = wrapped_lng.clamp(-180.0, 180.0);
+        let (lo, hi) = if self.min_zoom <= self.max_zoom {
+            (self.min_zoom, self.max_zoom)
+        } else {
+            (self.max_zoom, self.min_zoom)
+        };
+        self.zoom = zoom.clamp(lo, hi);
         self.load_visible_tiles();
         self.schedule_render();
 
@@ -456,14 +501,28 @@ impl RustyleafMap {
         self.tile_loader.tiles.clear();
         self.tile_loader.requested.clear();
         self.tile_loader.release_all_closures();
-        // Clear GeoJSON layer GPU buffers (triggers OwnedBuffer::Drop â†’ delete_buffer)
+        // Clear GeoJSON layer GPU buffers (take + drop lets OwnedBuffer Drop delete once; R-15/R-22)
         for layer in &self.geojson_layers {
-            layer.polygon_vertex_buffer.borrow_mut().take();
-            layer.line_vertex_buffer.borrow_mut().take();
+            drop(layer.polygon_vertex_buffer.borrow_mut().take());
+            drop(layer.line_vertex_buffer.borrow_mut().take());
+            layer.polygon_vertex_count.set(0);
+            layer.line_vertex_count.set(0);
         }
         // Drop per-layer point buffers and mark dirty so they re-upload on restore
         for layer in &self.point_layers {
-            layer.vertex_buffer.borrow_mut().take();
+            drop(layer.vertex_buffer.borrow_mut().take());
+            layer.gpu_dirty.set(true);
+        }
+        // Take line/polygon GPU buffers + mark dirty (R-15); previously they
+        // kept stale GL handles and never rebuilt after a context restore.
+        for layer in &self.line_layers {
+            drop(layer.vertex_buffer.borrow_mut().take());
+            layer.instance_count.set(0);
+            layer.gpu_dirty.set(true);
+        }
+        for layer in &self.polygon_layers {
+            drop(layer.vertex_buffer.borrow_mut().take());
+            layer.vertex_count.set(0);
             layer.gpu_dirty.set(true);
         }
         // Dropping gl_state triggers OwnedVAO, OwnedBuffer, OwnedProgram Drop impls
@@ -495,12 +554,24 @@ impl RustyleafMap {
 
     #[wasm_bindgen]
     pub fn handle_context_restored(&mut self) {
-        if let Some(ref _gl_state) = self.gl_state {
-            for layer_idx in 0..self.geojson_layers.len() {
-                let _ = self.rebuild_geojson_cache(layer_idx);
-            }
-            self.spatial_index_dirty = true;
+        // Fixed guard (R-15): cleanup sets gl_state = None, so the old
+        // `if let Some(gl_state)` branch was dead and line/polygon layers
+        // never rebuilt. CPU caches rebuild unconditionally here (GPU
+        // re-upload happens on demand via gpu_dirty once GL is back).
+        for layer_idx in 0..self.geojson_layers.len() {
+            let _ = self.rebuild_geojson_cache(layer_idx);
         }
+        for layer in &self.point_layers {
+            layer.gpu_dirty.set(true);
+        }
+        for layer in &self.line_layers {
+            layer.gpu_dirty.set(true);
+        }
+        for layer in &self.polygon_layers {
+            layer.gpu_dirty.set(true);
+        }
+        self.spatial_index_dirty = true;
+        self.needs_redraw = true;
     }
 
    
@@ -681,6 +752,32 @@ impl RustyleafMap {
             self.apply_momentum();
         }
 
+        // Throttle-aware rebuild (R-17): a throttled streaming chunk sets
+        // needs_rebuild; flush it on a render time-slice (>=120ms) so the
+        // next frame uses real caches instead of per-frame fallback
+        // triangulation.
+        {
+            let now_ms = js_sys::Date::now();
+            let throttled: Vec<usize> = self
+                .geojson_layers
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| {
+                    l.needs_rebuild && now_ms - l.last_rebuilt_at_ms >= 120.0
+                })
+                .map(|(i, _)| i)
+                .collect();
+            for idx in throttled {
+                let len = self.geojson_layers[idx].features.len();
+                let _ = self.rebuild_geojson_cache(idx);
+                self.geojson_layers[idx].last_rebuilt_len = len;
+                self.geojson_layers[idx].last_rebuilt_at_ms = now_ms;
+                self.geojson_layers[idx].needs_rebuild = false;
+                self.spatial_index_dirty = true;
+                self.needs_redraw = true;
+            }
+        }
+
         // Dirty-flag culling: skip the whole GPU pass when nothing changed.
         // A new tile texture arriving bumps the generation counter, forcing
         // the next frame to draw. Idle maps cost ~0 CPU instead of redrawing
@@ -792,18 +889,24 @@ impl RustyleafMap {
             context.use_program(Some(gl_state.programs.point_program.inner()));
             context.bind_vertex_array(Some(gl_state.marker_vao.inner()));
 
-            let count = self.markers.iter().filter(|m| m.visible.get()).count();
+            let count = self.markers.iter().flatten().filter(|m| m.visible.get()).count();
             if count == 0 {
                 return Ok(());
             }
 
             // Sort by z_order so lower markers draw first (painter's algorithm).
-            let mut order: Vec<usize> = (0..self.markers.len()).collect();
-            order.sort_by_key(|&i| self.markers[i].z_order);
+            // Only live slots participate; vacant slots keep no draw state.
+            let mut order: Vec<(usize, i32)> = self.markers.iter().enumerate()
+                .filter_map(|(i, m)| m.as_ref().map(|mm| (i, mm.z_order)))
+                .collect();
+            order.sort_by_key(|&(_, z)| z);
 
             let mut vertex_data: Vec<f32> = Vec::with_capacity(count * 7);
-            for i in order {
-                let m = &self.markers[i];
+            for (i, _) in order {
+                let m = match self.markers[i].as_ref() {
+                    Some(m) => m,
+                    None => continue,
+                };
                 if !m.visible.get() {
                     continue;
                 }
@@ -836,11 +939,12 @@ impl RustyleafMap {
                 context.uniform_matrix4fv_with_f32_array(Some(&loc), false, &projection_matrix);
             }
 
-            let zoom = self.viewport().zoom.round() as u32;
+            let zoom = clamp_zoom(self.viewport().zoom);
             let center_pixel = self.viewport().lat_lng_to_pixel(self.viewport().center_lat, self.viewport().center_lng, zoom);
             let origin_x = (center_pixel.0 - self.viewport().width as f64 / 2.0) as f32;
             let origin_y = (center_pixel.1 - self.viewport().height as f64 / 2.0) as f32;
-            let world_scale = self.viewport().tile_size as f32 * (1u32 << zoom) as f32;
+            // f64 on CPU (R-28); cast to f32 only at uniform upload.
+            let world_scale = (self.viewport().tile_size as f64 * (1u64 << zoom) as f64) as f32;
 
             if let Some(loc) = gl_state.point_u_origin.as_ref() {
                 context.uniform2f(Some(loc), origin_x, origin_y);
@@ -849,7 +953,7 @@ impl RustyleafMap {
                 context.uniform1f(Some(loc), world_scale);
             }
 
-            context.draw_arrays(WebGl2RenderingContext::POINTS, 0, (vertex_data.len() / 7) as i32);
+            context.draw_arrays(WebGl2RenderingContext::POINTS, 0, capped_draw_count(vertex_data.len() / 7));
         }
 
         Ok(())
@@ -1118,7 +1222,7 @@ impl RustyleafMap {
     // Public methods for JavaScript
     #[wasm_bindgen]
     pub fn pan(&mut self, delta_x: f64, delta_y: f64) {
-        let zoom = self.zoom.round() as u32;
+        let zoom = clamp_zoom(self.zoom);
         let pixel_center = self.viewport().lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
 
         // Note: delta_x and delta_y are in screen pixels (standard web coordinates)
@@ -1202,7 +1306,7 @@ impl RustyleafMap {
     #[wasm_bindgen]
     pub fn get_bounds(&self) -> Array {
         // Calculate current visible bounds based on center, zoom, and viewport dimensions
-        let zoom = self.zoom.round() as u32;
+        let zoom = clamp_zoom(self.zoom);
         let center_pixel = self.viewport().lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
         
         let start_x = center_pixel.0 - (self.width as f64 / 2.0);
@@ -1282,15 +1386,21 @@ impl RustyleafMap {
         // Binary search for the best zoom level
         for zoom in (1..=18).rev() {
             let bounds = self.get_view_bounds_at_zoom(center_lat, center_lng, zoom);
-            
-            if bounds[0] <= sw_lat && bounds[1] <= sw_lng && 
+
+            if bounds[0] <= sw_lat && bounds[1] <= sw_lng &&
                bounds[2] >= ne_lat && bounds[3] >= ne_lng {
                 best_zoom = zoom as f64;
                 break;
             }
         }
-        
-        best_zoom
+
+        // Respect the configured min/max zoom (R-5); set_view clamps again.
+        let (lo, hi) = if self.min_zoom <= self.max_zoom {
+            (self.min_zoom, self.max_zoom)
+        } else {
+            (self.max_zoom, self.min_zoom)
+        };
+        best_zoom.clamp(lo, hi)
     }
 
     fn get_view_bounds_at_zoom(&self, center_lat: f64, center_lng: f64, zoom: u32) -> [f64; 4] {
@@ -1317,8 +1427,8 @@ impl RustyleafMap {
         
         let lat = latlng_array.get(0).as_f64().unwrap_or(0.0);
         let lng = latlng_array.get(1).as_f64().unwrap_or(0.0);
-        
-        let zoom = self.zoom.round() as u32;
+
+        let zoom = clamp_zoom(self.zoom);
         let center_pixel = self.viewport().lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
         let point_pixel = self.viewport().lat_lng_to_pixel(lat, lng, zoom);
         
@@ -1352,8 +1462,8 @@ impl RustyleafMap {
         
         let screen_x = point_array.get(0).as_f64().unwrap_or(0.0);
         let screen_y = point_array.get(1).as_f64().unwrap_or(0.0);
-        
-        let zoom = self.zoom.round() as u32;
+
+        let zoom = clamp_zoom(self.zoom);
         let center_pixel = self.viewport().lat_lng_to_pixel(self.center_lat, self.center_lng, zoom);
         
         let point_x = screen_x - (self.width as f64 / 2.0) + center_pixel.0;
@@ -1371,6 +1481,19 @@ impl RustyleafMap {
     #[wasm_bindgen]
     pub fn add_tile_layer(&mut self, url_template: &str) -> Result<(), JsValue> {
         self.needs_redraw = true;
+        // Drop previous-template state (R-25): cached textures/keys from the
+        // old URL must not be reused under the new template, and stale
+        // `requested` entries would block reloads.
+        self.tile_loader.requested.clear();
+        self.tile_loader.tiles.clear();
+        self.tile_loader.failed.borrow_mut().clear();
+        self.tile_loader.release_all_closures();
+        {
+            let mut textures = self.tile_loader.textures.borrow_mut();
+            for (_k, tex) in textures.drain() {
+                drop(tex);
+            }
+        }
         let tile_layer = TileLayer {
             url_template: url_template.to_string(),
             subdomains: vec!["a".to_string(), "b".to_string(), "c".to_string()],
@@ -1444,7 +1567,12 @@ impl RustyleafMap {
     pub fn set_point_layer_visible(&mut self, layer_index: usize, visible: bool) {
         self.needs_redraw = true;
         if let Some(layer) = self.point_layers.get_mut(layer_index) {
-            layer.visible = visible;
+            // Visibility gates hit-testing too: only dirty the spatial index
+            // when the value actually flips (issue #17 — rebuilds are costly).
+            if layer.visible != visible {
+                layer.visible = visible;
+                self.spatial_index_dirty = true;
+            }
         }
     }
 
@@ -1540,9 +1668,26 @@ impl RustyleafMap {
         };
         let gl = &gl_state.context;
         gl.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(buffer));
-        let bytes = total_points * 7 * 4;
+        // Checked size with a sane MAX cap (R-10): an unchecked
+        // `total_points * 28 as i32` wraps negative / over-allocates the GPU.
+        if total_points > MAX_RESERVE_POINTS {
+            return Err(RustyleafError::ResourceError(format!(
+                "reserve_points_packed: total_points {} exceeds max {}",
+                total_points, MAX_RESERVE_POINTS
+            ))
+            .into());
+        }
+        let bytes = total_points
+            .checked_mul(7)
+            .and_then(|v| v.checked_mul(4))
+            .ok_or_else(|| {
+                RustyleafError::ResourceError("reserve_points_packed: byte size overflow".into())
+            })?;
+        let bytes_i32 = i32::try_from(bytes).map_err(|_| {
+            RustyleafError::ResourceError("reserve_points_packed: byte size exceeds i32".into())
+        })?;
         // Zero-initialized capacity so bufferSubData can fill it in later.
-        gl.buffer_data_with_i32(WebGl2RenderingContext::ARRAY_BUFFER, bytes as i32, WebGl2RenderingContext::DYNAMIC_DRAW);
+        gl.buffer_data_with_i32(WebGl2RenderingContext::ARRAY_BUFFER, bytes_i32, WebGl2RenderingContext::DYNAMIC_DRAW);
         Ok(())
     }
 
@@ -1569,6 +1714,32 @@ impl RustyleafMap {
         }
 
         let new_count = points_data.len() / 7;
+
+        // If a full re-upload is pending (points replaced since the last
+        // render) or nothing was ever uploaded, the GPU shadow/buffer do not
+        // reflect layer.points. Just extend the CPU points here; the next
+        // render's full upload rebuilds the GPU buffer AND the shadow, so a
+        // later append always builds on consistent state (issue #16).
+        {
+            let layer = &self.point_layers[layer_index];
+            if layer.gpu_dirty.get() || layer.vertex_buffer.borrow().is_none() {
+                let layer = &mut self.point_layers[layer_index];
+                layer.points.reserve(new_count);
+                for i in (0..points_data.len()).step_by(7) {
+                    let point = &points_data[i..i + 7];
+                    layer.points.push(PointFeature {
+                        lat: point[0] as f64,
+                        lng: point[1] as f64,
+                        size: point[2],
+                        color: [point[3], point[4], point[5], point[6]],
+                        meta: serde_json::Value::Null,
+                    });
+                }
+                self.spatial_index_dirty = true;
+                return Ok(());
+            }
+        }
+
         let viewport = self.viewport();
         let layer = &mut self.point_layers[layer_index];
         layer.points.reserve(new_count);
@@ -1657,11 +1828,28 @@ impl RustyleafMap {
                 );
             } else if !vertex_data.is_empty() {
                 let vertices = Float32Array::from(&vertex_data[..]);
+                // Checked offset (R-23): prev_total * stride wraps past i32 at
+                // ~76M points. Fail loudly instead of corrupting the buffer.
+                let byte_offset = prev_total
+                    .checked_mul(stride)
+                    .and_then(|v| i32::try_from(v).ok())
+                    .ok_or_else(|| {
+                        RustyleafError::ResourceError(
+                            "append_points_packed: buffer offset overflow".into(),
+                        )
+                    })?;
                 gl.buffer_sub_data_with_i32_and_array_buffer_view(
                     WebGl2RenderingContext::ARRAY_BUFFER,
-                    (prev_total * stride) as i32,
+                    byte_offset,
                     &vertices,
                 );
+                // Surface silent GL failures instead of corrupting silently.
+                if gl.get_error() != WebGl2RenderingContext::NO_ERROR {
+                    return Err(RustyleafError::BufferCreation(
+                        "append_points_packed: bufferSubData GL error".into(),
+                    )
+                    .into());
+                }
             }
         }
         layer.vertex_count.set(new_total);
@@ -1692,15 +1880,19 @@ impl RustyleafMap {
     #[wasm_bindgen]
     pub fn add_marker(&mut self) -> u32 {
         self.needs_redraw = true;
-        let id = self.markers.len() as u32;
-        self.markers.push(Marker::new());
-        id
+        // Reuse the lowest vacant slot so IDs stay dense; otherwise append.
+        if let Some(slot) = self.markers.iter().position(|m| m.is_none()) {
+            self.markers[slot] = Some(Marker::new());
+            return slot as u32;
+        }
+        self.markers.push(Some(Marker::new()));
+        (self.markers.len() - 1) as u32
     }
 
     #[wasm_bindgen]
     pub fn update_marker(&mut self, id: u32, lat: f64, lng: f64) {
         self.needs_redraw = true;
-        if let Some(m) = self.markers.get_mut(id as usize) {
+        if let Some(m) = self.markers.get_mut(id as usize).and_then(|m| m.as_mut()) {
             m.lat = lat;
             m.lng = lng;
         }
@@ -1718,17 +1910,19 @@ impl RustyleafMap {
         a: f32,
         z_order: i32,
     ) {
-        if let Some(m) = self.markers.get_mut(id as usize) {
+        if let Some(m) = self.markers.get_mut(id as usize).and_then(|m| m.as_mut()) {
             m.size = size;
             m.color = [r, g, b, a];
             m.z_order = z_order;
+            // Style change must schedule a draw (R-24); siblings already do.
+            self.needs_redraw = true;
         }
     }
 
     #[wasm_bindgen]
     pub fn set_marker_visible(&mut self, id: u32, visible: bool) {
         self.needs_redraw = true;
-        if let Some(m) = self.markers.get_mut(id as usize) {
+        if let Some(m) = self.markers.get_mut(id as usize).and_then(|m| m.as_mut()) {
             m.visible.set(visible);
         }
     }
@@ -1736,14 +1930,15 @@ impl RustyleafMap {
     #[wasm_bindgen]
     pub fn remove_marker(&mut self, id: u32) {
         self.needs_redraw = true;
-        if (id as usize) < self.markers.len() {
-            self.markers.remove(id as usize);
+        // Vacate the slot; never shift later entries (their IDs must not move).
+        if let Some(slot) = self.markers.get_mut(id as usize) {
+            *slot = None;
         }
     }
 
     #[wasm_bindgen]
     pub fn get_marker_latlng(&self, id: u32) -> Result<JsValue, JsValue> {
-        if let Some(m) = self.markers.get(id as usize) {
+        if let Some(m) = self.markers.get(id as usize).and_then(|m| m.as_ref()) {
             let arr = js_sys::Array::new();
             arr.push(&JsValue::from_f64(m.lat));
             arr.push(&JsValue::from_f64(m.lng));
@@ -1765,7 +1960,10 @@ impl RustyleafMap {
     pub fn set_line_layer_visible(&mut self, layer_index: usize, visible: bool) {
         self.needs_redraw = true;
         if let Some(layer) = self.line_layers.get_mut(layer_index) {
-            layer.visible = visible;
+            if layer.visible != visible {
+                layer.visible = visible;
+                self.spatial_index_dirty = true;
+            }
         }
     }
 
@@ -1787,10 +1985,15 @@ impl RustyleafMap {
             let mut points = Vec::new();
             for j in 0..coords.length() {
                 let coord_obj = coords.get(j);
-                let lat = js_sys::Reflect::get(&coord_obj, &JsValue::from_str("lat"))?
-                    .as_f64().unwrap_or(0.0);
-                let lng = js_sys::Reflect::get(&coord_obj, &JsValue::from_str("lng"))?
-                    .as_f64().unwrap_or(0.0);
+                // Skip malformed coords (R-16) instead of Null-Island (0,0).
+                let lat = match js_sys::Reflect::get(&coord_obj, &JsValue::from_str("lat"))?.as_f64() {
+                    Some(v) if v.is_finite() => v,
+                    _ => continue,
+                };
+                let lng = match js_sys::Reflect::get(&coord_obj, &JsValue::from_str("lng"))?.as_f64() {
+                    Some(v) if v.is_finite() => v,
+                    _ => continue,
+                };
                 points.push([lat, lng]);
             }
 
@@ -1834,7 +2037,7 @@ impl RustyleafMap {
 
         let lines_array = js_sys::Array::from(lines_data);
         let layer = &mut self.line_layers[layer_index];
-        layer.lines.reserve(lines_array.length() as usize);
+        layer.lines.reserve((lines_array.length() as usize).min(MAX_PREALLOC_ELEMS));
 
         for i in 0..lines_array.length() {
             let line_obj = lines_array.get(i);
@@ -1842,10 +2045,14 @@ impl RustyleafMap {
             let mut points = Vec::new();
             for j in 0..coords_array.length() {
                 let coord_obj = coords_array.get(j);
-                let lat = js_sys::Reflect::get(&coord_obj, &JsValue::from_str("lat"))?
-                    .as_f64().unwrap_or(0.0);
-                let lng = js_sys::Reflect::get(&coord_obj, &JsValue::from_str("lng"))?
-                    .as_f64().unwrap_or(0.0);
+                let lat = match js_sys::Reflect::get(&coord_obj, &JsValue::from_str("lat"))?.as_f64() {
+                    Some(v) if v.is_finite() => v,
+                    _ => continue,
+                };
+                let lng = match js_sys::Reflect::get(&coord_obj, &JsValue::from_str("lng"))?.as_f64() {
+                    Some(v) if v.is_finite() => v,
+                    _ => continue,
+                };
                 points.push([lat, lng]);
             }
             let color_str = js_sys::Reflect::get(&line_obj, &JsValue::from_str("color"))?
@@ -1954,7 +2161,10 @@ impl RustyleafMap {
     pub fn set_polygon_layer_visible(&mut self, layer_index: usize, visible: bool) {
         self.needs_redraw = true;
         if let Some(layer) = self.polygon_layers.get_mut(layer_index) {
-            layer.visible = visible;
+            if layer.visible != visible {
+                layer.visible = visible;
+                self.spatial_index_dirty = true;
+            }
         }
     }
 
@@ -1980,10 +2190,14 @@ impl RustyleafMap {
                 
                 for k in 0..ring_array.length() {
                     let coord_obj = ring_array.get(k);
-                    let lat = js_sys::Reflect::get(&coord_obj, &JsValue::from_str("lat"))?
-                        .as_f64().unwrap_or(0.0);
-                    let lng = js_sys::Reflect::get(&coord_obj, &JsValue::from_str("lng"))?
-                        .as_f64().unwrap_or(0.0);
+                    let lat = match js_sys::Reflect::get(&coord_obj, &JsValue::from_str("lat"))?.as_f64() {
+                        Some(v) if v.is_finite() => v,
+                        _ => continue,
+                    };
+                    let lng = match js_sys::Reflect::get(&coord_obj, &JsValue::from_str("lng"))?.as_f64() {
+                        Some(v) if v.is_finite() => v,
+                        _ => continue,
+                    };
                     ring_points.push([lat, lng]);
                 }
                 
@@ -2031,6 +2245,7 @@ impl RustyleafMap {
             pending_chunk: String::new(),
             last_rebuilt_len: 0,
             last_rebuilt_at_ms: 0.0,
+            needs_rebuild: false,
             polygon_vertex_buffer: RefCell::new(None),
             polygon_vertex_count: Cell::new(0),
             line_vertex_buffer: RefCell::new(None),
@@ -2044,7 +2259,10 @@ impl RustyleafMap {
     pub fn set_geojson_layer_visible(&mut self, layer_index: usize, visible: bool) {
         self.needs_redraw = true;
         if let Some(layer) = self.geojson_layers.get_mut(layer_index) {
-            layer.visible = visible;
+            if layer.visible != visible {
+                layer.visible = visible;
+                self.spatial_index_dirty = true;
+            }
         }
     }
 
@@ -2074,6 +2292,27 @@ impl RustyleafMap {
         // boundaries are parsed exactly once, in full.
         let mut buffer = std::mem::take(&mut self.geojson_layers[layer_index].pending_chunk);
         buffer.push_str(chunk_str);
+        // Cap the pending buffer (R-9): garbage/malicious streams must not
+        // grow it without bound. drain_features also drops leading non-'{'
+        // garbage and compacts, but enforce a hard ceiling here too.
+        if buffer.len() > MAX_PENDING_CHUNK_BYTES {
+            let excess = buffer.len() - MAX_PENDING_CHUNK_BYTES;
+            // Drain from the front on a char boundary, then drop any leading
+            // partial object so the tail restarts at the next '{'.
+            let mut cut = excess.min(buffer.len());
+            while cut < buffer.len() && !buffer.is_char_boundary(cut) {
+                cut += 1;
+            }
+            buffer.drain(..cut);
+            if let Some(pos) = buffer.find('{') {
+                buffer.drain(..pos);
+            } else {
+                buffer.clear();
+            }
+            web_sys::console::warn_1(&JsValue::from_str(
+                "rustyleaf: pending GeoJSON chunk buffer capped, dropped oldest data",
+            ));
+        }
         let drained = self.drain_features(&mut buffer, is_final);
         self.geojson_layers[layer_index].pending_chunk = buffer;
 
@@ -2084,14 +2323,31 @@ impl RustyleafMap {
             // Batch rebuilds: at most one per ~250 newly-parsed features
             // (plus always the final flush).
             let len = self.geojson_layers[layer_index].features.len();
-            let since = len - self.geojson_layers[layer_index].last_rebuilt_len;
+            let since = len.saturating_sub(self.geojson_layers[layer_index].last_rebuilt_len);
             let now_ms = js_sys::Date::now();
-            if is_final || (since >= 250 && now_ms - self.geojson_layers[layer_index].last_rebuilt_at_ms >= 120.0) {
+            // Rebuild immediately when the caches are still empty (R-17):
+            // otherwise the render fallback re-triangulates from `features`
+            // on every frame while streaming.
+            let caches_empty = self.geojson_layers[layer_index].cached_points.is_empty()
+                && self.geojson_layers[layer_index].cached_lines.is_empty()
+                && self.geojson_layers[layer_index].cached_polygon_triangles.is_empty();
+            if is_final
+                || caches_empty
+                || (since >= 250
+                    && now_ms - self.geojson_layers[layer_index].last_rebuilt_at_ms >= 120.0)
+            {
                 self.rebuild_geojson_cache(layer_index)?;
                 self.geojson_layers[layer_index].last_rebuilt_len = len;
                 self.geojson_layers[layer_index].last_rebuilt_at_ms = now_ms;
+                self.geojson_layers[layer_index].needs_rebuild = false;
+            } else {
+                // Throttle-aware dirty flag (R-17): the view lags ingestion by
+                // design, but the next time-slice must rebuild instead of
+                // paying per-frame fallback triangulation.
+                self.geojson_layers[layer_index].needs_rebuild = true;
             }
             self.spatial_index_dirty = true;
+            self.needs_redraw = true;
         }
 
         Ok(())
@@ -2103,49 +2359,66 @@ impl RustyleafMap {
     fn drain_features(&self, buf: &mut String, is_final: bool) -> Vec<GeoJSONFeature> {
         let mut out = Vec::new();
 
-        // Fast path: the buffer is already a complete JSON document.
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(buf) {
-            if let Ok(mut f) = self.parse_geojson_value(&v) {
-                out.append(&mut f);
+        // Fast path (R-8): only attempt the full-buffer parse when the chunk
+        // plausibly closes the document. Retrying a full `from_str` on every
+        // intermediate chunk is O(n^2) over a stream.
+        {
+            let trimmed = buf.trim_end();
+            let looks_closed = is_final
+                || trimmed.ends_with('}')
+                || trimmed.ends_with(']');
+            if looks_closed {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(buf) {
+                    if let Ok(mut f) = self.parse_geojson_value(&v) {
+                        out.append(&mut f);
+                    }
+                    buf.clear();
+                    return out;
+                }
+                // Not a complete document yet (or NDJSON tail when final):
+                // fall through to the incremental object scanner below.
             }
-            buf.clear();
-            return out;
         }
 
-        let chars: Vec<char> = buf.chars().collect();
-        let mut stack: Vec<usize> = Vec::new(); // indices of unmatched '{'
-        let mut consumed_until = 0usize; // chars strictly before this are done
+        // Byte scanning (R-8): '{', '}', '"' and '\\' are single-byte in UTF-8,
+        // so byte indices are safe for slicing at those positions. Avoids the
+        // 4x `Vec<char>` expansion per chunk.
+        let bytes = buf.as_bytes();
+        let mut stack: Vec<usize> = Vec::new(); // byte indices of unmatched '{'
+        let mut consumed_until = 0usize; // bytes strictly before this are done
         let mut in_string = false;
         let mut escaped = false;
 
-        for (i, &c) in chars.iter().enumerate() {
+        for (i, &b) in bytes.iter().enumerate() {
             if in_string {
                 if escaped {
                     escaped = false;
-                } else if c == '\\' {
+                } else if b == b'\\' {
                     escaped = true;
-                } else if c == '"' {
+                } else if b == b'"' {
                     in_string = false;
                 }
                 continue;
             }
-            match c {
-                '"' => in_string = true,
-                '{' => stack.push(i),
-                '}' => {
+            match b {
+                b'"' => in_string = true,
+                b'{' => stack.push(i),
+                b'}' => {
                     if let Some(start) = stack.pop() {
-                        let segment: String = chars[start..=i].iter().collect();
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&segment) {
-                            // ONLY complete Feature objects count. Accepting
-                            // bare geometries here would double-count the
-                            // geometry objects nested INSIDE features.
-                            let is_feature =
-                                v.get("type").and_then(|x| x.as_str()) == Some("Feature");
-                            if is_feature {
-                                if let Ok(mut f) = self.parse_geojson_value(&v) {
-                                    if !f.is_empty() {
-                                        out.append(&mut f);
-                                        consumed_until = i + 1;
+                        // start..=i lands on ASCII boundaries, always valid UTF-8.
+                        if let Ok(segment) = std::str::from_utf8(&bytes[start..=i]) {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(segment) {
+                                // ONLY complete Feature objects count. Accepting
+                                // bare geometries here would double-count the
+                                // geometry objects nested INSIDE features.
+                                let is_feature =
+                                    v.get("type").and_then(|x| x.as_str()) == Some("Feature");
+                                if is_feature {
+                                    if let Ok(mut f) = self.parse_geojson_value(&v) {
+                                        if !f.is_empty() {
+                                            out.append(&mut f);
+                                            consumed_until = i + 1;
+                                        }
                                     }
                                 }
                             }
@@ -2158,10 +2431,38 @@ impl RustyleafMap {
 
         // Retention: drop everything fully consumed; keep the innermost
         // unclosed object (a partial feature or the collection skeleton).
-        // Wasm-event style note: taking max() avoids re-scanning features
-        // that were already emitted above.
+        // Taking max() avoids re-scanning features already emitted above.
         let keep_from = stack.first().copied().unwrap_or(consumed_until).max(consumed_until);
-        let tail: String = chars[keep_from..].iter().collect();
+        let mut tail = buf[keep_from..].to_string();
+
+        // Drop leading non-'{' garbage (R-9): braceless junk previously pinned
+        // the whole buffer forever, growing `pending_chunk` without bound.
+        if let Some(pos) = tail.find('{') {
+            if pos > 0 {
+                tail.drain(..pos);
+            }
+        } else if !is_final {
+            // No object start at all: retain at most a small probe so a brace
+            // split across the boundary is still caught, drop the rest.
+            tail.clear();
+            *buf = tail;
+            return out;
+        }
+        // Hard cap on the retained tail (R-9).
+        if tail.len() > MAX_PENDING_CHUNK_BYTES {
+            let excess = tail.len() - MAX_PENDING_CHUNK_BYTES;
+            let mut cut = excess.min(tail.len());
+            while cut < tail.len() && !tail.is_char_boundary(cut) {
+                cut += 1;
+            }
+            tail.drain(..cut);
+            if let Some(pos) = tail.find('{') {
+                tail.drain(..pos);
+            }
+            web_sys::console::warn_1(&JsValue::from_str(
+                "rustyleaf: streaming GeoJSON tail capped, dropped oldest data",
+            ));
+        }
 
         if is_final {
             // Last chance: newline-delimited JSON in the remaining tail.
@@ -2198,8 +2499,9 @@ impl RustyleafMap {
         self.geojson_layers[layer_index].pending_chunk.clear();
         self.geojson_layers[layer_index].last_rebuilt_len = 0;
         self.geojson_layers[layer_index].last_rebuilt_at_ms = 0.0;
-        self.geojson_layers[layer_index].polygon_vertex_buffer.borrow_mut().take();
-        self.geojson_layers[layer_index].line_vertex_buffer.borrow_mut().take();
+        self.geojson_layers[layer_index].needs_rebuild = false;
+        drop(self.geojson_layers[layer_index].polygon_vertex_buffer.borrow_mut().take());
+        drop(self.geojson_layers[layer_index].line_vertex_buffer.borrow_mut().take());
         self.geojson_layers[layer_index].polygon_vertex_count = Cell::new(0);
         self.geojson_layers[layer_index].line_vertex_count = Cell::new(0);
         self.spatial_index_dirty = true;
@@ -2213,6 +2515,12 @@ impl RustyleafMap {
         }
 
         Ok(self.geojson_layers[layer_index].features.len())
+    }
+
+    /// Per-feature GeoJSON parse failures from the last load (R-18).
+    #[wasm_bindgen]
+    pub fn get_geojson_parse_error_count(&self) -> usize {
+        self.geojson_parse_errors.get()
     }
 
     #[wasm_bindgen]
@@ -2376,12 +2684,49 @@ impl RustyleafMap {
     }
 
     #[wasm_bindgen]
-    pub fn on_wheel(&mut self, delta_y: f64, _canvas_x: f64, _canvas_y: f64) {
-        // Zoom based on wheel direction
+    pub fn on_wheel(&mut self, delta_y: f64, canvas_x: f64, canvas_y: f64) {
+        // Cursor-anchored wheel zoom (R-30): unproject the cursor before and
+        // after the zoom step and pan the delta so the geo point under the
+        // cursor stays stationary (Leaflet UX). Falls back to center zoom
+        // when the cursor position is not finite.
+        if !delta_y.is_finite() {
+            return;
+        }
+        if !canvas_x.is_finite() || !canvas_y.is_finite() {
+            if delta_y > 0.0 {
+                self.zoom_out();
+            } else {
+                self.zoom_in();
+            }
+            return;
+        }
+        let vp = self.viewport();
+        let zoom_before = clamp_zoom(vp.zoom);
+        let center_px = vp.lat_lng_to_pixel(vp.center_lat, vp.center_lng, zoom_before);
+        let cursor_world_x = canvas_x - (vp.width as f64 / 2.0) + center_px.0;
+        let cursor_world_y = canvas_y - (vp.height as f64 / 2.0) + center_px.1;
+        let (anchor_lat, anchor_lng) = vp.pixel_to_lat_lng(cursor_world_x, cursor_world_y, zoom_before);
+
         if delta_y > 0.0 {
             self.zoom_out();
         } else {
             self.zoom_in();
+        }
+
+        // At min/max zoom the step is a no-op: nothing to anchor.
+        let vp2 = self.viewport();
+        let zoom_after = clamp_zoom(vp2.zoom);
+        if zoom_after == zoom_before {
+            return;
+        }
+        let center_px2 = vp2.lat_lng_to_pixel(vp2.center_lat, vp2.center_lng, zoom_after);
+        let anchor_px = vp2.lat_lng_to_pixel(anchor_lat, anchor_lng, zoom_after);
+        let screen_x = anchor_px.0 - center_px2.0 + (vp2.width as f64 / 2.0);
+        let screen_y = anchor_px.1 - center_px2.1 + (vp2.height as f64 / 2.0);
+        if screen_x.is_finite() && screen_y.is_finite() {
+            // pan(dx, dy) shifts content by (+dx, +dy); move the anchor back
+            // onto the cursor.
+            self.pan(canvas_x - screen_x, canvas_y - screen_y);
         }
     }
 
@@ -2407,12 +2752,38 @@ impl RustyleafMap {
     fn parse_geojson_string(&self, geojson_str: &str) -> Result<Vec<GeoJSONFeature>, JsValue> {
         web_sys::console::log_2(&"Parsing GeoJSON string length:".into(), &geojson_str.len().into());
 
+        // Size cap before building the full serde_json DOM (R-7): a hostile
+        // or merely huge file otherwise OOMs/hangs the main thread.
+        if geojson_str.len() > MAX_GEOJSON_BYTES {
+            return Err(RustyleafError::GeoJsonParse(format!(
+                "GeoJSON string ({} bytes) exceeds max {} bytes",
+                geojson_str.len(),
+                MAX_GEOJSON_BYTES
+            ))
+            .into());
+        }
+
         // Parse GeoJSON string using serde_json
         let geojson_value: serde_json::Value = serde_json::from_str(geojson_str)
             .map_err(|e| {
                 web_sys::console::log_2(&"GeoJSON parse error:".into(), &e.to_string().into());
                 RustyleafError::GeoJsonParse(format!("Failed to parse GeoJSON: {}", e))
             })?;
+
+        // Feature-count cap before per-feature conversion (R-7).
+        if let Some(n) = geojson_value
+            .get("features")
+            .and_then(|f| f.as_array())
+            .map(|a| a.len())
+        {
+            if n > MAX_GEOJSON_FEATURES {
+                return Err(RustyleafError::GeoJsonParse(format!(
+                    "GeoJSON feature count ({}) exceeds max {}",
+                    n, MAX_GEOJSON_FEATURES
+                ))
+                .into());
+            }
+        }
 
         web_sys::console::log_1(&"GeoJSON parsed successfully, now processing features".into());
         self.parse_geojson_value(&geojson_value)
@@ -2432,6 +2803,10 @@ impl RustyleafMap {
                         web_sys::console::log_1(&"Found FeatureCollection".into());
                         if let Some(features_array) = obj.get("features").and_then(|f| f.as_array()) {
                             web_sys::console::log_2(&"Features array length:".into(), &features_array.len().into());
+                            // Count per-feature failures and warn with the total
+                            // (R-18); previously every failure was a lone
+                            // console::log and all-bad input returned Ok(empty).
+                            let mut failures: usize = 0;
                             for (index, feature_value) in features_array.iter().enumerate() {
                                 match self.parse_geojson_feature(feature_value) {
                                     Ok(feature) => {
@@ -2441,17 +2816,37 @@ impl RustyleafMap {
                                         }
                                     },
                                     Err(e) => {
+                                        failures += 1;
                                         web_sys::console::log_3(&"Failed to parse feature".into(), &index.into(), &e);
                                     }
                                 }
+                            }
+                            self.geojson_parse_errors.set(failures);
+                            if failures > 0 {
+                                web_sys::console::warn_1(&JsValue::from_str(&format!(
+                                    "rustyleaf: {} of {} GeoJSON features failed to parse ({} loaded)",
+                                    failures,
+                                    features_array.len(),
+                                    features.len()
+                                )));
                             }
                         } else {
                             web_sys::console::log_1(&"No features array found in FeatureCollection".into());
                         }
                     },
                     "Feature" => {
-                        if let Ok(feature) = self.parse_geojson_feature(geojson_value) {
-                            features.push(feature);
+                        match self.parse_geojson_feature(geojson_value) {
+                            Ok(feature) => {
+                                features.push(feature);
+                                self.geojson_parse_errors.set(0);
+                            }
+                            Err(e) => {
+                                self.geojson_parse_errors.set(1);
+                                web_sys::console::warn_1(&JsValue::from_str(&format!(
+                                    "rustyleaf: 1 of 1 GeoJSON features failed to parse: {:?}",
+                                    e.as_string().unwrap_or_else(|| format!("{:?}", e))
+                                )));
+                            }
                         }
                     },
                     _ => {
@@ -2463,6 +2858,12 @@ impl RustyleafMap {
                                 id: None,
                             };
                             features.push(feature);
+                            self.geojson_parse_errors.set(0);
+                        } else {
+                            self.geojson_parse_errors.set(1);
+                            web_sys::console::warn_1(&JsValue::from_str(
+                                "rustyleaf: GeoJSON geometry failed to parse",
+                            ));
                         }
                     },
                 }
@@ -2705,8 +3106,8 @@ impl RustyleafMap {
                     if !polygon_rings.is_empty() && polygon_rings[0].len() >= 3 {
                         let tris = self.triangulate_polygon_with_holes_lyon(&polygon_rings);
                         cached_polygon_triangles.extend(tris);
-                        // Interior hit-testing record (outer ring + properties)
-                        cached_polygon_hits.push(PolygonHit { outer_ring: polygon_rings[0].clone(), meta: feature.properties.clone() });
+                        // Interior hit-testing record (outer ring + holes + properties)
+                        cached_polygon_hits.push(PolygonHit { outer_ring: polygon_rings[0].clone(), holes: polygon_rings[1..].to_vec(), meta: feature.properties.clone() });
                         // Add outline from outer ring
                         cached_lines.push(LineFeature { points: polygon_rings[0].clone(), color: style.line_color, width: style.line_width, meta: feature.properties.clone() });
                     }
@@ -2717,7 +3118,7 @@ impl RustyleafMap {
                         if !polygon_rings.is_empty() && polygon_rings[0].len() >= 3 {
                             let tris = self.triangulate_polygon_with_holes_lyon(&polygon_rings);
                             cached_polygon_triangles.extend(tris);
-                            cached_polygon_hits.push(PolygonHit { outer_ring: polygon_rings[0].clone(), meta: feature.properties.clone() });
+                            cached_polygon_hits.push(PolygonHit { outer_ring: polygon_rings[0].clone(), holes: polygon_rings[1..].to_vec(), meta: feature.properties.clone() });
                             // Outline
                             cached_lines.push(LineFeature { points: polygon_rings[0].clone(), color: style.line_color, width: style.line_width, meta: feature.properties.clone() });
                         }
@@ -2746,10 +3147,8 @@ impl RustyleafMap {
             }
 
             {
-                let old_poly_buf = self.geojson_layers[layer_index].polygon_vertex_buffer.borrow_mut().take();
-                if let Some(buf) = old_poly_buf {
-                    context.delete_buffer(Some(buf.inner()));
-                }
+                // Take + drop; OwnedBuffer::Drop deletes exactly once (R-22).
+                drop(self.geojson_layers[layer_index].polygon_vertex_buffer.borrow_mut().take());
             }
 
             if !vertex_data.is_empty() {
@@ -2783,10 +3182,8 @@ impl RustyleafMap {
             }
 
             {
-                let old_line_buf = self.geojson_layers[layer_index].line_vertex_buffer.borrow_mut().take();
-                if let Some(buf) = old_line_buf {
-                    context.delete_buffer(Some(buf.inner()));
-                }
+                // Take + drop; OwnedBuffer::Drop deletes exactly once (R-22).
+                drop(self.geojson_layers[layer_index].line_vertex_buffer.borrow_mut().take());
             }
 
             if !line_vertex_data.is_empty() {
@@ -2859,14 +3256,21 @@ impl RustyleafMap {
         let mut geometry: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
         let mut tess = FillTessellator::new();
         let opts = FillOptions::tolerance(0.05);
-        if tess.tessellate_path(
+        if let Err(e) = tess.tessellate_path(
             &path,
             &opts,
             &mut BuffersBuilder::new(&mut geometry, |v: FillVertex| {
                 let p = v.position();
                 [p.x, p.y]
             }),
-        ).is_err() { return Vec::new(); }
+        ) {
+            // Log instead of silently vanishing the polygon (R-20).
+            web_sys::console::warn_1(&JsValue::from_str(&format!(
+                "rustyleaf: polygon tessellation failed, dropping polygon: {:?}",
+                e
+            )));
+            return Vec::new();
+        }
 
         let mut out: Vec<[f64; 2]> = Vec::with_capacity(geometry.indices.len());
         for idx in geometry.indices {
@@ -2938,10 +3342,14 @@ impl PointLayerApi {
 
         for i in 0..points_array.length() {
             let point_obj = points_array.get(i);
-            let lat = js_sys::Reflect::get(&point_obj, &JsValue::from_str("lat"))?
-                .as_f64().unwrap_or(0.0);
-            let lng = js_sys::Reflect::get(&point_obj, &JsValue::from_str("lng"))?
-                .as_f64().unwrap_or(0.0);
+            let lat = match js_sys::Reflect::get(&point_obj, &JsValue::from_str("lat"))?.as_f64() {
+                Some(v) if v.is_finite() => v,
+                _ => continue,
+            };
+            let lng = match js_sys::Reflect::get(&point_obj, &JsValue::from_str("lng"))?.as_f64() {
+                Some(v) if v.is_finite() => v,
+                _ => continue,
+            };
             let size = js_sys::Reflect::get(&point_obj, &JsValue::from_str("size"))?
                 .as_f64().unwrap_or(5.0) as f32;
 

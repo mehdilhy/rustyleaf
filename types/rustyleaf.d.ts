@@ -30,6 +30,7 @@ export interface LatLngBoundsValue extends Array<number[] | LatLngValue> {
   getSouth(): number | undefined;
   getEast(): number | undefined;
   getNorth(): number | undefined;
+  extend(value: LatLngLike | LatLngBoundsLike): LatLngBoundsValue;
   contains(value: LatLngLike | LatLngBoundsLike): boolean;
   intersects(value: LatLngBoundsLike): boolean;
   overlaps(value: LatLngBoundsLike): boolean;
@@ -54,17 +55,24 @@ export interface PointValue extends Array<number> {
   round(): PointValue;
   floor(): PointValue;
   ceil(): PointValue;
+  trunc(): PointValue;
   distanceTo(other: PointLike): number;
   equals(other: PointLike): boolean;
   contains(other: PointLike): boolean;
   toArray(): number[];
+  toString(): string;
 }
 export type PointLike = [number, number] | PointValue | { x: number; y: number };
 export interface BoundsValue extends Array<number[][] | PointValue[]> {
   min: PointValue | null;
   max: PointValue | null;
   isValid(): boolean;
+  extend(value: PointLike | BoundsLike): BoundsValue;
   getCenter(round?: boolean): PointValue | null;
+  getBottomLeft(): PointValue | null;
+  getTopRight(): PointValue | null;
+  getTopLeft(): PointValue | null;
+  getBottomRight(): PointValue | null;
   getSize(): PointValue;
   contains(value: PointLike | BoundsLike): boolean;
   intersects(value: BoundsLike): boolean;
@@ -72,6 +80,7 @@ export interface BoundsValue extends Array<number[][] | PointValue[]> {
   pad(bufferRatio: number): BoundsValue;
   equals(value: BoundsLike): boolean;
   toArray(): number[][];
+  toString(): string;
 }
 export type BoundsLike = BoundsValue | [PointLike, PointLike] | PointLike[];
 
@@ -332,10 +341,17 @@ export declare class Map {
   constructor(container: string | HTMLElement, options?: MapOptions);
 
   setView(latlng: LatLngLike, zoom: number): this;
+  setZoom(zoom: number): this;
+  panTo(latlng: LatLngLike): this;
   panBy(dx: number, dy: number): this;
   panBy(offset: PointLike): this;
   zoomIn(delta?: number): this;
   zoomOut(delta?: number): this;
+  closePopup(): this;
+  closeTooltip(): this;
+  eachLayer(fn: (layer: GroupableLayer) => void, context?: any): this;
+  containerPointToLayerPoint(point: PointLike): PointValue;
+  layerPointToContainerPoint(point: PointLike): PointValue;
   getWebGLSupport(): WebGLSupportInfo;
   getCenter(): LatLngValue;
   getZoom(): number;
@@ -348,6 +364,8 @@ export declare class Map {
   flyTo(latlng: LatLngLike, zoom?: number, options?: { duration?: number }): this;
   flyTo(latlng: LatLngLike, options?: { zoom?: number; duration?: number }): this;
   flyToBounds(bounds: LatLngBoundsLike, options?: { maxZoom?: number; duration?: number }): this;
+  addControl(control: Control): this;
+  removeControl(control: Control): this;
   setMaxBounds(bounds: LatLngBoundsLike | null): this;
   getMaxBounds(): LatLngBoundsValue | null;
   invalidateSize(): this;
@@ -387,6 +405,7 @@ export declare class Map {
    */
   on(event: string, callback: (...args: any[]) => void): this;
   off(event: string, callback: (...args: any[]) => void): this;
+  once(event: string, callback: (...args: any[]) => void, context?: any): this;
   remove(): this;
   destroy(): this;
 
@@ -467,6 +486,8 @@ export declare class LineLayer {
   add(lines: LineFeature[]): this;
   clear(): this;
   on(event: 'click' | 'hover', callback: (...args: any[]) => void): this;
+  off(event: string, callback?: (...args: any[]) => void): this;
+  fire(event: string, data?: any): this;
   addTo(map: Map): this;
   remove(): this;
   getLatLngs(): LatLngValue[][];
@@ -488,6 +509,8 @@ export declare class PolygonLayer {
   add(polygons: PolygonFeature[]): this;
   clear(): this;
   on(event: 'click' | 'hover', callback: (...args: any[]) => void): this;
+  off(event: string, callback?: (...args: any[]) => void): this;
+  fire(event: string, data?: any): this;
   addTo(map: Map): this;
   remove(): this;
   getLatLngs(): LatLngValue[][][];
@@ -663,6 +686,7 @@ export declare class Tooltip {
   isOpen(): boolean;
   isOpenTooltip(): boolean;
   getElement(): HTMLElement | null;
+  bindTo(layer: any, content: any): this;
 }
 
 // ==================== Controls ====================
@@ -889,5 +913,6 @@ declare const _default: {
   latLngBounds: typeof latLngBounds;
   point: typeof point;
   bounds: typeof bounds;
+  wrapNum: typeof wrapNum;
 };
 export default _default;

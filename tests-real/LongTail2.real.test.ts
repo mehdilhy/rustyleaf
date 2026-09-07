@@ -182,14 +182,18 @@ describe('Canvas input handler tails (real source)', () => {
     marker.on('drag', () => events.push('drag'));
     marker.on('dragend', () => events.push('dragend'));
 
-    // screen_xy mock projects every latlng to canvas px [400, 300].
+    // The wasm mock projects the default center to canvas px [400, 300].
     canvas.dispatchEvent(mouseEvent('mousedown', { clientX: 400, clientY: 300 }));
     expect(canvas.style.cursor).toBe('move');
     expect(events).toEqual(['dragstart']);
 
     document.dispatchEvent(mouseEvent('mousemove', { clientX: 420, clientY: 290 }));
     expect(events).toEqual(['dragstart', 'drag']);
-    expect(marker.getLatLng()).toEqual([48.8566, 2.3522]); // unproject mock value
+    // Derived from the input-aware wasm mock: unproject([420, 290]) inverts the
+    // relative project mapping (100 px/deg about [48.8566, 2.3522] → [400, 300]).
+    const ll = marker.getLatLng();
+    expect(ll[0]).toBeCloseTo(48.9566, 4);
+    expect(ll[1]).toBeCloseTo(2.5522, 4);
 
     document.dispatchEvent(mouseEvent('mouseup', { clientX: 420, clientY: 290 }));
     expect(events).toEqual(['dragstart', 'drag', 'dragend']);

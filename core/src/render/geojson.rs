@@ -6,9 +6,9 @@ use crate::layers::point::PointFeature;
 use crate::layers::line::LineFeature;
 use crate::layers::polygon::PolygonFeature;
 use crate::layers::geojson::{GeoJSONLayer, GeoJSONGeometry};
-use crate::projection::Viewport;
+use crate::projection::{Viewport, clamp_zoom};
 use crate::WebGlState;
-use super::polygons::triangulate_polygon;
+use super::polygons::{triangulate_polygon_with_holes_lyon, decimate_ring_shared, capped_draw_count};
 
 pub struct GeoJsonRenderCtx<'a> {
     pub context: &'a WebGl2RenderingContext,
@@ -30,7 +30,7 @@ impl<'a> GeoJsonRenderCtx<'a> {
     }
 
     fn zoom_round(&self) -> u32 {
-        self.viewport.zoom.round() as u32
+        clamp_zoom(self.viewport.zoom)
     }
 }
 
@@ -235,7 +235,7 @@ pub fn render_geojson_points(ctx: &GeoJsonRenderCtx, points: &[PointFeature]) ->
             context.uniform1f(Some(loc), 1.0);
         }
 
-        context.draw_arrays(WebGl2RenderingContext::POINTS, 0, points.len() as i32);
+        context.draw_arrays(WebGl2RenderingContext::POINTS, 0, capped_draw_count(points.len()));
     }
 
     Ok(())
@@ -275,11 +275,11 @@ pub fn draw_geojson_line_gpu(ctx: &GeoJsonRenderCtx, layer: &GeoJSONLayer) -> Re
     }
     if let Some(ref loc) = gl_state.line_u_world_scale {
         let zoom = ctx.zoom_round();
-        let world_scale = ctx.viewport.tile_size as f32 * (1u32 << zoom) as f32;
-        context.uniform1f(Some(loc), world_scale);
+        let world_scale_f64 = ctx.viewport.tile_size as f64 * (1u64 << zoom) as f64;
+        context.uniform1f(Some(loc), world_scale_f64 as f32);
     }
 
-    let total_vertices = layer.line_vertex_count.get() as i32;
+    let total_vertices = capped_draw_count(layer.line_vertex_count.get());
     if total_vertices > 0 {
         context.draw_arrays(WebGl2RenderingContext::LINES, 0, total_vertices);
     }
@@ -346,12 +346,12 @@ pub fn render_geojson_lines(ctx: &GeoJsonRenderCtx, lines: &[LineFeature]) -> Re
         }
         if let Some(ref loc) = gl_state.line_u_world_scale {
             let zoom = ctx.zoom_round();
-            let world_scale = ctx.viewport.tile_size as f32 * (1u32 << zoom) as f32;
-            context.uniform1f(Some(loc), world_scale);
+            let world_scale_f64 = ctx.viewport.tile_size as f64 * (1u64 << zoom) as f64;
+            context.uniform1f(Some(loc), world_scale_f64 as f32);
         }
 
         let total_vertices = vertex_data.len() / 6;
-        context.draw_arrays(WebGl2RenderingContext::LINES, 0, total_vertices as i32);
+        context.draw_arrays(WebGl2RenderingContext::LINES, 0, capped_draw_count(total_vertices));
     }
 
     Ok(())
@@ -391,11 +391,11 @@ pub fn draw_geojson_polygon_gpu(ctx: &GeoJsonRenderCtx, layer: &GeoJSONLayer) ->
     }
     if let Some(ref loc) = gl_state.polygon_u_world_scale {
         let zoom = ctx.zoom_round();
-        let world_scale = ctx.viewport.tile_size as f32 * (1u32 << zoom) as f32;
-        context.uniform1f(Some(loc), world_scale);
+        let world_scale_f64 = ctx.viewport.tile_size as f64 * (1u64 << zoom) as f64;
+        context.uniform1f(Some(loc), world_scale_f64 as f32);
     }
 
-    let total_vertices = layer.polygon_vertex_count.get() as i32;
+    let total_vertices = capped_draw_count(layer.polygon_vertex_count.get());
     if total_vertices > 0 {
         context.draw_arrays(WebGl2RenderingContext::TRIANGLES, 0, total_vertices);
     }
@@ -416,37 +416,46 @@ pub fn render_geojson_polygons(ctx: &GeoJsonRenderCtx, polygons: &[PolygonFeatur
         if polygon.rings.is_empty() {
             continue;
         }
+        if polygon.rings[0].len() < 3 {
+            continue;
+        }
 
+        // Hole-aware Lyon tessellation (R-12) so holes render as holes, matching
+        // the cached path. Rings over 100k vertices are decimated (R-19) with a
+        // console warning instead of being silently dropped.
+        let mut rings: Vec<Vec<[f64; 2]>> = Vec::with_capacity(polygon.rings.len());
         for ring in &polygon.rings {
             if ring.len() < 3 {
                 continue;
             }
-
-            // Ear clipping is O(n^2); 100k vertices is the practical ceiling.
-            // Previously anything over 1_000 was silently dropped, losing
-            // detailed coastlines/boundaries without any error.
             if ring.len() > 100_000 {
-                continue;
+                web_sys::console::warn_1(&JsValue::from_str(
+                    "rustyleaf: oversized polygon ring decimated for fallback triangulation",
+                ));
+                rings.push(decimate_ring_shared(ring));
+            } else {
+                rings.push(ring.clone());
             }
+        }
+        if rings.is_empty() || rings[0].len() < 3 {
+            continue;
+        }
+        let triangles = triangulate_polygon_with_holes_lyon(&rings);
 
-            let triangles = triangulate_polygon(ring);
+        for triangle in triangles.chunks(3) {
+            if triangle.len() == 3 {
+                for &[lat, lng] in triangle {
+                    let screen_pos = ctx.viewport.lat_lng_to_screen(lat, lng);
+                    vertex_data.extend_from_slice(&[
+                        screen_pos.0 as f32, screen_pos.1 as f32,
+                        polygon.color[0], polygon.color[1], polygon.color[2], polygon.color[3],
+                    ]);
 
-            for triangle in triangles.chunks(3) {
-                if triangle.len() == 3 {
-                    for &[lat, lng] in triangle {
-                        let screen_pos = ctx.viewport.lat_lng_to_screen(lat, lng);
-                        vertex_data.extend_from_slice(&[
-                            screen_pos.0 as f32, screen_pos.1 as f32,
-                            polygon.color[0], polygon.color[1], polygon.color[2], polygon.color[3],
-                        ]);
-
-                        if vertex_data.len() > MAX_VERTICES * 6 {
-                            break;
-                        }
+                    if vertex_data.len() > MAX_VERTICES * 6 {
+                        break;
                     }
                 }
             }
-
             if vertex_data.len() > MAX_VERTICES * 6 {
                 break;
             }
@@ -490,7 +499,7 @@ pub fn render_geojson_polygons(ctx: &GeoJsonRenderCtx, polygons: &[PolygonFeatur
         }
 
         let total_vertices = vertex_data.len() / 6;
-        context.draw_arrays(WebGl2RenderingContext::TRIANGLES, 0, total_vertices as i32);
+        context.draw_arrays(WebGl2RenderingContext::TRIANGLES, 0, capped_draw_count(total_vertices));
     }
 
     Ok(())
@@ -545,7 +554,7 @@ pub fn render_geojson_polygon_triangles(ctx: &GeoJsonRenderCtx, triangles: &[[f6
         }
 
         let total_vertices = vertex_data.len() / 6;
-        context.draw_arrays(WebGl2RenderingContext::TRIANGLES, 0, total_vertices as i32);
+        context.draw_arrays(WebGl2RenderingContext::TRIANGLES, 0, capped_draw_count(total_vertices));
     }
 
     Ok(())

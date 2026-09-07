@@ -3,7 +3,8 @@ use web_sys::WebGl2RenderingContext;
 use js_sys::Float32Array;
 
 use crate::layers::point::PointLayer;
-use crate::projection::Viewport;
+use crate::projection::{Viewport, clamp_zoom};
+use crate::render::polygons::capped_draw_count;
 use crate::{WebGlState, OwnedBuffer};
 
 pub fn render_points(
@@ -28,11 +29,15 @@ pub fn render_points(
         context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
     }
 
-    let zoom = viewport.zoom.round() as u32;
+    let zoom = clamp_zoom(viewport.zoom);
     let center_pixel = viewport.lat_lng_to_pixel(viewport.center_lat, viewport.center_lng, zoom);
-    let origin_x = (center_pixel.0 - viewport.width as f64 / 2.0) as f32;
-    let origin_y = (center_pixel.1 - viewport.height as f64 / 2.0) as f32;
-    let world_scale = viewport.tile_size as f32 * (1u32 << zoom) as f32;
+    // f64 on CPU (R-28); cast to f32 only at uniform upload below.
+    let origin_x_f64 = center_pixel.0 - viewport.width as f64 / 2.0;
+    let origin_y_f64 = center_pixel.1 - viewport.height as f64 / 2.0;
+    let world_scale_f64 = viewport.tile_size as f64 * (1u64 << zoom) as f64;
+    let origin_x = origin_x_f64 as f32;
+    let origin_y = origin_y_f64 as f32;
+    let world_scale = world_scale_f64 as f32;
 
     if let Some(loc) = gl_state.point_u_origin.as_ref() {
         context.uniform2f(Some(loc), origin_x, origin_y);
@@ -101,6 +106,11 @@ pub fn render_points(
                 &vertices,
                 WebGl2RenderingContext::STATIC_DRAW,
             );
+            // Keep the CPU shadow in lockstep with the GPU buffer (issue #16):
+            // append_points_packed grows/re-uploads from this shadow, so a
+            // stale (empty) shadow would discard previously rendered points
+            // or write past an exact-size buffer.
+            *layer.gpu_shadow.borrow_mut() = vertex_data;
             layer.vertex_count.set(layer.points.len());
             layer.gpu_dirty.set(false);
         }
@@ -151,7 +161,7 @@ pub fn render_points(
             draw_count = INTERACTION_MAX;
         }
 
-        context.draw_arrays(WebGl2RenderingContext::POINTS, 0, draw_count as i32);
+        context.draw_arrays(WebGl2RenderingContext::POINTS, 0, capped_draw_count(draw_count));
     }
 
     Ok(())

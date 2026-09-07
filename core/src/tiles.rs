@@ -6,7 +6,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
-use crate::projection::Viewport;
+use crate::projection::{Viewport, clamp_zoom};
 use crate::error::RustyleafError;
 use crate::OwnedTexture;
 
@@ -86,7 +86,10 @@ impl TileLoader {
     }
 
     pub fn cleanup_old_tiles(&mut self, viewport: &Viewport) {
-        let current_zoom = viewport.zoom.round() as u32;
+        self.cleanup_old_tiles_at_zoom(viewport, clamp_zoom(viewport.zoom));
+    }
+
+    fn cleanup_old_tiles_at_zoom(&mut self, viewport: &Viewport, current_zoom: u32) {
         let visible_keys = visible_tile_keys(viewport, current_zoom);
         // Keep one adjacent zoom level so render_tiles can use it as a visual
         // fallback while the current tiles are in flight.
@@ -164,8 +167,17 @@ impl TileLoader {
         context: &WebGl2RenderingContext,
         tile_size: u32,
     ) {
-        self.cleanup_old_tiles(viewport);
-        let zoom = viewport.zoom.round() as u32;
+        // Clamp to the layer's configured min/max zoom (R-26) so over-zoom
+        // never fetches nonexistent tiles (404 storm) and under-zoom clamps.
+        let raw_zoom = clamp_zoom(viewport.zoom);
+        let zoom = if tile_layer.min_zoom <= tile_layer.max_zoom {
+            raw_zoom.clamp(tile_layer.min_zoom, tile_layer.max_zoom)
+        } else {
+            raw_zoom
+        };
+        // Evict against the same effective zoom the load below uses, so
+        // clamped tiles are not immediately discarded as out-of-range.
+        self.cleanup_old_tiles_at_zoom(viewport, zoom);
         let center_pixel =
             viewport.lat_lng_to_pixel(viewport.center_lat, viewport.center_lng, zoom);
 
@@ -292,6 +304,7 @@ impl TileLoader {
         let context_clone = context.clone();
         let tile_textures = Rc::clone(&self.textures);
         let generation_cell = Rc::clone(&self.texture_generation);
+        let failed_set_clone = Rc::clone(&self.failed);
 
         let onload_closure = Closure::wrap(Box::new(move || {
             let texture = match context_clone.create_texture() {
@@ -342,6 +355,18 @@ impl TileLoader {
                     .insert(tile_key_clone.clone(), OwnedTexture::new(&context_clone, texture));
                 // Signal the render loop that a fresh tile needs a frame.
                 generation_cell.set(generation_cell.get() + 1);
+            } else {
+                // Delete the orphaned GL texture (R-21) and record the failure
+                // so the tile is retried after the backoff instead of leaking
+                // one texture per bad tile.
+                context_clone.delete_texture(Some(&texture));
+                web_sys::console::warn_1(&JsValue::from_str(&format!(
+                    "Tile upload failed, will retry: {}",
+                    tile_key_clone
+                )));
+                failed_set_clone
+                    .borrow_mut()
+                    .insert(tile_key_clone.clone(), js_sys::Date::now());
             }
         }) as Box<dyn FnMut()>);
 

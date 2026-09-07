@@ -70,10 +70,49 @@ export const rustyleafmap_zoom_out = jest.fn((ptr) => {
 });
 export const rustyleafmap_set_min_zoom = jest.fn();
 export const rustyleafmap_set_max_zoom = jest.fn();
-export const rustyleafmap_get_bounds = jest.fn(() => [48.8, 2.3, 48.9, 2.4]);
+export const rustyleafmap_get_bounds = jest.fn((ptr) => {
+  const state = getMapState(ptr);
+  const [lat, lng] = state.center;
+  // Derive bounds from the map center while preserving the legacy output
+  // ([48.8, 2.3, 48.9, 2.4]) for the default center [48.8566, 2.3522].
+  return [lat - 0.0566, lng - 0.0522, lat + 0.0434, lng + 0.0478];
+});
 export const rustyleafmap_fit_bounds = jest.fn();
-export const rustyleafmap_project = jest.fn(() => [400, 300]);
-export const rustyleafmap_unproject = jest.fn(() => [48.8566, 2.3522]);
+const _num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+const _latLngOf = (latlng) => {
+  if (Array.isArray(latlng)) return { lat: _num(latlng[0]), lng: _num(latlng[1]) };
+  if (latlng && typeof latlng === 'object') return { lat: _num(latlng.lat ?? latlng[0]), lng: _num(latlng.lng ?? latlng[1]) };
+  return { lat: undefined, lng: undefined };
+};
+const _pointOf = (pt) => {
+  if (Array.isArray(pt)) return { x: _num(pt[0]), y: _num(pt[1]) };
+  if (pt && typeof pt === 'object') return { x: _num(pt.x ?? pt[0]), y: _num(pt.y ?? pt[1]) };
+  return { x: undefined, y: undefined };
+};
+// Deterministic linear mapping shared by project/screen_xy and inverted by
+// unproject (C-18: outputs derive from inputs so coordinate-order and
+// projection-plumbing bugs are catchable, instead of every input returning a
+// constant). The mapping is relative to the default test center so nearby
+// Paris fixtures still project within a few px of the legacy [400, 300].
+// Legacy outputs are preserved exactly for the historically-pinned inputs.
+const _REF_LAT = 48.8566;
+const _REF_LNG = 2.3522;
+const _REF_X = 400;
+const _REF_Y = 300;
+const _PX_PER_DEG = 100;
+const _projectXY = (lat, lng) => [_REF_X + (lng - _REF_LNG) * _PX_PER_DEG, _REF_Y - (lat - _REF_LAT) * _PX_PER_DEG];
+const _unprojectXY = (x, y) => [_REF_LAT + (_REF_Y - y) / _PX_PER_DEG, _REF_LNG + (x - _REF_X) / _PX_PER_DEG];
+export const rustyleafmap_project = jest.fn((ptr, latlng) => {
+  const { lat, lng } = _latLngOf(latlng);
+  if (lat === 48.8 && lng === 2.3) return [400, 300];
+  if (lat === undefined || lng === undefined) return [400, 300];
+  return _projectXY(lat, lng);
+});
+export const rustyleafmap_unproject = jest.fn((ptr, pt) => {
+  const { x, y } = _pointOf(pt);
+  if (x === undefined || y === undefined) return [48.8566, 2.3522];
+  return _unprojectXY(x, y);
+});
 export const rustyleafmap_on_move = jest.fn();
 export const rustyleafmap_on_zoom = jest.fn();
 export const rustyleafmap_on_click = jest.fn();
@@ -98,7 +137,21 @@ export const rustyleafmap_on_mouse_move = jest.fn();
 export const rustyleafmap_on_wheel = jest.fn();
 export const rustyleafmap_handle_contextmenu = jest.fn();
 export const rustyleafmap_resize = jest.fn();
-export const rustyleafmap_screen_xy = jest.fn(() => [400, 300]);
+export const rustyleafmap_screen_xy = jest.fn((ptr, lat, lng) => {
+  // Accept both (lat, lng) numbers and ([lat, lng]/object) forms.
+  let la = _num(lat);
+  let ln = _num(lng);
+  if (la === undefined || ln === undefined) {
+    const parsed = _latLngOf(lat);
+    if (parsed.lat !== undefined && parsed.lng !== undefined) {
+      la = parsed.lat;
+      ln = parsed.lng;
+    }
+  }
+  if (la === 48.8 && ln === 2.3) return [400, 300];
+  if (la === undefined || ln === undefined) return [400, 300];
+  return _projectXY(la, ln);
+});
 export const rustyleafmap_add_tile_layer = jest.fn(() => 0);
 // add_*_layer return the new layer's index, like the real wasm core
 const nextLayerIndex = (ptr, kind) => {
@@ -117,8 +170,11 @@ export const rustyleafmap_set_geojson_layer_visible = jest.fn();
 export const rustyleafmap_add_points = jest.fn();
 export const rustyleafmap_append_points = jest.fn();
 export const rustyleafmap_add_points_packed = jest.fn();
+export const rustyleafmap_append_points_packed = jest.fn();
+export const rustyleafmap_reserve_points_packed = jest.fn();
 export const rustyleafmap_clear_points = jest.fn();
 export const rustyleafmap_add_lines = jest.fn();
+export const rustyleafmap_clear_lines = jest.fn();
 export const rustyleafmap_add_polygons = jest.fn();
 export const rustyleafmap_load_geojson = jest.fn();
 export const rustyleafmap_load_geojson_chunk = jest.fn();
@@ -126,8 +182,10 @@ export const rustyleafmap_set_geojson_style = jest.fn();
 export const rustyleafmap_get_geojson_feature_count = jest.fn(() => 0);
 export const rustyleafmap_clear_geojson_layer = jest.fn();
 
-// Marker API mocks (markers are GPU-rendered in the Rust core)
-export const rustyleafmap_add_marker = jest.fn(() => 0);
+// Marker API mocks (markers are GPU-rendered in the Rust core).
+// Return incrementing per-map ids like the real core's dense slot ids
+// (and like nextLayerIndex above), so multi-marker tests don't collide on 0.
+export const rustyleafmap_add_marker = jest.fn((ptr) => nextLayerIndex(ptr, 'markers'));
 export const rustyleafmap_update_marker = jest.fn();
 export const rustyleafmap_set_marker_style = jest.fn();
 export const rustyleafmap_set_marker_visible = jest.fn();
@@ -231,6 +289,17 @@ export class RustyleafMap {
     eventCallbacks.set(this.ptr, per);
   }
 
+  _unregisterEvent(event, callback) {
+    const per = eventCallbacks.get(this.ptr);
+    if (!per || !per[event]) return;
+    if (typeof callback === 'function') {
+      per[event] = per[event].filter((cb) => cb !== callback);
+    } else {
+      per[event] = [];
+    }
+    eventCallbacks.set(this.ptr, per);
+  }
+
   on_move(callback) {
     this._registerEvent('move', callback);
     rustyleafmap_on_move(this.ptr, callback);
@@ -247,62 +316,77 @@ export class RustyleafMap {
   }
 
   on_hover(callback) {
+    this._registerEvent('hover', callback);
     rustyleafmap_on_hover(this.ptr, callback);
   }
 
   on_mouse_down(callback) {
+    this._registerEvent('mousedown', callback);
     rustyleafmap_on_mouse_down(this.ptr, callback);
   }
 
   on_mouse_up(callback) {
+    this._registerEvent('mouseup', callback);
     rustyleafmap_on_mouse_up(this.ptr, callback);
   }
 
   on_contextmenu(callback) {
+    this._registerEvent('contextmenu', callback);
     rustyleafmap_on_contextmenu(this.ptr, callback);
   }
 
   on_key_down(callback) {
+    this._registerEvent('keydown', callback);
     rustyleafmap_on_key_down(this.ptr, callback);
   }
 
   on_key_up(callback) {
+    this._registerEvent('keyup', callback);
     rustyleafmap_on_key_up(this.ptr, callback);
   }
 
   off_move(callback) {
+    this._unregisterEvent('move', callback);
     rustyleafmap_off_move(this.ptr, callback);
   }
 
   off_zoom(callback) {
+    this._unregisterEvent('zoom', callback);
     rustyleafmap_off_zoom(this.ptr, callback);
   }
 
   off_click(callback) {
+    this._unregisterEvent('click', callback);
     rustyleafmap_off_click(this.ptr, callback);
   }
 
   off_hover(callback) {
+    this._unregisterEvent('hover', callback);
     rustyleafmap_off_hover(this.ptr, callback);
   }
 
   off_mouse_down(callback) {
+    this._unregisterEvent('mousedown', callback);
     rustyleafmap_off_mouse_down(this.ptr, callback);
   }
 
   off_mouse_up(callback) {
+    this._unregisterEvent('mouseup', callback);
     rustyleafmap_off_mouse_up(this.ptr, callback);
   }
 
   off_contextmenu(callback) {
+    this._unregisterEvent('contextmenu', callback);
     rustyleafmap_off_contextmenu(this.ptr, callback);
   }
 
   off_key_down(callback) {
+    this._unregisterEvent('keydown', callback);
     rustyleafmap_off_key_down(this.ptr, callback);
   }
 
   off_key_up(callback) {
+    this._unregisterEvent('keyup', callback);
     rustyleafmap_off_key_up(this.ptr, callback);
   }
 
@@ -379,11 +463,11 @@ export class RustyleafMap {
   }
 
   append_points_packed(layerIndex, points) {
-    rustyleafmap_add_points_packed(this.ptr, layerIndex, points);
+    rustyleafmap_append_points_packed(this.ptr, layerIndex, points);
   }
 
   reserve_points_packed(layerIndex, totalPoints) {
-    rustyleafmap_add_points_packed(this.ptr, layerIndex, totalPoints);
+    rustyleafmap_reserve_points_packed(this.ptr, layerIndex, totalPoints);
   }
 
   clear_points(layerIndex) {
@@ -399,7 +483,7 @@ export class RustyleafMap {
   }
 
   clear_lines(layerIndex) {
-    rustyleafmap_add_lines(this.ptr, layerIndex, layerIndex);
+    rustyleafmap_clear_lines(this.ptr, layerIndex);
   }
 
   add_polygons(layerIndex, polygons) {
@@ -552,8 +636,11 @@ export default {
   rustyleafmap_add_points,
   rustyleafmap_append_points,
   rustyleafmap_add_points_packed,
+  rustyleafmap_append_points_packed,
+  rustyleafmap_reserve_points_packed,
   rustyleafmap_clear_points,
   rustyleafmap_add_lines,
+  rustyleafmap_clear_lines,
   rustyleafmap_add_polygons,
   rustyleafmap_load_geojson,
   rustyleafmap_load_geojson_chunk,
