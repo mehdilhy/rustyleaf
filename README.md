@@ -18,7 +18,7 @@
 
 <p align="center">
   <a href="https://github.com/mehdilhy/rustyleaf/actions"><img src="https://img.shields.io/github/actions/workflow/status/mehdilhy/rustyleaf/ci.yml?branch=main&label=CI" alt="CI"></a>
-  <img src="https://img.shields.io/badge/tests-824%20passing-brightgreen" alt="tests passing">
+  <img src="https://img.shields.io/badge/tests-826%20passing-brightgreen" alt="tests passing">
   <img src="https://img.shields.io/badge/coverage-100%25%20lines-success" alt="coverage: 100% lines">
   <img src="https://img.shields.io/badge/coverage-95.3%25%20branches-brightgreen" alt="coverage: 95.3% branches">
   <img src="https://img.shields.io/badge/clippy-D%20warnings%20clean-success" alt="clippy clean">
@@ -33,7 +33,7 @@
   <img src="https://img.shields.io/badge/wasm%20core-1.5MB-8A2BE2" alt="wasm core 1.5MB">
 </p>
 
-> **Compatibility preview (v0.0.9).** Rustyleaf is intentionally API-compatible
+> **Compatibility preview (v0.0.10).** Rustyleaf is intentionally API-compatible
 > with common Leaflet workflows while its WebGL2 renderer and plugin surface
 > continue to mature. The documented surface is executable and covered by the
 > unit, parity, and end-to-end suites.
@@ -90,14 +90,17 @@ Leaflet-style) instead of showing empty gray past ±180°.
 - TypeScript definitions matching the actual runtime API
 - RAII-managed WebGL resources (textures, buffers, VAOs, programs are freed deterministically; verified by GL leak-detection e2e tests)
 
-## Known limitations (v0.0.9)
+## Known limitations (v0.0.10)
 
 - **WebGL2 required.** No Canvas2D or WebGL1 rendering fallback (`checkWebGLSupport`
   reports a WebGL1 "limited" level, but the renderer hard-requires a WebGL2
   context and refuses to start without one).
-- **Spherical Mercator only** — no custom CRS (EPSG:4326/3395, `SimpleCRS`).
-- Line width applies to `LineLayer`; GeoJSON-styled lines honor width only when
-  their GPU cache is built (the fallback non-cached path still draws 1px).
+- **Spherical Mercator only** — the map renders in mercator regardless of
+  `options.crs` (accepted but currently ignored); `CRS.EPSG4326`/`CRS.Simple`
+  exist only as coordinate helpers, not render paths.
+- Line width applies to `LineLayer` only (thick-line triangulation); GeoJSON
+  lines always draw 1px — the cached and non-cached GeoJSON paths both use
+  the 1px `LINES` primitive and ignore `width`.
 - No vector tiles.
 - Polygon *interiors* are hit-tested via point-in-polygon on the outer ring (holes aren't subtracted yet). `PointLayer`/`LineLayer`/`PolygonLayer` (non-GeoJSON) hit-test normally.
 - Line/polygon vertex data is cached in GPU buffers per layer, but heavy combined scenes still cost more than points alone.
@@ -202,7 +205,7 @@ cargo install wasm-pack
 npm install
 
 npm run build        # wasm-pack + webpack production build
-npm test             # Jest unit + parity tests (824 tests)
+npm test             # Jest unit + parity tests (826 tests)
 npm run lint         # ESLint
 npm run typecheck    # tsc --noEmit
 cargo clippy --manifest-path core/Cargo.toml --target wasm32-unknown-unknown -- -D warnings

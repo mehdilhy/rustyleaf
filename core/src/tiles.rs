@@ -85,10 +85,6 @@ impl TileLoader {
         }
     }
 
-    pub fn cleanup_old_tiles(&mut self, viewport: &Viewport) {
-        self.cleanup_old_tiles_at_zoom(viewport, clamp_zoom(viewport.zoom));
-    }
-
     fn cleanup_old_tiles_at_zoom(&mut self, viewport: &Viewport, current_zoom: u32) {
         let visible_keys = visible_tile_keys(viewport, current_zoom);
         // Keep one adjacent zoom level so render_tiles can use it as a visual

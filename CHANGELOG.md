@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.0.10 - 2026-09-07
+
+100-item bug-audit hardening across the JS API, Leaflet-compat layer, types,
+and Rust/WASM core (826/826 Jest tests, `tsc`/`cargo check`/eslint clean).
+
+### Fixed
+- **Compat math** — `Point`/`LatLng` index↔property sync, `asPoint`
+  fail-fast, strict `finiteNumber`, pole `cos()` floors (`toBounds`,
+  `Circle`), `wrap(180)` endpoint, `Transformation`/`CRS` guards, real
+  elliptical `Projection.Mercator`, total `equals`/`contains` predicates,
+  SSR-safe `DomUtil`/`DomEvent`.
+- **Lifecycle/leaks** — render loop survives a throwing frame, tracked
+  document listeners (drag/marker/box-zoom) and derived-event timers torn
+  down on `remove()`, owned controls removed with the map, `locate({watch})`
+  and `PointLayer.clear()` leaks plugged, GL probe contexts released.
+- **Correctness** — `Popup` honors `options.content`, marker re-add no longer
+  orphans GPU sprites, mounted-path `getLatLngs`/`getBounds` stay complete,
+  `LineLayer.setLatLngs` multi-line branch, `flyTo`/`getBoundsZoom`/
+  `unproject`/opacity/color validation, `LayersControl` reflects live map
+  state, `ImageOverlay` re-add semantics, `GridLayer`/`ScaleControl` guards.
+- **Loading** — `loadUrlStreaming` enforces `maxBytes` with a running total
+  and honors `signal`/`timeout`; `Util.template` and `WMSTileLayer.setParams`
+  hardened against prototype pollution.
+- **Rust core** — non-ASCII color panic, NaN GeoJSON coordinates, marker
+  style validation, `resize(0,0)`/oversize rejection, bounds wrapping,
+  antimeridian `fitBounds`, tile subdomain guard, BLEND in all render
+  passes, degenerate-triangle guard.
+- **Types** — `allowHTML`, `setParams`, `Control.onAdd/onRemove`, loader
+  options, `invokeFeatureMethod`, `L` namespace, documented `crs`-ignored.
+
 ## 0.0.9 - 2026-09-07
 
 First release published since 0.0.3 (0.0.4–0.0.8 lived only in git).

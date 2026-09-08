@@ -51,7 +51,7 @@ features:
   - icon: 🧪
     title: Honestly documented & tested
     details: >-
-      824 Jest unit and parity tests, a Playwright e2e suite (visual regression, GL leak
+      826 Jest unit and parity tests, a Playwright e2e suite (visual regression, GL leak
       detection, FPS, soak), and a reproducible benchmark. Nothing here is
       aspirational.
 
@@ -88,7 +88,7 @@ points.add(
 points.addTo(map)
 ```
 
-> **Compatibility preview (v0.0.9).** The documented Leaflet-style surface is
+> **Compatibility preview (v0.0.10).** The documented Leaflet-style surface is
 > covered by unit, parity, and end-to-end tests while the WebGL2 renderer and
 > plugin ecosystem continue to mature.
 
