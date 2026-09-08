@@ -111,6 +111,13 @@ use crate::projection::{Viewport, clamp_zoom};
 use crate::render::polygons::capped_draw_count;
 use crate::color::parse_color;
 
+// Size: use a tiny allocator instead of dlmalloc (~20-30KB saved).
+// WASM is single-threaded here, so the lock-free wrapper is safe + smaller.
+#[cfg(target_arch = "wasm32")]
+#[global_allocator]
+static ALLOC: lol_alloc::AssumeSingleThreaded<lol_alloc::FreeListAllocator> =
+    unsafe { lol_alloc::AssumeSingleThreaded::new(lol_alloc::FreeListAllocator::new()) };
+
 // Allocation / ingestion caps (R-6…R-10).
 /// Max pre-allocation for a single JS-array-driven `Vec::with_capacity`.
 const MAX_PREALLOC_ELEMS: usize = 1_000_000;
@@ -1174,50 +1181,46 @@ impl RustyleafMap {
         }
     }
 
-    fn trigger_click_event(&self, lat: f64, lng: f64, _original_event: Option<&web_sys::MouseEvent>) {
+    fn trigger_click_event(&self, lat: f64, lng: f64, _original_event: Option<JsValue>) {
         let latlng = Array::new();
         latlng.push(&JsValue::from_f64(lat));
         latlng.push(&JsValue::from_f64(lng));
         let point = self.project(&JsValue::from(latlng));
         let layer_point = self.layer_point_from_container(&point);
-        let original_js = _original_event.map(|e| JsValue::from(e.clone()));
-        if let Ok(event_obj) = create_click_event(lat, lng, &point, &layer_point, original_js.as_ref()) {
+        if let Ok(event_obj) = create_click_event(lat, lng, &point, &layer_point, _original_event.as_ref()) {
             trigger_event(&self.events.click_callbacks, &event_obj);
         }
     }
 
-    fn trigger_mousedown_event(&self, lat: f64, lng: f64, _original_event: Option<&web_sys::MouseEvent>) {
+    fn trigger_mousedown_event(&self, lat: f64, lng: f64, _original_event: Option<JsValue>) {
         let latlng = Array::new();
         latlng.push(&JsValue::from_f64(lat));
         latlng.push(&JsValue::from_f64(lng));
         let point = self.project(&JsValue::from(latlng));
         let layer_point = self.layer_point_from_container(&point);
-        let original_js = _original_event.map(|e| JsValue::from(e.clone()));
-        if let Ok(event_obj) = create_click_event(lat, lng, &point, &layer_point, original_js.as_ref()) {
+        if let Ok(event_obj) = create_click_event(lat, lng, &point, &layer_point, _original_event.as_ref()) {
             trigger_event(&self.events.mousedown_callbacks, &event_obj);
         }
     }
 
-    fn trigger_mouseup_event(&self, lat: f64, lng: f64, _original_event: Option<&web_sys::MouseEvent>) {
+    fn trigger_mouseup_event(&self, lat: f64, lng: f64, _original_event: Option<JsValue>) {
         let latlng = Array::new();
         latlng.push(&JsValue::from_f64(lat));
         latlng.push(&JsValue::from_f64(lng));
         let point = self.project(&JsValue::from(latlng));
         let layer_point = self.layer_point_from_container(&point);
-        let original_js = _original_event.map(|e| JsValue::from(e.clone()));
-        if let Ok(event_obj) = create_click_event(lat, lng, &point, &layer_point, original_js.as_ref()) {
+        if let Ok(event_obj) = create_click_event(lat, lng, &point, &layer_point, _original_event.as_ref()) {
             trigger_event(&self.events.mouseup_callbacks, &event_obj);
         }
     }
 
-    fn trigger_contextmenu_event(&self, lat: f64, lng: f64, _original_event: Option<&web_sys::MouseEvent>) {
+    fn trigger_contextmenu_event(&self, lat: f64, lng: f64, _original_event: Option<JsValue>) {
         let latlng = Array::new();
         latlng.push(&JsValue::from_f64(lat));
         latlng.push(&JsValue::from_f64(lng));
         let point = self.project(&JsValue::from(latlng));
         let layer_point = self.layer_point_from_container(&point);
-        let original_js = _original_event.map(|e| JsValue::from(e.clone()));
-        if let Ok(event_obj) = create_click_event(lat, lng, &point, &layer_point, original_js.as_ref()) {
+        if let Ok(event_obj) = create_click_event(lat, lng, &point, &layer_point, _original_event.as_ref()) {
             trigger_event(&self.events.contextmenu_callbacks, &event_obj);
         }
     }
@@ -2783,8 +2786,6 @@ impl RustyleafMap {
     }
 
     fn parse_geojson_string(&self, geojson_str: &str) -> Result<Vec<GeoJSONFeature>, JsValue> {
-        web_sys::console::log_2(&"Parsing GeoJSON string length:".into(), &geojson_str.len().into());
-
         // Size cap before building the full serde_json DOM (R-7): a hostile
         // or merely huge file otherwise OOMs/hangs the main thread.
         if geojson_str.len() > MAX_GEOJSON_BYTES {
@@ -2799,7 +2800,6 @@ impl RustyleafMap {
         // Parse GeoJSON string using serde_json
         let geojson_value: serde_json::Value = serde_json::from_str(geojson_str)
             .map_err(|e| {
-                web_sys::console::log_2(&"GeoJSON parse error:".into(), &e.to_string().into());
                 RustyleafError::GeoJsonParse(format!("Failed to parse GeoJSON: {}", e))
             })?;
 
@@ -2818,7 +2818,6 @@ impl RustyleafMap {
             }
         }
 
-        web_sys::console::log_1(&"GeoJSON parsed successfully, now processing features".into());
         self.parse_geojson_value(&geojson_value)
     }
 
@@ -2833,24 +2832,18 @@ impl RustyleafMap {
 
                 match geojson_type {
                     "FeatureCollection" => {
-                        web_sys::console::log_1(&"Found FeatureCollection".into());
                         if let Some(features_array) = obj.get("features").and_then(|f| f.as_array()) {
-                            web_sys::console::log_2(&"Features array length:".into(), &features_array.len().into());
                             // Count per-feature failures and warn with the total
                             // (R-18); previously every failure was a lone
                             // console::log and all-bad input returned Ok(empty).
                             let mut failures: usize = 0;
-                            for (index, feature_value) in features_array.iter().enumerate() {
+                            for feature_value in features_array.iter() {
                                 match self.parse_geojson_feature(feature_value) {
                                     Ok(feature) => {
                                         features.push(feature);
-                                        if index < 5 { // Log first 5 features
-                                            web_sys::console::log_2(&"Successfully parsed feature".into(), &index.into());
-                                        }
                                     },
-                                    Err(e) => {
+                                    Err(_) => {
                                         failures += 1;
-                                        web_sys::console::log_3(&"Failed to parse feature".into(), &index.into(), &e);
                                     }
                                 }
                             }
@@ -2864,7 +2857,7 @@ impl RustyleafMap {
                                 )));
                             }
                         } else {
-                            web_sys::console::log_1(&"No features array found in FeatureCollection".into());
+                            self.geojson_parse_errors.set(0);
                         }
                     },
                     "Feature" => {
@@ -2904,7 +2897,6 @@ impl RustyleafMap {
             _ => return Err(RustyleafError::GeoJsonParse("GeoJSON must be an object".into()).into()),
         }
 
-        web_sys::console::log_2(&"Total features parsed:".into(), &features.len().into());
         Ok(features)
     }
 

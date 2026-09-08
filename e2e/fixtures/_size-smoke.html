@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>size smoke</title></head>
+<body>
+<div id="map" style="width:800px;height:600px;"></div>
+<script type="module">
+  import * as RL from '/dist/rustyleaf.bundle.js';
+  try {
+    const map = new RL.Map('map', { center: [48.8566, 2.3522], zoom: 13 });
+    const center = map.getCenter();
+    window.__smoke = {
+      ok: true,
+      center: typeof center.toArray === 'function' ? center.toArray() : [center.lat, center.lng],
+      zoom: map.getZoom(),
+    };
+  } catch (e) {
+    window.__smoke = { ok: false, error: String((e && e.stack) || e) };
+  }
+</script>
+</body>
+</html>
