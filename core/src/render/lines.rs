@@ -3,7 +3,8 @@ use web_sys::WebGl2RenderingContext;
 use js_sys::Float32Array;
 
 use crate::layers::line::LineLayer;
-use crate::projection::Viewport;
+use crate::projection::{Viewport, clamp_zoom};
+use crate::render::polygons::capped_draw_count;
 use crate::error::RustyleafError;
 use crate::OwnedBuffer;
 use crate::WebGlState;
@@ -100,12 +101,14 @@ pub fn render_lines(
 
         let projection_matrix = super::screen_projection_matrix(viewport);
         let program = gl_state.programs.line_gpu_program.inner();
+        context.enable(WebGl2RenderingContext::BLEND);
+        context.blend_func(WebGl2RenderingContext::SRC_ALPHA, WebGl2RenderingContext::ONE_MINUS_SRC_ALPHA);
         let u_matrix = context.get_uniform_location(program, "u_matrix");
         if let Some(loc) = u_matrix.as_ref() {
             context.uniform_matrix4fv_with_f32_array(Some(loc), false, &projection_matrix);
         }
 
-        let zoom = (viewport.zoom.round() as i64).clamp(0, 30) as u32;
+        let zoom = clamp_zoom(viewport.zoom);
         let center_pixel = viewport.lat_lng_to_pixel(viewport.center_lat, viewport.center_lng, zoom);
         if let Some(loc) = gl_state.line_gpu_u_origin.as_ref() {
             context.uniform2f(
@@ -115,15 +118,18 @@ pub fn render_lines(
             );
         }
         if let Some(loc) = gl_state.line_gpu_u_world_scale.as_ref() {
-            context.uniform1f(Some(loc), (viewport.tile_size as u64 * (1u64 << zoom)) as f32);
+            // f64 on CPU (R-28); cast to f32 only at uniform upload.
+            let world_scale_f64 = viewport.tile_size as f64 * (1u64 << zoom) as f64;
+            context.uniform1f(Some(loc), world_scale_f64 as f32);
         }
 
         context.draw_arrays_instanced(
             WebGl2RenderingContext::TRIANGLES,
             0,
             6,
-            instance_count as i32,
+            capped_draw_count(instance_count),
         );
+        context.disable(WebGl2RenderingContext::BLEND);
     }
 
     Ok(())
