@@ -88,7 +88,7 @@ points.add(
 points.addTo(map)
 ```
 
-> **Compatibility preview (v0.0.10).** The documented Leaflet-style surface is
+> **Compatibility preview (v0.0.11).** The documented Leaflet-style surface is
 > covered by unit, parity, and end-to-end tests while the WebGL2 renderer and
 > plugin ecosystem continue to mature.
 

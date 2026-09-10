@@ -1,8 +1,6 @@
 use wasm_bindgen::JsValue;
 use web_sys::WebGl2RenderingContext;
 use js_sys::Float32Array;
-use lyon_tessellation::{BuffersBuilder, FillOptions, FillTessellator, FillVertex, VertexBuffers};
-use lyon_path::Path;
 
 use crate::layers::polygon::PolygonLayer;
 use crate::projection::{Viewport, clamp_zoom};
@@ -42,9 +40,9 @@ pub fn render_polygons(
                 if polygon.rings.is_empty() {
                     continue;
                 }
-                // Hole-aware Lyon tessellation (R-11): triangulating each ring
+                // Hole-aware earcut triangulation (R-11): triangulating each ring
                 // independently fills holes as solid islands.
-                let triangles = triangulate_polygon_with_holes_lyon(&polygon.rings);
+                let triangles = triangulate_polygon_with_holes(&polygon.rings);
                 let mut i = 0;
                 while i + 2 < triangles.len() {
                     for k in 0..3 {
@@ -134,57 +132,67 @@ pub fn render_polygons(
     Ok(())
 }
 
-/// Hole-aware Lyon tessellation shared by the plain-polygon path (R-11) and
-/// the GeoJSON fallback path (R-12). `rings[0]` is the outer ring, the rest
-/// are holes. Returns [lat, lng] triplets. Single-ring input without holes
-/// behaves like the ear-clipping path but through the same tessellator so
+/// Hole-aware earcut triangulation shared by the plain-polygon path (R-11) and
+/// the GeoJSON cache/fallback paths (R-12). `rings[0]` is the outer ring, the
+/// rest are holes. Returns [lat, lng] triplets. Single-ring input without holes
+/// behaves like the ear-clipping path but through the same triangulator so
 /// both paths agree.
-pub fn triangulate_polygon_with_holes_lyon(rings: &[Vec<[f64; 2]>]) -> Vec<[f64; 2]> {
+///
+/// This replaced the lyon tessellator: lyon was only ever fed straight
+/// segments (no curves, so its flattening tolerance was dead weight), while
+/// earcut is the map-industry standard for holed polygons at a fraction of
+/// the binary size. Triangulation still runs once per data change behind the
+/// `gpu_dirty` cache — never per frame — so frame cost is unchanged.
+pub fn triangulate_polygon_with_holes(rings: &[Vec<[f64; 2]>]) -> Vec<[f64; 2]> {
     if rings.is_empty() || rings[0].len() < 3 {
         return Vec::new();
     }
-    let mut path_builder = Path::builder();
-    path_builder.begin(lyon_path::geom::point(rings[0][0][1] as f32, rings[0][0][0] as f32));
-    for coord in rings[0].iter().skip(1) {
-        path_builder.line_to(lyon_path::geom::point(coord[1] as f32, coord[0] as f32));
-    }
-    path_builder.end(true);
-    for hole in rings.iter().skip(1) {
-        if hole.len() < 3 {
+    // Flatten as x=lng, y=lat (same plane lyon used), in f64.
+    let mut vertices: Vec<f64> = Vec::new();
+    let mut holes: Vec<usize> = Vec::new();
+    for (ring_idx, ring) in rings.iter().enumerate() {
+        // Strip a duplicated GeoJSON closing coordinate; it would be a
+        // zero-length edge for the triangulator.
+        let mut pts: &[[f64; 2]] = ring;
+        if pts.len() >= 2 && pts.first() == pts.last() {
+            pts = &pts[..pts.len() - 1];
+        }
+        // Non-finite coordinates would poison the triangulator's math
+        // (NaN comparisons never resolve); drop such rings like the old
+        // tessellator's failure path did. GeoJSON input is already
+        // finite-validated at parse time, so this only guards the
+        // vector-layer paths.
+        if pts.len() < 3 || !pts.iter().all(|p| p[0].is_finite() && p[1].is_finite()) {
+            if ring_idx == 0 {
+                return Vec::new();
+            }
             continue;
         }
-        path_builder.begin(lyon_path::geom::point(hole[0][1] as f32, hole[0][0] as f32));
-        for coord in hole.iter().skip(1) {
-            path_builder.line_to(lyon_path::geom::point(coord[1] as f32, coord[0] as f32));
+        if ring_idx > 0 {
+            holes.push(vertices.len() / 2);
         }
-        path_builder.end(true);
+        vertices.extend(pts.iter().flat_map(|p| [p[1], p[0]]));
     }
-    let path = path_builder.build();
-    let mut geometry: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
-    let mut tess = FillTessellator::new();
-    let opts = FillOptions::tolerance(0.05);
-    if tess
-        .tessellate_path(
-            &path,
-            &opts,
-            &mut BuffersBuilder::new(&mut geometry, |v: FillVertex| {
-                let p = v.position();
-                [p.x, p.y]
-            }),
-        )
-        .is_err()
-    {
-        web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(
-            "rustyleaf: polygon tessellation failed, dropping polygon",
-        ));
+    if vertices.len() < 6 {
         return Vec::new();
     }
-    let mut out: Vec<[f64; 2]> = Vec::with_capacity(geometry.indices.len());
-    for idx in geometry.indices {
-        let v = geometry.vertices[idx as usize];
-        out.push([v[1] as f64, v[0] as f64]);
+    match earcutr::earcut(&vertices, &holes, 2) {
+        Ok(indices) => {
+            let mut out: Vec<[f64; 2]> = Vec::with_capacity(indices.len());
+            for idx in indices {
+                let v = idx * 2;
+                out.push([vertices[v + 1], vertices[v]]);
+            }
+            out
+        }
+        Err(_) => {
+            // Log instead of silently vanishing the polygon (R-20).
+            web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(
+                "rustyleaf: polygon tessellation failed, dropping polygon",
+            ));
+            Vec::new()
+        }
     }
-    out
 }
 
 /// Cap a ring at MAX_TESS_RING_VERTICES vertices by uniform stride sampling

@@ -4,6 +4,16 @@ All notable changes are documented in
 [`CHANGELOG.md`](https://github.com/mehdilhy/rustyleaf/blob/main/CHANGELOG.md).
 Highlights from the published pre-alpha release are below.
 
+## 0.0.11 — size and simplicity
+
+- Packed tarball 210.3 → 156.4 kB with no feature loss: lyon → earcut,
+  rstar → uniform grid, serde → native JSON parsing.
+- Removed unused wasm exports (`get_geojson_parse_error_count`,
+  `get_marker_latlng`, `WebGlSupportInfo` methods, `PointLayerApi::add`);
+  static error strings, hand-written hex/WMS number formatting, minified
+  GLSL, slimmed README.
+- The Jest suite still covers 826 tests; e2e green including kitchen-sink.
+
 ## 0.0.10 — bug-audit hardening
 
 - 100-item audit across the JS API, compat layer, types, and Rust core:

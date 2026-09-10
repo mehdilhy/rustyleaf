@@ -3,30 +3,12 @@ use crate::error::RustyleafError;
 use wasm_bindgen::JsValue;
 use web_sys::{WebGl2RenderingContext, WebGlProgram, WebGlShader};
 
-// ---------- GLSL shader source strings ----------
+// ---------- GLSL shader source strings (minified: whitespace-insensitive,
+// no comments/preprocessor lines, so single-line sources compile identically) ----------
 
-pub(crate) const TILE_VERTEX_SHADER: &str = r#"
-attribute vec2 a_position;
-attribute vec2 a_texCoord;
-uniform mat4 u_matrix;
-varying vec2 v_texCoord;
+pub(crate) const TILE_VERTEX_SHADER: &str = r#"attribute vec2 a_position; attribute vec2 a_texCoord; uniform mat4 u_matrix; varying vec2 v_texCoord; void main(){ vec4 position=u_matrix*vec4(a_position,0.0,1.0); gl_Position=position; v_texCoord=a_texCoord; }"#;
 
-void main() {
-    vec4 position = u_matrix * vec4(a_position, 0.0, 1.0);
-    gl_Position = position;
-    v_texCoord = a_texCoord;
-}
-"#;
-
-pub(crate) const TILE_FRAGMENT_SHADER: &str = r#"
-precision mediump float;
-uniform sampler2D u_texture;
-varying vec2 v_texCoord;
-
-void main() {
-    gl_FragColor = texture2D(u_texture, v_texCoord);
-}
-"#;
+pub(crate) const TILE_FRAGMENT_SHADER: &str = r#"precision mediump float; uniform sampler2D u_texture; varying vec2 v_texCoord; void main(){ gl_FragColor=texture2D(u_texture,v_texCoord); }"#;
 
 // a_position holds zoom-independent normalized Web-Mercator coords in [0,1],
 // uploaded to the GPU once. The shader converts them to screen pixels every
@@ -34,113 +16,23 @@ void main() {
 // in world pixels), so panning/zooming touches no vertex data on the CPU.
 // The GeoJSON point path reuses this program with u_world_scale=1 / u_origin=0
 // and uploads screen-space coords directly.
-pub(crate) const POINT_VERTEX_SHADER: &str = r#"
-attribute vec2 a_position;
-attribute float a_size;
-attribute vec4 a_color;
-uniform mat4 u_matrix;
-uniform float u_world_scale;
-uniform vec2 u_origin;
-varying vec4 v_color;
+pub(crate) const POINT_VERTEX_SHADER: &str = r#"attribute vec2 a_position; attribute float a_size; attribute vec4 a_color; uniform mat4 u_matrix; uniform float u_world_scale; uniform vec2 u_origin; varying vec4 v_color; void main(){ vec2 pixel_pos=a_position*u_world_scale; vec2 screen_pos=pixel_pos-u_origin; gl_Position=u_matrix*vec4(screen_pos,0.0,1.0); gl_PointSize=a_size; v_color=a_color; }"#;
 
-void main() {
-    vec2 pixel_pos = a_position * u_world_scale;
-    vec2 screen_pos = pixel_pos - u_origin;
-    gl_Position = u_matrix * vec4(screen_pos, 0.0, 1.0);
-    gl_PointSize = a_size;
-    v_color = a_color;
-}
-"#;
+pub(crate) const POINT_FRAGMENT_SHADER: &str = r#"precision mediump float; varying vec4 v_color; void main(){ float dist=length(gl_PointCoord-vec2(0.5)); if(dist>0.5) discard; gl_FragColor=v_color; }"#;
 
-pub(crate) const POINT_FRAGMENT_SHADER: &str = r#"
-precision mediump float;
-varying vec4 v_color;
+pub(crate) const LINE_VERTEX_SHADER: &str = r#"attribute vec2 a_position; attribute vec4 a_color; varying vec4 v_color; uniform mat4 u_matrix; uniform float u_world_scale; uniform vec2 u_origin; void main(){ vec2 pixel_pos=a_position*u_world_scale; vec2 screen_pos=pixel_pos-u_origin; gl_Position=u_matrix*vec4(screen_pos,0.0,1.0); v_color=a_color; }"#;
 
-void main() {
-    float dist = length(gl_PointCoord - vec2(0.5));
-    if (dist > 0.5) discard;
-    gl_FragColor = v_color;
-}
-"#;
+pub(crate) const LINE_FRAGMENT_SHADER: &str = r#"precision mediump float; varying vec4 v_color; void main(){ gl_FragColor=v_color; }"#;
 
-pub(crate) const LINE_VERTEX_SHADER: &str = r#"
-attribute vec2 a_position;
-attribute vec4 a_color;
-varying vec4 v_color;
-uniform mat4 u_matrix;
-uniform float u_world_scale;
-uniform vec2 u_origin;
+pub(crate) const POLYGON_VERTEX_SHADER: &str = r#"attribute vec2 a_position; attribute vec4 a_color; varying vec4 v_color; uniform mat4 u_matrix; uniform float u_world_scale; uniform vec2 u_origin; void main(){ vec2 pixel_pos=a_position*u_world_scale; vec2 screen_pos=pixel_pos-u_origin; gl_Position=u_matrix*vec4(screen_pos,0.0,1.0); v_color=a_color; }"#;
 
-void main() {
-    vec2 pixel_pos = a_position * u_world_scale;
-    vec2 screen_pos = pixel_pos - u_origin;
-    gl_Position = u_matrix * vec4(screen_pos, 0.0, 1.0);
-    v_color = a_color;
-}
-"#;
-
-pub(crate) const LINE_FRAGMENT_SHADER: &str = r#"
-precision mediump float;
-varying vec4 v_color;
-
-void main() {
-    gl_FragColor = v_color;
-}
-"#;
-
-pub(crate) const POLYGON_VERTEX_SHADER: &str = r#"
-attribute vec2 a_position;
-attribute vec4 a_color;
-varying vec4 v_color;
-uniform mat4 u_matrix;
-uniform float u_world_scale;
-uniform vec2 u_origin;
-
-void main() {
-    vec2 pixel_pos = a_position * u_world_scale;
-    vec2 screen_pos = pixel_pos - u_origin;
-    gl_Position = u_matrix * vec4(screen_pos, 0.0, 1.0);
-    v_color = a_color;
-}
-"#;
-
-pub(crate) const POLYGON_FRAGMENT_SHADER: &str = r#"
-precision mediump float;
-varying vec4 v_color;
-
-void main() {
-    gl_FragColor = v_color;
-}
-"#;
+pub(crate) const POLYGON_FRAGMENT_SHADER: &str = r#"precision mediump float; varying vec4 v_color; void main(){ gl_FragColor=v_color; }"#;
 
 // GPU-resident width-expanded lines. Segment data is uploaded ONCE (per
 // instance: start/end in normalized world coords + pixel half-width + color)
 // and each of the 6 corner vertices per segment is expanded in the vertex
 // shader, so panning/zooming costs no CPU vertex rebuilds at all.
-pub(crate) const LINE_GPU_VERTEX_SHADER: &str = r#"
-attribute vec2 a_start;      // normalized [0..1] segment start (per instance)
-attribute vec2 a_end;        // normalized [0..1] segment end   (per instance)
-attribute float a_half_width; // pixels                          (per instance)
-attribute vec4 a_color;      //                                 (per instance)
-attribute vec2 a_corner;     // (t along segment, side sign)    (per vertex)
-
-varying vec4 v_color;
-uniform mat4 u_matrix;
-uniform float u_world_scale;
-uniform vec2 u_origin;
-
-void main() {
-    vec2 sp = a_start * u_world_scale - u_origin;
-    vec2 ep = a_end * u_world_scale - u_origin;
-    vec2 dir = ep - sp;
-    float len = length(dir);
-    // Pixel-space perpendicular; degenerate segments collapse to zero area.
-    vec2 n = len > 0.000001 ? vec2(-dir.y, dir.x) / len : vec2(0.0);
-    vec2 p = mix(sp, ep, a_corner.x) + n * (a_half_width * a_corner.y);
-    gl_Position = u_matrix * vec4(p, 0.0, 1.0);
-    v_color = a_color;
-}
-"#;
+pub(crate) const LINE_GPU_VERTEX_SHADER: &str = r#"attribute vec2 a_start; attribute vec2 a_end; attribute float a_half_width; attribute vec4 a_color; attribute vec2 a_corner; varying vec4 v_color; uniform mat4 u_matrix; uniform float u_world_scale; uniform vec2 u_origin; void main(){ vec2 sp=a_start*u_world_scale-u_origin; vec2 ep=a_end*u_world_scale-u_origin; vec2 dir=ep-sp; float len=length(dir); vec2 n=len>0.000001 ? vec2(-dir.y,dir.x)/len : vec2(0.0); vec2 p=mix(sp,ep,a_corner.x)+n*(a_half_width*a_corner.y); gl_Position=u_matrix*vec4(p,0.0,1.0); v_color=a_color; }"#;
 
 // ---------- ShaderPrograms struct ----------
 

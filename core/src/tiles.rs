@@ -10,6 +10,46 @@ use crate::projection::{Viewport, clamp_zoom};
 use crate::error::RustyleafError;
 use crate::OwnedTexture;
 
+/// Append `v` with exactly 6 decimals (1e-6 fixed point) without float
+/// Display machinery. Inputs here are tile-edge meters (|v| < 2^53), so the
+/// scaled value is exactly representable. Precision beyond micrometers is
+/// meaningless to WMS servers.
+fn push_fixed6(out: &mut String, v: f64) {
+    let mut scaled = (v * 1_000_000.0).round();
+    if scaled == 0.0 {
+        scaled = 0.0; // normalize -0.0
+    }
+    if scaled < 0.0 {
+        out.push('-');
+        scaled = -scaled;
+    }
+    let whole = (scaled / 1_000_000.0) as u64;
+    let mut frac = (scaled - whole as f64 * 1_000_000.0) as u64;
+    // Decimal digits of `whole` without int Display.
+    let mut digits = [0u8; 20];
+    let mut len = 0usize;
+    let mut w = whole;
+    loop {
+        digits[len] = (w % 10) as u8;
+        len += 1;
+        w /= 10;
+        if w == 0 {
+            break;
+        }
+    }
+    while len > 0 {
+        len -= 1;
+        out.push((b'0' + digits[len]) as char);
+    }
+    out.push('.');
+    let mut div = 100_000u64;
+    while div > 0 {
+        out.push((b'0' + (frac / div) as u8) as char);
+        frac %= div;
+        div /= 10;
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TileCoord {
     pub x: i32,
@@ -268,7 +308,14 @@ impl TileLoader {
                 let tile_size_m = (HALF_WORLD_M * 2.0) / tiles_per_axis;
                 let min_x = -HALF_WORLD_M + coord.x as f64 * tile_size_m;
                 let max_y = HALF_WORLD_M - coord.y as f64 * tile_size_m;
-                let bbox = format!("{},{},{},{}", min_x, max_y - tile_size_m, min_x + tile_size_m, max_y);
+                let mut bbox = String::new();
+                push_fixed6(&mut bbox, min_x);
+                bbox.push(',');
+                push_fixed6(&mut bbox, max_y - tile_size_m);
+                bbox.push(',');
+                push_fixed6(&mut bbox, min_x + tile_size_m);
+                bbox.push(',');
+                push_fixed6(&mut bbox, max_y);
                 url = url.replace("{bbox-epsg-3857}", &bbox);
             }
             url

@@ -8,7 +8,7 @@ use crate::layers::polygon::PolygonFeature;
 use crate::layers::geojson::{GeoJSONLayer, GeoJSONGeometry};
 use crate::projection::{Viewport, clamp_zoom};
 use crate::WebGlState;
-use super::polygons::{triangulate_polygon_with_holes_lyon, decimate_ring_shared, capped_draw_count};
+use super::polygons::{triangulate_polygon_with_holes, decimate_ring_shared, capped_draw_count};
 
 pub struct GeoJsonRenderCtx<'a> {
     pub context: &'a WebGl2RenderingContext,
@@ -440,7 +440,7 @@ pub fn render_geojson_polygons(ctx: &GeoJsonRenderCtx, polygons: &[PolygonFeatur
         if rings.is_empty() || rings[0].len() < 3 {
             continue;
         }
-        let triangles = triangulate_polygon_with_holes_lyon(&rings);
+        let triangles = triangulate_polygon_with_holes(&rings);
 
         for triangle in triangles.chunks(3) {
             if triangle.len() == 3 {
