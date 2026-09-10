@@ -93,9 +93,6 @@ impl OwnedProgram {
 use std::cell::{RefCell, Cell};
 use std::rc::Rc;
 use js_sys::{Array, Float32Array};
-use rstar::RTree;
-use lyon_tessellation::{BuffersBuilder, FillOptions, FillTessellator, FillVertex, VertexBuffers};
-use lyon_path::Path;
 
 mod projection;
 mod color;
@@ -108,8 +105,15 @@ mod layers;
 mod gl;
 mod render;
 use crate::projection::{Viewport, clamp_zoom};
-use crate::render::polygons::capped_draw_count;
+use crate::render::polygons::{capped_draw_count, triangulate_polygon_with_holes};
 use crate::color::parse_color;
+
+// Size: use a tiny allocator instead of dlmalloc (~20-30KB saved).
+// WASM is single-threaded here, so the lock-free wrapper is safe + smaller.
+#[cfg(target_arch = "wasm32")]
+#[global_allocator]
+static ALLOC: lol_alloc::AssumeSingleThreaded<lol_alloc::FreeListAllocator> =
+    unsafe { lol_alloc::AssumeSingleThreaded::new(lol_alloc::FreeListAllocator::new()) };
 
 // Allocation / ingestion caps (R-6…R-10).
 /// Max pre-allocation for a single JS-array-driven `Vec::with_capacity`.
@@ -123,7 +127,7 @@ const MAX_PENDING_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 /// Max points `reserve_points_packed` will allocate (28 bytes each → ~280 MiB).
 const MAX_RESERVE_POINTS: usize = 10_000_000;
 use crate::tiles::{TileCoord, TileLayer, TileLoader};
-use crate::spatial::{SpatialFeature, rebuild_spatial_index, hit_test as spatial_hit_test};
+use crate::spatial::{SpatialIndex, rebuild_spatial_index, hit_test as spatial_hit_test};
 use crate::input::MouseState;
 use crate::input::momentum::{apply_drag, apply_momentum, start_momentum_animation};
 use crate::events::{EventSystem, trigger_event, create_map_event, create_click_event};
@@ -173,106 +177,56 @@ pub(crate) struct WebGlState {
 
 // Layer types moved to crate::layers
 
-// WebGL support information for compatibility checking
-#[wasm_bindgen]
-pub struct WebGlSupportInfo {
-    #[wasm_bindgen(skip)]
-    pub extensions: Vec<String>,
-    #[wasm_bindgen(skip)]
-    pub renderer: Option<String>,
-    #[wasm_bindgen(skip)]
-    pub vendor: Option<String>,
-    pub webgl2_available: bool,
-    pub webgl1_fallback: bool,
-    pub max_texture_size: i32,
+// WebGL support probe for compatibility checking. Plain internal struct
+// (not exported): only init_canvas consumes it, so the renderer/vendor
+// strings and texture-size queries the old exported API collected are gone.
+struct WebGlSupportInfo {
+    webgl2_available: bool,
+    webgl1_fallback: bool,
 }
 
-#[wasm_bindgen]
 impl WebGlSupportInfo {
-    
-    #[wasm_bindgen]
-    pub fn is_supported(&self) -> bool {
+
+    fn is_supported(&self) -> bool {
         self.webgl2_available || self.webgl1_fallback
     }
-    
-    #[wasm_bindgen]
-    pub fn get_support_level(&self) -> String {
+
+    fn get_support_level(&self) -> &'static str {
         if self.webgl2_available {
-            "full".to_string()
+            "full"
         } else if self.webgl1_fallback {
-            "limited".to_string()
+            "limited"
         } else {
-            "none".to_string()
+            "none"
         }
     }
-    
-    #[wasm_bindgen]
-    pub fn renderer(&self) -> String {
-        self.renderer.clone().unwrap_or_else(|| "unknown".to_string())
-    }
-    
-    #[wasm_bindgen]
-    pub fn extensions(&self) -> String {
-        self.extensions.join(", ")
-    }
-    
-    #[wasm_bindgen]
-    pub fn check_webgl_support() -> Result<WebGlSupportInfo, JsValue> {
+
+    fn check_webgl_support() -> Result<WebGlSupportInfo, JsValue> {
         let window = window().ok_or_else(|| RustyleafError::DomError("Window not available".into()))?;
         let document = window.document().ok_or_else(|| RustyleafError::DomError("Document not available".into()))?;
-        
+
         // Create a temporary canvas to test WebGL support
         let canvas = document
             .create_element("canvas")
-            .map_err(|e| RustyleafError::CanvasInit(format!("Failed to create canvas: {:?}", e)))?
+            .map_err(|_| RustyleafError::CanvasInit("Failed to create probe canvas".into()))?
             .dyn_into::<HtmlCanvasElement>()
             .map_err(|_| RustyleafError::CanvasInit("Failed to create canvas element".into()))?;
-        
+
         let mut info = WebGlSupportInfo {
             webgl2_available: false,
             webgl1_fallback: false,
-            extensions: Vec::new(),
-            renderer: None,
-            vendor: None,
-            max_texture_size: 0,
         };
-        
+
         // Test WebGL2 support
-        if let Some(gl2_context) = canvas.get_context("webgl2").ok().flatten() {
+        if canvas.get_context("webgl2").ok().flatten().is_some() {
             info.webgl2_available = true;
-            if let Ok(gl2) = gl2_context.dyn_into::<WebGl2RenderingContext>() {
-                // Get max texture size
-                match gl2.get_parameter(WebGl2RenderingContext::MAX_TEXTURE_SIZE) {
-                    Ok(max_size) => {
-                        info.max_texture_size = max_size.as_f64().unwrap_or(2048.0) as i32;
-                    },
-                    Err(_) => {
-                        info.max_texture_size = 2048; // Default value
-                    }
-                }
-                
-                // Check for required extensions
-                let required_extensions = ["OES_texture_float"];
-                for ext in required_extensions.iter() {
-                    if gl2.get_extension(ext).is_ok() {
-                        info.extensions.push(ext.to_string());
-                    }
-                }
-                
-                // Get renderer info (if available)
-                let renderer = gl2.get_parameter(WebGl2RenderingContext::RENDERER);
-                info.renderer = renderer.ok().and_then(|r| r.as_string());
-                
-                let vendor = gl2.get_parameter(WebGl2RenderingContext::VENDOR);
-                info.vendor = vendor.ok().and_then(|v| v.as_string());
-            }
         } else {
             // Test WebGL1 fallback
             if canvas.get_context("webgl").is_ok() || canvas.get_context("experimental-webgl").is_ok() {
                 info.webgl1_fallback = true;
             }
         }
-        
+
         Ok(info)
     }
 }
@@ -302,14 +256,11 @@ pub struct RustyleafMap {
     // shifting later entries, so numeric IDs handed to JS stay valid for the
     // lifetime of the marker (issue #15). Vacant slots are reused by add_marker.
     markers: Vec<Option<Marker>>,
-    spatial_index: RTree<SpatialFeature>,
+    spatial_index: SpatialIndex,
     spatial_index_dirty: bool,
     // Whether the last hover hit-test found a feature (used to emit a single
     // clearing event when the cursor leaves a feature).
     hovering: bool,
-    // Per-feature GeoJSON parse failures from the last load (R-18), exposed
-    // via `get_geojson_parse_error_count()`.
-    geojson_parse_errors: Cell<usize>,
     mouse_state: MouseState,
     // Smooth dragging with momentum
     drag_velocity: (f64, f64),
@@ -321,8 +272,64 @@ pub struct RustyleafMap {
     events: EventSystem,
 }
 
-fn parse_point_features(points_data: &JsValue) -> Result<Vec<PointFeature>, JsValue> {
-    let points_array = js_sys::Array::from(points_data);
+/// Snapshot-clone a JS value through the native JSON round-trip.
+///
+/// This preserves the old serde round-trip semantics: the stored copy is
+/// detached (later caller mutations don't leak in) and unserializable
+/// values (functions, symbols, BigInt, circular refs) degrade to null
+/// instead of throwing — at native-parser speed and without serde.
+pub(crate) fn snapshot_js_value(v: &JsValue) -> JsValue {
+    js_sys::JSON::stringify(v)
+        .ok()
+        .and_then(|s| s.as_string())
+        .and_then(|s| js_sys::JSON::parse(&s).ok())
+        .unwrap_or(JsValue::NULL)
+}
+
+/// Fresh empty JS object (`{}`).
+pub(crate) fn empty_js_object() -> JsValue {
+    js_sys::Object::new().into()
+}
+
+/// Normalize a user-supplied `meta` field with the legacy rules: missing →
+/// null; JSON-text strings are parsed (unparseable → null); anything else is
+/// snapshot-cloned.
+fn normalize_meta_value(v: &JsValue) -> JsValue {
+    if v.is_undefined() || v.is_null() {
+        return JsValue::NULL;
+    }
+    if let Some(s) = v.as_string() {
+        return js_sys::JSON::parse(&s).unwrap_or(JsValue::NULL);
+    }
+    snapshot_js_value(v)
+}
+
+/// Normalize a GeoJSON `properties` value: plain objects are
+/// snapshot-cloned, everything else (missing/null/arrays/primitives) → `{}`.
+fn normalize_properties(p: &JsValue) -> JsValue {
+    if p.is_object() && !js_sys::Array::is_array(p) {
+        snapshot_js_value(p)
+    } else {
+        empty_js_object()
+    }
+}
+
+/// Best-effort text for a JsValue error: plain strings as-is, Error objects
+/// via their `message`, anything else a static fallback. (Avoids Debug
+/// formatting, which drags float-formatting machinery into the binary.)
+fn js_error_text(e: &JsValue) -> String {
+    if let Some(s) = e.as_string() {
+        return s;
+    }
+    if let Ok(m) = js_sys::Reflect::get(e, &JsValue::from_str("message")) {
+        if let Some(s) = m.as_string() {
+            return s;
+        }
+    }
+    "unknown error".to_string()
+}
+
+fn parse_point_features(points_data: &JsValue) -> Result<Vec<PointFeature>, JsValue> {    let points_array = js_sys::Array::from(points_data);
     // Cap pre-allocation from the untrusted JS length (R-6).
     let capped = (points_array.length() as usize).min(MAX_PREALLOC_ELEMS);
     let mut points = Vec::with_capacity(capped);
@@ -343,16 +350,7 @@ fn parse_point_features(points_data: &JsValue) -> Result<Vec<PointFeature>, JsVa
         let color_str = js_sys::Reflect::get(&point_obj, &JsValue::from_str("color"))?
             .as_string().unwrap_or_else(|| "#0080ff".to_string());
         let meta_val = js_sys::Reflect::get(&point_obj, &JsValue::from_str("meta"))?;
-        let meta = if meta_val.is_undefined() || meta_val.is_null() {
-            serde_json::Value::Null
-        } else if let Some(value) = meta_val.as_string() {
-            serde_json::from_str(&value).unwrap_or(serde_json::Value::Null)
-        } else {
-            js_sys::JSON::stringify(&meta_val).ok()
-                .and_then(|value| value.as_string())
-                .and_then(|value| serde_json::from_str(&value).ok())
-                .unwrap_or(serde_json::Value::Null)
-        };
+        let meta = normalize_meta_value(&meta_val);
 
         points.push(PointFeature {
             lat,
@@ -390,10 +388,9 @@ impl RustyleafMap {
             polygon_layers: Vec::new(),
             geojson_layers: Vec::new(),
             markers: Vec::new(),
-            spatial_index: RTree::new(),
+            spatial_index: SpatialIndex::new(),
             spatial_index_dirty: true,
             hovering: false,
-            geojson_parse_errors: Cell::new(0),
             mouse_state: MouseState {
                 is_dragging: false,
                 last_x: 0.0,
@@ -543,7 +540,7 @@ impl RustyleafMap {
         self.polygon_layers.clear();
         self.geojson_layers.clear();
         self.markers.clear();
-        self.spatial_index = RTree::new();
+        self.spatial_index = SpatialIndex::new();
         self.events = EventSystem::new();
     }
 
@@ -993,7 +990,7 @@ impl RustyleafMap {
     // Event handling methods (simplified)
     // Fire the map-level click callbacks with a `feature` payload (the hit
     // feature's meta/properties) so JS layers can dispatch per-feature events.
-    fn trigger_feature_click(&mut self, hit_info: serde_json::Value, canvas_x: f64, canvas_y: f64) {
+    fn trigger_feature_click(&mut self, hit_info: JsValue, canvas_x: f64, canvas_y: f64) {
         let point_array = Array::new();
         point_array.push(&JsValue::from_f64(canvas_x));
         point_array.push(&JsValue::from_f64(canvas_y));
@@ -1009,8 +1006,9 @@ impl RustyleafMap {
         let point = self.project(&JsValue::from(latlng_arr));
         let layer_point = self.layer_point_from_container(&point);
         if let Ok(event_obj) = create_click_event(lat, lng, &point, &layer_point, None) {
-            let feature = js_sys::JSON::parse(&hit_info.to_string()).unwrap_or(JsValue::NULL);
-            let _ = js_sys::Reflect::set(&event_obj, &JsValue::from_str("feature"), &feature);
+            // meta_json() already snapshot-clones per hit, so the payload can
+            // go straight onto the event (no string round-trip).
+            let _ = js_sys::Reflect::set(&event_obj, &JsValue::from_str("feature"), &hit_info);
             trigger_event(&self.events.click_callbacks, &event_obj);
         }
     }
@@ -1049,7 +1047,7 @@ impl RustyleafMap {
         if let Ok(event_obj) = create_click_event(lat, lng, &point, &layer_point, None) {
             let _ = js_sys::Reflect::set(&event_obj, &JsValue::from_str("type"), &JsValue::from_str("hover"));
             let feature = match hit {
-                Some(info) => js_sys::JSON::parse(&info.to_string()).unwrap_or(JsValue::NULL),
+                Some(info) => info,
                 None => JsValue::NULL,
             };
             let _ = js_sys::Reflect::set(&event_obj, &JsValue::from_str("feature"), &feature);
@@ -1174,50 +1172,46 @@ impl RustyleafMap {
         }
     }
 
-    fn trigger_click_event(&self, lat: f64, lng: f64, _original_event: Option<&web_sys::MouseEvent>) {
+    fn trigger_click_event(&self, lat: f64, lng: f64, _original_event: Option<JsValue>) {
         let latlng = Array::new();
         latlng.push(&JsValue::from_f64(lat));
         latlng.push(&JsValue::from_f64(lng));
         let point = self.project(&JsValue::from(latlng));
         let layer_point = self.layer_point_from_container(&point);
-        let original_js = _original_event.map(|e| JsValue::from(e.clone()));
-        if let Ok(event_obj) = create_click_event(lat, lng, &point, &layer_point, original_js.as_ref()) {
+        if let Ok(event_obj) = create_click_event(lat, lng, &point, &layer_point, _original_event.as_ref()) {
             trigger_event(&self.events.click_callbacks, &event_obj);
         }
     }
 
-    fn trigger_mousedown_event(&self, lat: f64, lng: f64, _original_event: Option<&web_sys::MouseEvent>) {
+    fn trigger_mousedown_event(&self, lat: f64, lng: f64, _original_event: Option<JsValue>) {
         let latlng = Array::new();
         latlng.push(&JsValue::from_f64(lat));
         latlng.push(&JsValue::from_f64(lng));
         let point = self.project(&JsValue::from(latlng));
         let layer_point = self.layer_point_from_container(&point);
-        let original_js = _original_event.map(|e| JsValue::from(e.clone()));
-        if let Ok(event_obj) = create_click_event(lat, lng, &point, &layer_point, original_js.as_ref()) {
+        if let Ok(event_obj) = create_click_event(lat, lng, &point, &layer_point, _original_event.as_ref()) {
             trigger_event(&self.events.mousedown_callbacks, &event_obj);
         }
     }
 
-    fn trigger_mouseup_event(&self, lat: f64, lng: f64, _original_event: Option<&web_sys::MouseEvent>) {
+    fn trigger_mouseup_event(&self, lat: f64, lng: f64, _original_event: Option<JsValue>) {
         let latlng = Array::new();
         latlng.push(&JsValue::from_f64(lat));
         latlng.push(&JsValue::from_f64(lng));
         let point = self.project(&JsValue::from(latlng));
         let layer_point = self.layer_point_from_container(&point);
-        let original_js = _original_event.map(|e| JsValue::from(e.clone()));
-        if let Ok(event_obj) = create_click_event(lat, lng, &point, &layer_point, original_js.as_ref()) {
+        if let Ok(event_obj) = create_click_event(lat, lng, &point, &layer_point, _original_event.as_ref()) {
             trigger_event(&self.events.mouseup_callbacks, &event_obj);
         }
     }
 
-    fn trigger_contextmenu_event(&self, lat: f64, lng: f64, _original_event: Option<&web_sys::MouseEvent>) {
+    fn trigger_contextmenu_event(&self, lat: f64, lng: f64, _original_event: Option<JsValue>) {
         let latlng = Array::new();
         latlng.push(&JsValue::from_f64(lat));
         latlng.push(&JsValue::from_f64(lng));
         let point = self.project(&JsValue::from(latlng));
         let layer_point = self.layer_point_from_container(&point);
-        let original_js = _original_event.map(|e| JsValue::from(e.clone()));
-        if let Ok(event_obj) = create_click_event(lat, lng, &point, &layer_point, original_js.as_ref()) {
+        if let Ok(event_obj) = create_click_event(lat, lng, &point, &layer_point, _original_event.as_ref()) {
             trigger_event(&self.events.contextmenu_callbacks, &event_obj);
         }
     }
@@ -1349,30 +1343,30 @@ impl RustyleafMap {
         }
         
         // Validate all elements are numbers and within valid coordinate ranges
-        let sw_lat = bounds_array.get(0).as_f64().ok_or(RustyleafError::InvalidCoordinate { lat: 0.0, lng: 0.0 })?;
-        let sw_lng = bounds_array.get(1).as_f64().ok_or(RustyleafError::InvalidCoordinate { lat: 0.0, lng: 0.0 })?;
-        let ne_lat = bounds_array.get(2).as_f64().ok_or(RustyleafError::InvalidCoordinate { lat: 0.0, lng: 0.0 })?;
-        let ne_lng = bounds_array.get(3).as_f64().ok_or(RustyleafError::InvalidCoordinate { lat: 0.0, lng: 0.0 })?;
-        
+        let sw_lat = bounds_array.get(0).as_f64().ok_or(RustyleafError::InvalidCoordinate)?;
+        let sw_lng = bounds_array.get(1).as_f64().ok_or(RustyleafError::InvalidCoordinate)?;
+        let ne_lat = bounds_array.get(2).as_f64().ok_or(RustyleafError::InvalidCoordinate)?;
+        let ne_lng = bounds_array.get(3).as_f64().ok_or(RustyleafError::InvalidCoordinate)?;
+
         // Validate coordinate ranges
         if !(-90.0..=90.0).contains(&sw_lat) {
-            return Err(RustyleafError::InvalidCoordinate { lat: sw_lat, lng: sw_lng }.into());
+            return Err(RustyleafError::InvalidCoordinate.into());
         }
         if !(-180.0..=180.0).contains(&sw_lng) {
-            return Err(RustyleafError::InvalidCoordinate { lat: sw_lat, lng: sw_lng }.into());
+            return Err(RustyleafError::InvalidCoordinate.into());
         }
         if !(-90.0..=90.0).contains(&ne_lat) {
-            return Err(RustyleafError::InvalidCoordinate { lat: ne_lat, lng: ne_lng }.into());
+            return Err(RustyleafError::InvalidCoordinate.into());
         }
         if !(-180.0..=180.0).contains(&ne_lng) {
-            return Err(RustyleafError::InvalidCoordinate { lat: ne_lat, lng: ne_lng }.into());
+            return Err(RustyleafError::InvalidCoordinate.into());
         }
         
         // Validate that bounds are valid (ne > sw). Longitude wraps at the
         // antimeridian, so ne_lng <= sw_lng means a Fiji-style crossing box:
         // normalize the span instead of throwing.
         if ne_lat <= sw_lat {
-            return Err(RustyleafError::InvalidCoordinate { lat: ne_lat, lng: ne_lng }.into());
+            return Err(RustyleafError::InvalidCoordinate.into());
         }
         let span_lng = if ne_lng <= sw_lng {
             (ne_lng + 360.0) - sw_lng
@@ -1380,7 +1374,7 @@ impl RustyleafMap {
             ne_lng - sw_lng
         };
         if span_lng <= 0.0 || span_lng >= 360.0 {
-            return Err(RustyleafError::InvalidCoordinate { lat: ne_lat, lng: ne_lng }.into());
+            return Err(RustyleafError::InvalidCoordinate.into());
         }
         
         // Calculate center of bounds
@@ -1656,7 +1650,7 @@ impl RustyleafMap {
                 lng: point[1] as f64,
                 size: point[2],
                 color: [point[3], point[4], point[5], point[6]],
-                meta: serde_json::Value::Null,
+                meta: JsValue::NULL,
             });
         }
 
@@ -1759,7 +1753,7 @@ impl RustyleafMap {
                         lng: point[1] as f64,
                         size: point[2],
                         color: [point[3], point[4], point[5], point[6]],
-                        meta: serde_json::Value::Null,
+                        meta: JsValue::NULL,
                     });
                 }
                 self.spatial_index_dirty = true;
@@ -1798,7 +1792,7 @@ impl RustyleafMap {
                 lng,
                 size,
                 color: [point[3], point[4], point[5], point[6]],
-                meta: serde_json::Value::Null,
+                meta: JsValue::NULL,
             });
         }
         layer.norm_min.set(min);
@@ -1970,18 +1964,6 @@ impl RustyleafMap {
     }
 
     #[wasm_bindgen]
-    pub fn get_marker_latlng(&self, id: u32) -> Result<JsValue, JsValue> {
-        if let Some(m) = self.markers.get(id as usize).and_then(|m| m.as_ref()) {
-            let arr = js_sys::Array::new();
-            arr.push(&JsValue::from_f64(m.lat));
-            arr.push(&JsValue::from_f64(m.lng));
-            Ok(arr.into())
-        } else {
-            Err(RustyleafError::LayerOutOfBounds { index: id as usize, len: self.markers.len() }.into())
-        }
-    }
-
-    #[wasm_bindgen]
     pub fn add_line_layer(&mut self) -> usize {
         self.needs_redraw = true;
         let line_layer = LineLayer::new();
@@ -2039,9 +2021,9 @@ impl RustyleafMap {
 
             let meta = js_sys::Reflect::get(&line_obj, &JsValue::from_str("meta"))?;
             let meta_json = if meta.is_object() {
-                serde_wasm_bindgen::from_value(meta)?
+                snapshot_js_value(&meta)
             } else {
-                serde_json::json!({})
+                empty_js_object()
             };
 
             let line = LineFeature {
@@ -2094,9 +2076,9 @@ impl RustyleafMap {
                 .as_f64().unwrap_or(2.0) as f32;
             let meta = js_sys::Reflect::get(&line_obj, &JsValue::from_str("meta"))?;
             let meta_json = if meta.is_object() {
-                serde_wasm_bindgen::from_value(meta)?
+                snapshot_js_value(&meta)
             } else {
-                serde_json::json!({})
+                empty_js_object()
             };
             layer.lines.push(LineFeature { points, color: parse_color(&color_str), width, meta: meta_json });
         }
@@ -2245,9 +2227,9 @@ impl RustyleafMap {
 
             let meta = js_sys::Reflect::get(&polygon_obj, &JsValue::from_str("meta"))?;
             let meta_json = if meta.is_object() {
-                serde_wasm_bindgen::from_value(meta)?
+                snapshot_js_value(&meta)
             } else {
-                serde_json::json!({})
+                empty_js_object()
             };
 
             let polygon = PolygonFeature {
@@ -2393,7 +2375,7 @@ impl RustyleafMap {
         let mut out = Vec::new();
 
         // Fast path (R-8): only attempt the full-buffer parse when the chunk
-        // plausibly closes the document. Retrying a full `from_str` on every
+        // plausibly closes the document. Retrying a full parse on every
         // intermediate chunk is O(n^2) over a stream.
         {
             let trimmed = buf.trim_end();
@@ -2401,7 +2383,7 @@ impl RustyleafMap {
                 || trimmed.ends_with('}')
                 || trimmed.ends_with(']');
             if looks_closed {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(buf) {
+                if let Ok(v) = js_sys::JSON::parse(buf) {
                     if let Ok(mut f) = self.parse_geojson_value(&v) {
                         out.append(&mut f);
                     }
@@ -2440,12 +2422,16 @@ impl RustyleafMap {
                     if let Some(start) = stack.pop() {
                         // start..=i lands on ASCII boundaries, always valid UTF-8.
                         if let Ok(segment) = std::str::from_utf8(&bytes[start..=i]) {
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(segment) {
+                            if let Ok(v) = js_sys::JSON::parse(segment) {
                                 // ONLY complete Feature objects count. Accepting
                                 // bare geometries here would double-count the
                                 // geometry objects nested INSIDE features.
                                 let is_feature =
-                                    v.get("type").and_then(|x| x.as_str()) == Some("Feature");
+                                    js_sys::Reflect::get(&v, &JsValue::from_str("type"))
+                                        .ok()
+                                        .and_then(|t| t.as_string())
+                                        .as_deref()
+                                        == Some("Feature");
                                 if is_feature {
                                     if let Ok(mut f) = self.parse_geojson_value(&v) {
                                         if !f.is_empty() {
@@ -2502,7 +2488,7 @@ impl RustyleafMap {
             for line in tail.lines() {
                 let line = line.trim().trim_end_matches(',');
                 if line.starts_with('{') {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    if let Ok(v) = js_sys::JSON::parse(line) {
                         if let Ok(mut f) = self.parse_geojson_value(&v) {
                             out.append(&mut f);
                         }
@@ -2550,12 +2536,6 @@ impl RustyleafMap {
         Ok(self.geojson_layers[layer_index].features.len())
     }
 
-    /// Per-feature GeoJSON parse failures from the last load (R-18).
-    #[wasm_bindgen]
-    pub fn get_geojson_parse_error_count(&self) -> usize {
-        self.geojson_parse_errors.get()
-    }
-
     #[wasm_bindgen]
     pub fn set_geojson_style(&mut self, layer_index: usize, style_data: &JsValue) -> Result<(), JsValue> {
         self.needs_redraw = true;
@@ -2563,26 +2543,36 @@ impl RustyleafMap {
             return Err(RustyleafError::LayerOutOfBounds { index: layer_index, len: self.geojson_layers.len() }.into());
         }
 
-        // Convert JsValue to serde_json::Value for easier manipulation
-        let style_value: serde_json::Value = serde_wasm_bindgen::from_value(style_data.clone())?;
-        
-        if let Some(style_obj) = style_value.as_object() {
+        // Style arrives as a live JS object; read its fields directly.
+        // Non-object styles (and objects without the known keys) leave the
+        // style untouched, like before.
+        if style_data.is_object() && !js_sys::Array::is_array(style_data) {
             let mut style = self.geojson_layers[layer_index].style.clone();
 
-            if let Some(point_color) = style_obj.get("pointColor").and_then(|c| c.as_str()) {
-                style.point_color = parse_color(point_color);
+            if let Some(point_color) = js_sys::Reflect::get(style_data, &JsValue::from_str("pointColor"))
+                .ok().and_then(|c| c.as_string())
+            {
+                style.point_color = parse_color(&point_color);
             }
-            if let Some(point_size) = style_obj.get("pointSize").and_then(|s| s.as_f64()) {
+            if let Some(point_size) = js_sys::Reflect::get(style_data, &JsValue::from_str("pointSize"))
+                .ok().and_then(|s| s.as_f64())
+            {
                 style.point_size = point_size as f32;
             }
-            if let Some(line_color) = style_obj.get("lineColor").and_then(|c| c.as_str()) {
-                style.line_color = parse_color(line_color);
+            if let Some(line_color) = js_sys::Reflect::get(style_data, &JsValue::from_str("lineColor"))
+                .ok().and_then(|c| c.as_string())
+            {
+                style.line_color = parse_color(&line_color);
             }
-            if let Some(line_width) = style_obj.get("lineWidth").and_then(|w| w.as_f64()) {
+            if let Some(line_width) = js_sys::Reflect::get(style_data, &JsValue::from_str("lineWidth"))
+                .ok().and_then(|w| w.as_f64())
+            {
                 style.line_width = line_width as f32;
             }
-            if let Some(polygon_color) = style_obj.get("polygonColor").and_then(|c| c.as_str()) {
-                style.polygon_color = parse_color(polygon_color);
+            if let Some(polygon_color) = js_sys::Reflect::get(style_data, &JsValue::from_str("polygonColor"))
+                .ok().and_then(|c| c.as_string())
+            {
+                style.polygon_color = parse_color(&polygon_color);
             }
 
             self.geojson_layers[layer_index].style = style;
@@ -2783,10 +2773,8 @@ impl RustyleafMap {
     }
 
     fn parse_geojson_string(&self, geojson_str: &str) -> Result<Vec<GeoJSONFeature>, JsValue> {
-        web_sys::console::log_2(&"Parsing GeoJSON string length:".into(), &geojson_str.len().into());
-
-        // Size cap before building the full serde_json DOM (R-7): a hostile
-        // or merely huge file otherwise OOMs/hangs the main thread.
+        // Size cap before parsing (R-7): a hostile or merely huge file
+        // otherwise OOMs/hangs the main thread.
         if geojson_str.len() > MAX_GEOJSON_BYTES {
             return Err(RustyleafError::GeoJsonParse(format!(
                 "GeoJSON string ({} bytes) exceeds max {} bytes",
@@ -2796,19 +2784,20 @@ impl RustyleafMap {
             .into());
         }
 
-        // Parse GeoJSON string using serde_json
-        let geojson_value: serde_json::Value = serde_json::from_str(geojson_str)
+        // Parse GeoJSON text with the native JSON parser (no serde DOM).
+        let geojson_value: JsValue = js_sys::JSON::parse(geojson_str)
             .map_err(|e| {
-                web_sys::console::log_2(&"GeoJSON parse error:".into(), &e.to_string().into());
-                RustyleafError::GeoJsonParse(format!("Failed to parse GeoJSON: {}", e))
+                RustyleafError::GeoJsonParse(format!(
+                    "Failed to parse GeoJSON: {}",
+                    js_error_text(&e)
+                ))
             })?;
 
         // Feature-count cap before per-feature conversion (R-7).
-        if let Some(n) = geojson_value
-            .get("features")
-            .and_then(|f| f.as_array())
-            .map(|a| a.len())
-        {
+        let features_val = js_sys::Reflect::get(&geojson_value, &JsValue::from_str("features"))
+            .unwrap_or(JsValue::UNDEFINED);
+        if js_sys::Array::is_array(&features_val) {
+            let n = js_sys::Array::from(&features_val).length() as usize;
             if n > MAX_GEOJSON_FEATURES {
                 return Err(RustyleafError::GeoJsonParse(format!(
                     "GeoJSON feature count ({}) exceeds max {}",
@@ -2818,177 +2807,159 @@ impl RustyleafMap {
             }
         }
 
-        web_sys::console::log_1(&"GeoJSON parsed successfully, now processing features".into());
         self.parse_geojson_value(&geojson_value)
     }
 
-    fn parse_geojson_value(&self, geojson_value: &serde_json::Value) -> Result<Vec<GeoJSONFeature>, JsValue> {
+    fn parse_geojson_value(&self, geojson_value: &JsValue) -> Result<Vec<GeoJSONFeature>, JsValue> {
         let mut features = Vec::new();
 
-        match geojson_value {
-            serde_json::Value::Object(obj) => {
-                let geojson_type = obj.get("type")
-                    .and_then(|t| t.as_str())
-                    .ok_or_else(|| RustyleafError::GeoJsonParse("GeoJSON missing 'type' field".into()))?;
+        // serde's `as_object` accepted JSON objects only (arrays rejected);
+        // mirror that: only plain objects are GeoJSON documents.
+        if !geojson_value.is_object() || js_sys::Array::is_array(geojson_value) {
+            return Err(RustyleafError::GeoJsonParse("GeoJSON must be an object".into()).into());
+        }
+        let geojson_type = js_sys::Reflect::get(geojson_value, &JsValue::from_str("type"))?
+            .as_string()
+            .ok_or_else(|| RustyleafError::GeoJsonParse("GeoJSON missing 'type' field".into()))?;
 
-                match geojson_type {
-                    "FeatureCollection" => {
-                        web_sys::console::log_1(&"Found FeatureCollection".into());
-                        if let Some(features_array) = obj.get("features").and_then(|f| f.as_array()) {
-                            web_sys::console::log_2(&"Features array length:".into(), &features_array.len().into());
-                            // Count per-feature failures and warn with the total
-                            // (R-18); previously every failure was a lone
-                            // console::log and all-bad input returned Ok(empty).
-                            let mut failures: usize = 0;
-                            for (index, feature_value) in features_array.iter().enumerate() {
-                                match self.parse_geojson_feature(feature_value) {
-                                    Ok(feature) => {
-                                        features.push(feature);
-                                        if index < 5 { // Log first 5 features
-                                            web_sys::console::log_2(&"Successfully parsed feature".into(), &index.into());
-                                        }
-                                    },
-                                    Err(e) => {
-                                        failures += 1;
-                                        web_sys::console::log_3(&"Failed to parse feature".into(), &index.into(), &e);
-                                    }
-                                }
-                            }
-                            self.geojson_parse_errors.set(failures);
-                            if failures > 0 {
-                                web_sys::console::warn_1(&JsValue::from_str(&format!(
-                                    "rustyleaf: {} of {} GeoJSON features failed to parse ({} loaded)",
-                                    failures,
-                                    features_array.len(),
-                                    features.len()
-                                )));
-                            }
-                        } else {
-                            web_sys::console::log_1(&"No features array found in FeatureCollection".into());
-                        }
-                    },
-                    "Feature" => {
-                        match self.parse_geojson_feature(geojson_value) {
+        match geojson_type.as_str() {
+            "FeatureCollection" => {
+                let features_val = js_sys::Reflect::get(geojson_value, &JsValue::from_str("features"))?;
+                if js_sys::Array::is_array(&features_val) {
+                    let features_array = js_sys::Array::from(&features_val);
+                    // Count per-feature failures and warn with the total
+                    // (R-18); previously every failure was a lone
+                    // console::log and all-bad input returned Ok(empty).
+                    let mut failures: usize = 0;
+                    for i in 0..features_array.length() {
+                        let feature_value = features_array.get(i);
+                        match self.parse_geojson_feature(&feature_value) {
                             Ok(feature) => {
                                 features.push(feature);
-                                self.geojson_parse_errors.set(0);
-                            }
-                            Err(e) => {
-                                self.geojson_parse_errors.set(1);
-                                web_sys::console::warn_1(&JsValue::from_str(&format!(
-                                    "rustyleaf: 1 of 1 GeoJSON features failed to parse: {:?}",
-                                    e.as_string().unwrap_or_else(|| format!("{:?}", e))
-                                )));
+                            },
+                            Err(_) => {
+                                failures += 1;
                             }
                         }
-                    },
-                    _ => {
-                        // Direct geometry (Point, LineString, etc.)
-                        if let Ok(geometry) = self.parse_geojson_geometry(geojson_value) {
-                            let feature = GeoJSONFeature {
-                                geometry,
-                                properties: serde_json::json!({}),
-                                id: None,
-                            };
-                            features.push(feature);
-                            self.geojson_parse_errors.set(0);
-                        } else {
-                            self.geojson_parse_errors.set(1);
-                            web_sys::console::warn_1(&JsValue::from_str(
-                                "rustyleaf: GeoJSON geometry failed to parse",
-                            ));
-                        }
-                    },
+                    }
+                    if failures > 0 {
+                        web_sys::console::warn_1(&JsValue::from_str(&format!(
+                            "rustyleaf: {} of {} GeoJSON features failed to parse ({} loaded)",
+                            failures,
+                            features_array.length(),
+                            features.len()
+                        )));
+                    }
                 }
             },
-            _ => return Err(RustyleafError::GeoJsonParse("GeoJSON must be an object".into()).into()),
+            "Feature" => {
+                match self.parse_geojson_feature(geojson_value) {
+                    Ok(feature) => {
+                        features.push(feature);
+                    }
+                    Err(e) => {
+                        web_sys::console::warn_1(&JsValue::from_str(&format!(
+                            "rustyleaf: 1 of 1 GeoJSON features failed to parse: {}",
+                            js_error_text(&e)
+                        )));
+                    }
+                }
+            },
+            _ => {
+                // Direct geometry (Point, LineString, etc.)
+                if let Ok(geometry) = self.parse_geojson_geometry(geojson_value) {
+                    let feature = GeoJSONFeature {
+                        geometry,
+                        properties: empty_js_object(),
+                    };
+                    features.push(feature);
+                } else {
+                    web_sys::console::warn_1(&JsValue::from_str(
+                        "rustyleaf: GeoJSON geometry failed to parse",
+                    ));
+                }
+            },
         }
 
-        web_sys::console::log_2(&"Total features parsed:".into(), &features.len().into());
         Ok(features)
     }
 
-    fn parse_geojson_feature(&self, feature_value: &serde_json::Value) -> Result<GeoJSONFeature, JsValue> {
-        let obj = feature_value.as_object()
-            .ok_or_else(|| RustyleafError::GeoJsonParse("Feature must be an object".into()))?;
+    fn parse_geojson_feature(&self, feature_value: &JsValue) -> Result<GeoJSONFeature, JsValue> {
+        if !feature_value.is_object() || js_sys::Array::is_array(feature_value) {
+            return Err(RustyleafError::GeoJsonParse("Feature must be an object".into()).into());
+        }
 
-        let geometry = obj.get("geometry")
-            .ok_or_else(|| RustyleafError::GeoJsonParse("Feature missing 'geometry' field".into()))?;
-        let geometry = self.parse_geojson_geometry(geometry)?;
+        let geometry_val = js_sys::Reflect::get(feature_value, &JsValue::from_str("geometry"))?;
+        if geometry_val.is_undefined() {
+            return Err(RustyleafError::GeoJsonParse("Feature missing 'geometry' field".into()).into());
+        }
+        let geometry = self.parse_geojson_geometry(&geometry_val)?;
 
-        let properties = obj.get("properties")
-            .and_then(|p| p.as_object())
-            .map(|p| serde_json::Value::Object(p.clone()))
-            .unwrap_or_else(|| serde_json::json!({}));
-
-        let id = obj.get("id")
-            .and_then(|id| {
-                if id.is_string() {
-                    id.as_str().map(|s| s.to_string())
-                } else if id.is_number() {
-                    id.as_u64().map(|n| n.to_string())
-                } else {
-                    None
-                }
-            });
+        let properties = js_sys::Reflect::get(feature_value, &JsValue::from_str("properties"))
+            .map(|p| normalize_properties(&p))
+            .unwrap_or_else(|_| empty_js_object());
 
         Ok(GeoJSONFeature {
             geometry,
             properties,
-            id,
         })
     }
 
-    fn parse_geojson_geometry(&self, geometry_value: &serde_json::Value) -> Result<GeoJSONGeometry, JsValue> {
-        let obj = geometry_value.as_object()
-            .ok_or_else(|| RustyleafError::GeoJsonParse("Geometry must be an object".into()))?;
+    fn parse_geojson_geometry(&self, geometry_value: &JsValue) -> Result<GeoJSONGeometry, JsValue> {
+        if !geometry_value.is_object() || js_sys::Array::is_array(geometry_value) {
+            return Err(RustyleafError::GeoJsonParse("Geometry must be an object".into()).into());
+        }
 
-        let geometry_type = obj.get("type")
-            .and_then(|t| t.as_str())
+        let geometry_type = js_sys::Reflect::get(geometry_value, &JsValue::from_str("type"))?
+            .as_string()
             .ok_or_else(|| RustyleafError::GeoJsonParse("Geometry missing 'type' field".into()))?;
 
-        let coordinates = obj.get("coordinates")
-            .ok_or_else(|| RustyleafError::GeoJsonParse("Geometry missing 'coordinates' field".into()))?;
+        let coordinates = js_sys::Reflect::get(geometry_value, &JsValue::from_str("coordinates"))?;
+        if coordinates.is_undefined() {
+            return Err(RustyleafError::GeoJsonParse("Geometry missing 'coordinates' field".into()).into());
+        }
 
-        match geometry_type {
+        match geometry_type.as_str() {
             "Point" => {
-                let coords = self.parse_point_coordinates(coordinates)?;
+                let coords = self.parse_point_coordinates(&coordinates)?;
                 Ok(GeoJSONGeometry::Point { coordinates: coords })
             },
             "MultiPoint" => {
-                let coords = self.parse_multi_point_coordinates(coordinates)?;
+                let coords = self.parse_multi_point_coordinates(&coordinates)?;
                 Ok(GeoJSONGeometry::MultiPoint { coordinates: coords })
             },
             "LineString" => {
-                let coords = self.parse_line_string_coordinates(coordinates)?;
+                let coords = self.parse_line_string_coordinates(&coordinates)?;
                 Ok(GeoJSONGeometry::LineString { coordinates: coords })
             },
             "MultiLineString" => {
-                let coords = self.parse_multi_line_string_coordinates(coordinates)?;
+                let coords = self.parse_multi_line_string_coordinates(&coordinates)?;
                 Ok(GeoJSONGeometry::MultiLineString { coordinates: coords })
             },
             "Polygon" => {
-                let coords = self.parse_polygon_coordinates(coordinates)?;
+                let coords = self.parse_polygon_coordinates(&coordinates)?;
                 Ok(GeoJSONGeometry::Polygon { coordinates: coords })
             },
             "MultiPolygon" => {
-                let coords = self.parse_multi_polygon_coordinates(coordinates)?;
+                let coords = self.parse_multi_polygon_coordinates(&coordinates)?;
                 Ok(GeoJSONGeometry::MultiPolygon { coordinates: coords })
             },
             _ => Err(RustyleafError::GeoJsonParse(format!("Unsupported geometry type: {}", geometry_type)).into()),
         }
     }
 
-    fn parse_point_coordinates(&self, value: &serde_json::Value) -> Result<[f64; 2], JsValue> {
-        let arr = value.as_array()
-            .ok_or_else(|| RustyleafError::GeoJsonParse("Point coordinates must be an array".into()))?;
-        
-        if arr.len() < 2 {
+    fn parse_point_coordinates(&self, value: &JsValue) -> Result<[f64; 2], JsValue> {
+        if !js_sys::Array::is_array(value) {
+            return Err(RustyleafError::GeoJsonParse("Point coordinates must be an array".into()).into());
+        }
+        let arr = js_sys::Array::from(value);
+
+        if arr.length() < 2 {
             return Err(RustyleafError::GeoJsonParse("Point coordinates must have at least 2 values".into()).into());
         }
 
-        let x = arr[0].as_f64().ok_or_else(|| RustyleafError::GeoJsonParse("Invalid x coordinate".into()))?;
-        let y = arr[1].as_f64().ok_or_else(|| RustyleafError::GeoJsonParse("Invalid y coordinate".into()))?;
+        let x = arr.get(0).as_f64().ok_or_else(|| RustyleafError::GeoJsonParse("Invalid x coordinate".into()))?;
+        let y = arr.get(1).as_f64().ok_or_else(|| RustyleafError::GeoJsonParse("Invalid y coordinate".into()))?;
         // NaN/Inf coordinates would poison caches, projection, and hit-test
         // downstream — reject them at parse time like the vector-layer paths do.
         if !x.is_finite() || !y.is_finite() {
@@ -2998,25 +2969,29 @@ impl RustyleafMap {
         Ok([x, y])
     }
 
-    fn parse_multi_point_coordinates(&self, value: &serde_json::Value) -> Result<Vec<[f64; 2]>, JsValue> {
-        let arr = value.as_array()
-            .ok_or_else(|| RustyleafError::GeoJsonParse("MultiPoint coordinates must be an array".into()))?;
-        
+    fn parse_multi_point_coordinates(&self, value: &JsValue) -> Result<Vec<[f64; 2]>, JsValue> {
+        if !js_sys::Array::is_array(value) {
+            return Err(RustyleafError::GeoJsonParse("MultiPoint coordinates must be an array".into()).into());
+        }
+        let arr = js_sys::Array::from(value);
+
         let mut points = Vec::new();
-        for point_value in arr {
-            points.push(self.parse_point_coordinates(point_value)?);
+        for i in 0..arr.length() {
+            points.push(self.parse_point_coordinates(&arr.get(i))?);
         }
 
         Ok(points)
     }
 
-    fn parse_line_string_coordinates(&self, value: &serde_json::Value) -> Result<Vec<[f64; 2]>, JsValue> {
-        let arr = value.as_array()
-            .ok_or_else(|| RustyleafError::GeoJsonParse("LineString coordinates must be an array".into()))?;
-        
+    fn parse_line_string_coordinates(&self, value: &JsValue) -> Result<Vec<[f64; 2]>, JsValue> {
+        if !js_sys::Array::is_array(value) {
+            return Err(RustyleafError::GeoJsonParse("LineString coordinates must be an array".into()).into());
+        }
+        let arr = js_sys::Array::from(value);
+
         let mut points = Vec::new();
-        for point_value in arr {
-            points.push(self.parse_point_coordinates(point_value)?);
+        for i in 0..arr.length() {
+            points.push(self.parse_point_coordinates(&arr.get(i))?);
         }
 
         if points.len() < 2 {
@@ -3026,25 +3001,29 @@ impl RustyleafMap {
         Ok(points)
     }
 
-    fn parse_multi_line_string_coordinates(&self, value: &serde_json::Value) -> Result<Vec<Vec<[f64; 2]>>, JsValue> {
-        let arr = value.as_array()
-            .ok_or_else(|| RustyleafError::GeoJsonParse("MultiLineString coordinates must be an array".into()))?;
-        
+    fn parse_multi_line_string_coordinates(&self, value: &JsValue) -> Result<Vec<Vec<[f64; 2]>>, JsValue> {
+        if !js_sys::Array::is_array(value) {
+            return Err(RustyleafError::GeoJsonParse("MultiLineString coordinates must be an array".into()).into());
+        }
+        let arr = js_sys::Array::from(value);
+
         let mut lines = Vec::new();
-        for line_value in arr {
-            lines.push(self.parse_line_string_coordinates(line_value)?);
+        for i in 0..arr.length() {
+            lines.push(self.parse_line_string_coordinates(&arr.get(i))?);
         }
 
         Ok(lines)
     }
 
-    fn parse_polygon_coordinates(&self, value: &serde_json::Value) -> Result<Vec<Vec<[f64; 2]>>, JsValue> {
-        let arr = value.as_array()
-            .ok_or_else(|| RustyleafError::GeoJsonParse("Polygon coordinates must be an array".into()))?;
-        
+    fn parse_polygon_coordinates(&self, value: &JsValue) -> Result<Vec<Vec<[f64; 2]>>, JsValue> {
+        if !js_sys::Array::is_array(value) {
+            return Err(RustyleafError::GeoJsonParse("Polygon coordinates must be an array".into()).into());
+        }
+        let arr = js_sys::Array::from(value);
+
         let mut rings = Vec::new();
-        for ring_value in arr {
-            let ring = self.parse_line_string_coordinates(ring_value)?; // Reuse line string parsing
+        for i in 0..arr.length() {
+            let ring = self.parse_line_string_coordinates(&arr.get(i))?; // Reuse line string parsing
             if ring.len() < 3 {
                 return Err(RustyleafError::GeoJsonParse("Polygon ring must have at least 3 points".into()).into());
             }
@@ -3058,13 +3037,15 @@ impl RustyleafMap {
         Ok(rings)
     }
 
-    fn parse_multi_polygon_coordinates(&self, value: &serde_json::Value) -> Result<Vec<Vec<Vec<[f64; 2]>>>, JsValue> {
-        let arr = value.as_array()
-            .ok_or_else(|| RustyleafError::GeoJsonParse("MultiPolygon coordinates must be an array".into()))?;
-        
+    fn parse_multi_polygon_coordinates(&self, value: &JsValue) -> Result<Vec<Vec<Vec<[f64; 2]>>>, JsValue> {
+        if !js_sys::Array::is_array(value) {
+            return Err(RustyleafError::GeoJsonParse("MultiPolygon coordinates must be an array".into()).into());
+        }
+        let arr = js_sys::Array::from(value);
+
         let mut polygons = Vec::new();
-        for polygon_value in arr {
-            polygons.push(self.parse_polygon_coordinates(polygon_value)?);
+        for i in 0..arr.length() {
+            polygons.push(self.parse_polygon_coordinates(&arr.get(i))?);
         }
 
         Ok(polygons)
@@ -3078,7 +3059,7 @@ impl RustyleafMap {
         );
     }
 
-    fn hit_test(&self, x: f64, y: f64) -> Option<serde_json::Value> {
+    fn hit_test(&self, x: f64, y: f64) -> Option<JsValue> {
         spatial_hit_test(&self.viewport(), &self.spatial_index, x, y)
     }
 
@@ -3142,7 +3123,7 @@ impl RustyleafMap {
                 GeoJSONGeometry::Polygon { coordinates } => {
                     let polygon_rings: Vec<Vec<[f64; 2]>> = coordinates.iter().map(|ring| Self::decimate_ring(&ring.iter().map(|c| [c[1], c[0]]).collect::<Vec<[f64; 2]>>())).collect();
                     if !polygon_rings.is_empty() && polygon_rings[0].len() >= 3 {
-                        let tris = self.triangulate_polygon_with_holes_lyon(&polygon_rings);
+                        let tris = triangulate_polygon_with_holes(&polygon_rings);
                         cached_polygon_triangles.extend(tris);
                         // Interior hit-testing record (outer ring + holes + properties)
                         cached_polygon_hits.push(PolygonHit { outer_ring: polygon_rings[0].clone(), holes: polygon_rings[1..].to_vec(), meta: feature.properties.clone() });
@@ -3154,7 +3135,7 @@ impl RustyleafMap {
                     for polygon_coords in coordinates {
                         let polygon_rings: Vec<Vec<[f64; 2]>> = polygon_coords.iter().map(|ring| Self::decimate_ring(&ring.iter().map(|c| [c[1], c[0]]).collect::<Vec<[f64; 2]>>())).collect();
                         if !polygon_rings.is_empty() && polygon_rings[0].len() >= 3 {
-                            let tris = self.triangulate_polygon_with_holes_lyon(&polygon_rings);
+                            let tris = triangulate_polygon_with_holes(&polygon_rings);
                             cached_polygon_triangles.extend(tris);
                             cached_polygon_hits.push(PolygonHit { outer_ring: polygon_rings[0].clone(), holes: polygon_rings[1..].to_vec(), meta: feature.properties.clone() });
                             // Outline
@@ -3266,56 +3247,7 @@ impl RustyleafMap {
                 }
             }
         }
-        out
-    }
-
-    fn triangulate_polygon_with_holes_lyon(&self, rings: &[Vec<[f64; 2]>]) -> Vec<[f64; 2]> {
-        if rings.is_empty() || rings[0].len() < 3 { return Vec::new(); }
-
-        let mut path_builder = Path::builder();
-        // Outer ring (lng, lat mapped as x, y)
-        path_builder.begin(lyon_path::geom::point(rings[0][0][1] as f32, rings[0][0][0] as f32));
-        for coord in rings[0].iter().skip(1) {
-            path_builder.line_to(lyon_path::geom::point(coord[1] as f32, coord[0] as f32));
-        }
-        path_builder.end(true);
-
-        // Holes
-        for hole in rings.iter().skip(1) {
-            if hole.len() < 3 { continue; }
-            path_builder.begin(lyon_path::geom::point(hole[0][1] as f32, hole[0][0] as f32));
-            for coord in hole.iter().skip(1) {
-                path_builder.line_to(lyon_path::geom::point(coord[1] as f32, coord[0] as f32));
-            }
-            path_builder.end(true);
-        }
-        let path = path_builder.build();
-
-        let mut geometry: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
-        let mut tess = FillTessellator::new();
-        let opts = FillOptions::tolerance(0.05);
-        if let Err(e) = tess.tessellate_path(
-            &path,
-            &opts,
-            &mut BuffersBuilder::new(&mut geometry, |v: FillVertex| {
-                let p = v.position();
-                [p.x, p.y]
-            }),
-        ) {
-            // Log instead of silently vanishing the polygon (R-20).
-            web_sys::console::warn_1(&JsValue::from_str(&format!(
-                "rustyleaf: polygon tessellation failed, dropping polygon: {:?}",
-                e
-            )));
-            return Vec::new();
-        }
-
-        let mut out: Vec<[f64; 2]> = Vec::with_capacity(geometry.indices.len());
-        for idx in geometry.indices {
-            let v = geometry.vertices[idx as usize];
-            out.push([v[1] as f64, v[0] as f64]);
-        }
-        out
+            out
     }
 
 }
@@ -3350,13 +3282,10 @@ impl TileLayerApi {
     }
 }
 
-// Separate PointLayer API class
+// Separate PointLayer API class (event-registration shell; point data
+// lives on RustyleafMap layers, not here).
 #[wasm_bindgen]
-pub struct PointLayerApi {
-    points: Vec<PointFeature>,
-    #[allow(dead_code)] // toggled by future setVisible API
-    visible: bool,
-}
+pub struct PointLayerApi {}
 
 impl Default for PointLayerApi {
     fn default() -> Self {
@@ -3368,51 +3297,7 @@ impl Default for PointLayerApi {
 impl PointLayerApi {
     #[wasm_bindgen(constructor)]
     pub fn new() -> PointLayerApi {
-        PointLayerApi {
-            points: Vec::new(),
-            visible: true,
-        }
-    }
-
-    #[wasm_bindgen]
-    pub fn add(&mut self, points_data: &JsValue) -> Result<(), JsValue> {
-        let points_array = js_sys::Array::from(points_data);
-
-        for i in 0..points_array.length() {
-            let point_obj = points_array.get(i);
-            let lat = match js_sys::Reflect::get(&point_obj, &JsValue::from_str("lat"))?.as_f64() {
-                Some(v) if v.is_finite() => v,
-                _ => continue,
-            };
-            let lng = match js_sys::Reflect::get(&point_obj, &JsValue::from_str("lng"))?.as_f64() {
-                Some(v) if v.is_finite() => v,
-                _ => continue,
-            };
-            let size = js_sys::Reflect::get(&point_obj, &JsValue::from_str("size"))?
-                .as_f64().unwrap_or(5.0) as f32;
-
-            let color_str = js_sys::Reflect::get(&point_obj, &JsValue::from_str("color"))?
-                .as_string().unwrap_or("#0080ff".to_string());
-            let color = parse_color(&color_str);
-
-            let meta = js_sys::Reflect::get(&point_obj, &JsValue::from_str("meta"))?;
-            let meta_json = if meta.is_object() {
-                serde_wasm_bindgen::from_value(meta)?
-            } else {
-                serde_json::json!({})
-            };
-
-            let point = PointFeature {
-                lat,
-                lng,
-                size,
-                color,
-                meta: meta_json,
-            };
-            self.points.push(point);
-        }
-
-        Ok(())
+        PointLayerApi {}
     }
 
     #[wasm_bindgen]

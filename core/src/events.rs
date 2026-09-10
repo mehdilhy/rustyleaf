@@ -128,60 +128,48 @@ pub fn trigger_event(callbacks: &[Function], event_obj: &JsValue) {
     }
 }
 
+/// Set a property on an event object, mapping reflection failures to a
+/// static error (no formatted payloads — keeps float/Debug formatting out
+/// of the binary).
+fn reflect_set(obj: &js_sys::Object, key: &str, value: &JsValue) -> Result<(), JsValue> {
+    js_sys::Reflect::set(obj, &JsValue::from_str(key), value)
+        .map_err(|_| RustyleafError::EventConstruction("Reflect::set failed".into()))?;
+    Ok(())
+}
+
 pub fn create_map_event(event_type: &str, center: &Array, zoom: f64, bounds: &Array) -> Result<JsValue, JsValue> {
     let obj = js_sys::Object::new();
-    js_sys::Reflect::set(&obj, &JsValue::from_str("type"), &JsValue::from_str(event_type))
-        .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set event type: {:?}", e)))?;
-    js_sys::Reflect::set(&obj, &JsValue::from_str("target"), &JsValue::null())
-        .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set target: {:?}", e)))?;
-    js_sys::Reflect::set(&obj, &JsValue::from_str("sourceTarget"), &JsValue::null())
-        .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set sourceTarget: {:?}", e)))?;
-    js_sys::Reflect::set(&obj, &JsValue::from_str("propagatedFrom"), &JsValue::null())
-        .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set propagatedFrom: {:?}", e)))?;
-    js_sys::Reflect::set(&obj, &JsValue::from_str("originalEvent"), &JsValue::null())
-        .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set originalEvent: {:?}", e)))?;
-
-    js_sys::Reflect::set(&obj, &JsValue::from_str("center"), center)
-        .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set center: {:?}", e)))?;
-
-    js_sys::Reflect::set(&obj, &JsValue::from_str("zoom"), &JsValue::from_f64(zoom))
-        .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set zoom: {:?}", e)))?;
-
-    js_sys::Reflect::set(&obj, &JsValue::from_str("bounds"), bounds)
-        .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set bounds: {:?}", e)))?;
+    reflect_set(&obj, "type", &JsValue::from_str(event_type))?;
+    reflect_set(&obj, "target", &JsValue::null())?;
+    reflect_set(&obj, "sourceTarget", &JsValue::null())?;
+    reflect_set(&obj, "propagatedFrom", &JsValue::null())?;
+    reflect_set(&obj, "originalEvent", &JsValue::null())?;
+    reflect_set(&obj, "center", center)?;
+    reflect_set(&obj, "zoom", &JsValue::from_f64(zoom))?;
+    reflect_set(&obj, "bounds", bounds)?;
 
     Ok(obj.into())
 }
 
 pub fn create_click_event(lat: f64, lng: f64, container_point: &Array, layer_point: &Array, original_event: Option<&JsValue>) -> Result<JsValue, JsValue> {
     let obj = js_sys::Object::new();
-    js_sys::Reflect::set(&obj, &JsValue::from_str("type"), &JsValue::from_str("click"))
-        .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set click type: {:?}", e)))?;
-    js_sys::Reflect::set(&obj, &JsValue::from_str("target"), &JsValue::null())
-        .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set click target: {:?}", e)))?;
-    js_sys::Reflect::set(&obj, &JsValue::from_str("sourceTarget"), &JsValue::null())
-        .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set click sourceTarget: {:?}", e)))?;
-    js_sys::Reflect::set(&obj, &JsValue::from_str("propagatedFrom"), &JsValue::null())
-        .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set click propagatedFrom: {:?}", e)))?;
+    reflect_set(&obj, "type", &JsValue::from_str("click"))?;
+    reflect_set(&obj, "target", &JsValue::null())?;
+    reflect_set(&obj, "sourceTarget", &JsValue::null())?;
+    reflect_set(&obj, "propagatedFrom", &JsValue::null())?;
 
     let latlng = Array::new();
     latlng.push(&JsValue::from_f64(lat));
     latlng.push(&JsValue::from_f64(lng));
-    js_sys::Reflect::set(&obj, &JsValue::from_str("latlng"), &latlng)
-        .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set click latlng: {:?}", e)))?;
-
-    js_sys::Reflect::set(&obj, &JsValue::from_str("containerPoint"), container_point)
-        .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set click containerPoint: {:?}", e)))?;
-
-    js_sys::Reflect::set(&obj, &JsValue::from_str("layerPoint"), layer_point)
-        .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set click layerPoint: {:?}", e)))?;
+    reflect_set(&obj, "latlng", &latlng)?;
+    reflect_set(&obj, "containerPoint", container_point)?;
+    reflect_set(&obj, "layerPoint", layer_point)?;
 
     let original_js = match original_event {
         Some(ev) => ev.clone(),
         None => JsValue::NULL,
     };
-    js_sys::Reflect::set(&obj, &JsValue::from_str("originalEvent"), &original_js)
-        .map_err(|e| RustyleafError::EventConstruction(format!("Failed to set click originalEvent: {:?}", e)))?;
+    reflect_set(&obj, "originalEvent", &original_js)?;
 
     Ok(obj.into())
 }

@@ -1,6 +1,6 @@
 {
   "name": "rustyleaf",
-  "version": "0.0.10",
+  "version": "0.0.11",
   "description": "A high-performance Rust-based map visualization engine powered by WebAssembly and WebGL2",
   "main": "dist/rustyleaf.bundle.js",
   "exports": {
@@ -12,8 +12,11 @@
   },
   "types": "types/rustyleaf.d.ts",
   "files": [
-    "dist/",
-    "types/",
+    "dist/rustyleaf.bundle.js",
+    "dist/rustyleaf_core_bg.js",
+    "dist/rustyleaf_core_bg.wasm",
+    "types/rustyleaf.d.ts",
+    "!types/README.md",
     "README.md",
     "LICENSE"
   ],
@@ -23,8 +26,9 @@
     "dev": "npm run build:wasm && webpack --mode development --watch",
     "build:wasm": "cd core && wasm-pack build --target bundler --release --out-dir ../dist",
     "prepublishOnly": "npm run build",
-    "prepack": "node -e \"require('fs').writeFileSync('dist/.npmignore','# keep: stops npm from applying wasm-pack generated dist/.gitignore\\n')\"",
+    "prepack": "node -e \"require('fs').writeFileSync('dist/.npmignore','# keep: stops npm from applying wasm-pack generated dist/.gitignore\\n*.br\\n*.gz\\n')\"",
     "test": "jest",
+    "test:smoke": "node scripts/smoke-bundle.mjs",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
     "test:e2e": "npm run build:wasm && playwright test --config e2e/playwright.config.ts",
@@ -38,7 +42,11 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "typecheck": "tsc --noEmit",
-    "bench": "node -e \"console.log('Run: npm run build && node e2e/serve.mjs, then open http://localhost:3333/benchmark/')\""
+    "size": "node scripts/size-report.mjs",
+    "size:check": "node scripts/size-report.mjs --check",
+    "compress": "node scripts/compress-dist.mjs",
+    "bench": "node -e \"console.log('Run: npm run build && node e2e/serve.mjs, then open http://localhost:3333/benchmark/')\"",
+    "hormuz": "node scripts/hormuz-live-server.mjs"
   },
   "keywords": [
     "map",
@@ -78,6 +86,7 @@
     "jest": "^29.0.0",
     "jest-environment-jsdom": "^29.0.0",
     "prettier": "^3.0.0",
+    "terser-webpack-plugin": "^5.6.1",
     "ts-jest": "^29.0.0",
     "ts-loader": "^9.0.0",
     "typescript": "^5.0.0",
