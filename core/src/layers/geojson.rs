@@ -1,4 +1,5 @@
 use std::cell::{RefCell, Cell};
+use wasm_bindgen::JsValue;
 use crate::OwnedBuffer;
 use super::point::PointFeature;
 use super::line::LineFeature;
@@ -38,15 +39,13 @@ pub struct GeoJSONLayer {
 pub struct PolygonHit {
     pub outer_ring: Vec<[f64; 2]>, // [lat, lng] pairs
     pub holes: Vec<Vec<[f64; 2]>>, // interior rings ([lat, lng] pairs)
-    pub meta: serde_json::Value,
+    pub meta: JsValue,
 }
 
 #[derive(Clone)]
 pub struct GeoJSONFeature {
     pub(crate) geometry: GeoJSONGeometry,
-    pub(crate) properties: serde_json::Value,
-    #[allow(dead_code)] // GeoJSON feature id, kept for future feature lookup API
-    pub(crate) id: Option<String>,
+    pub(crate) properties: JsValue,
 }
 
 #[derive(Clone)]

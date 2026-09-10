@@ -1,6 +1,6 @@
 {
   "name": "rustyleaf",
-  "version": "0.0.10",
+  "version": "0.0.11",
   "description": "A high-performance Rust-based map visualization engine powered by WebAssembly and WebGL2",
   "main": "dist/rustyleaf.bundle.js",
   "exports": {
@@ -12,8 +12,11 @@
   },
   "types": "types/rustyleaf.d.ts",
   "files": [
-    "dist/",
-    "types/",
+    "dist/rustyleaf.bundle.js",
+    "dist/rustyleaf_core_bg.js",
+    "dist/rustyleaf_core_bg.wasm",
+    "types/rustyleaf.d.ts",
+    "!types/README.md",
     "README.md",
     "LICENSE"
   ],
@@ -42,7 +45,8 @@
     "size": "node scripts/size-report.mjs",
     "size:check": "node scripts/size-report.mjs --check",
     "compress": "node scripts/compress-dist.mjs",
-    "bench": "node -e \"console.log('Run: npm run build && node e2e/serve.mjs, then open http://localhost:3333/benchmark/')\""
+    "bench": "node -e \"console.log('Run: npm run build && node e2e/serve.mjs, then open http://localhost:3333/benchmark/')\"",
+    "hormuz": "node scripts/hormuz-live-server.mjs"
   },
   "keywords": [
     "map",

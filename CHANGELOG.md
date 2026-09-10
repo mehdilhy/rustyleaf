@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.0.11 - 2026-09-10
+
+Size and simplicity release: packed tarball 210.3 → 156.4 kB with no
+feature loss (826/826 Jest tests, `tsc`/eslint/`cargo clippy -D warnings`
+clean, e2e green including kitchen-sink at 60fps/1M points).
+
+### Changed
+- **WASM core deps** — `lyon_tessellation`/`lyon_path` → `earcutr`
+  (same hole-aware triangulation, still once per data change);
+  `rstar` R-tree → 1° uniform grid + overflow list (same hit-test
+  semantics, deterministic insertion-order tie-break); `serde`/
+  `serde_json`/`serde-wasm-bindgen` → native `JSON.parse` + `js-sys`
+  (same parse caps and validation, faster ingest).
+- **Smaller binary** — dead exports unshipped (see Removed), static
+  error strings (float/`{:?}` formatting removed), hand-written WMS
+  bbox fixed-point and hex color parsing, minified GLSL, explicit
+  `files` whitelist, slimmed README.
+
+### Removed (breaking, preview-stage — nobody on these yet)
+- Unused wasm exports: `get_geojson_parse_error_count`,
+  `get_marker_latlng`, `WebGlSupportInfo` methods, `PointLayerApi::add`;
+  write-only `GeoJSONFeature.id` and spatial index ids.
+
+### Fixed
+- **Docs** — stale size table, Lyon/R-tree mentions → earcut/grid,
+  hole-subtraction and streaming-parser notes corrected.
+
 ## 0.0.10 - 2026-09-07
 
 100-item bug-audit hardening across the JS API, Leaflet-compat layer, types,

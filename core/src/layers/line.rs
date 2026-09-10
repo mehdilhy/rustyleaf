@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use wasm_bindgen::JsValue;
 use crate::OwnedBuffer;
 
 #[derive(Clone)]
@@ -6,7 +7,7 @@ pub struct LineFeature {
     pub(crate) points: Vec<[f64; 2]>,
     pub(crate) color: [f32; 4],
     pub(crate) width: f32,
-    pub(crate) meta: serde_json::Value,
+    pub(crate) meta: JsValue,
 }
 
 #[derive(Clone)]

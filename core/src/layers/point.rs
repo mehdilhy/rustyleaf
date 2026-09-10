@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use wasm_bindgen::JsValue;
 use crate::OwnedBuffer;
 
 pub struct PointLayer {
@@ -45,5 +46,5 @@ pub struct PointFeature {
     pub(crate) lng: f64,
     pub(crate) size: f32,
     pub(crate) color: [f32; 4],
-    pub(crate) meta: serde_json::Value,
+    pub(crate) meta: JsValue,
 }

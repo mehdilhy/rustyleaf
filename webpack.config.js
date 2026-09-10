@@ -44,7 +44,12 @@ module.exports = {
         terserOptions: {
           module: true,
           toplevel: true,
+          // Target matches webpack `target: es2020` above: emitting modern
+          // syntax (const/arrow) instead of ES5 helpers is smaller and still
+          // runs everywhere the WASM/WebGL2 core runs.
+          ecma: 2020,
           compress: {
+            ecma: 2020,
             passes: 3,
             pure_funcs: ['console.log', 'console.info', 'console.debug'],
           },
